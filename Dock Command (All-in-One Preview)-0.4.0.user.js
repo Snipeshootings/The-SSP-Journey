@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Dock Command (All-in-One Preview)
 // @namespace    dock-command
-// @version      0.4.0
-// @description  Dock Command preview workbench (grid + grouped toolbox + lock/swap modes)
+// @version      0.4.1
+// @description  Dock Command preview workbench (core script pages + grouped toolbox + lock/swap modes)
 // @match        https://*/*
 // @grant        GM_addStyle
 // @require      https://cdn.jsdelivr.net/npm/gridstack@11.2.0/dist/gridstack-all.js
@@ -21,6 +21,12 @@
 
   // Tool catalog (id must be unique)
   const TOOLS = [
+    // Core scripts currently in this repo
+    { id: "dock_command", title: "Dock Command", desc: "All-in-One command workspace", alerts: 0, w: 12, h: 12 },
+    { id: "ssp_util", title: "SSP Util", desc: "CPT + lane + planning execution panel", alerts: 0, w: 10, h: 10 },
+    { id: "relay_proto", title: "Relay Prototype", desc: "Relay auth bridge + data preview", alerts: 1, w: 10, h: 10 },
+    { id: "failed_moves", title: "Failed Container Moves", desc: "Failed move notifications + follow-up", alerts: 2, w: 10, h: 10 },
+
     { id: "flow", title: "Flow", desc: "Buckets + quick actions", alerts: 0, w: 12, h: 12 },
     { id: "atlas", title: "Atlas", desc: "Ops events + status feed", alerts: 1, w: 8, h: 10 },
 
@@ -45,6 +51,7 @@
 
   // Toolbox groups (order matters)
   const GROUPS = [
+    { id: "core", title: "Core Scripts", items: ["dock_command", "ssp_util", "relay_proto", "failed_moves"] },
     { id: "execution", title: "Execution", items: ["flow", "atlas", "sortation", "crossdock"] },
     { id: "data", title: "Data", items: ["relay", "ssp", "yms", "troubleshoot"] },
     { id: "people", title: "People", items: ["assoc_assign", "scheduling", "engage"] },
@@ -255,8 +262,8 @@
     return {
       open: false,
       locked: true,          // locked => execution mode
-      active: "flow",        // full view tool in execution mode
-      enabled: { flow: true }, // docked tools for edit mode
+      active: "dock_command", // full view tool in execution mode
+      enabled: { dock_command: true }, // docked tools for edit mode
       layout: null,          // last edit layout (gridstack items)
       groupOpen,
     };
@@ -374,7 +381,7 @@
         </div>
       </div>
       <div class="dc-card-bd">
-        ${toolId === "flow" ? flowBody() : toolBody(t.title)}
+        ${toolId === "flow" ? flowBody() : scriptWorkbenchBody(toolId, t.title)}
       </div>
     `;
   }
@@ -391,6 +398,71 @@
         <div class="dc-small" style="margin-top:6px;">
           Call Drivers (±30m CPT) → VRID, Driver, Phone, Trailer, Location, TDRStatus
         </div>
+      </div>
+    `;
+  }
+
+
+  function scriptWorkbenchBody(toolId, name) {
+    const pages = {
+      dock_command: {
+        file: "Dock Command (All-in-One Preview)-0.4.0.user.js",
+        purpose: "Unified command shell for launching operational tools and monitoring live status.",
+        inputs: ["Site", "Shift Window", "Filter Preset"],
+        status: "Workbench active • layout autosave enabled",
+        outputs: ["Tool launch map", "Live alerts rail", "Pinned quick actions"],
+      },
+      ssp_util: {
+        file: "SSP_Util_1.6.42.user.js",
+        purpose: "Execution cockpit for CPT utilization, lane actions, and planning workflows.",
+        inputs: ["Station", "CPT Horizon", "Lane / Route scope"],
+        status: "Using throttled network profile • cached lookups enabled",
+        outputs: ["CPT utilization snapshot", "Action lane queue", "Planning/staffing estimates"],
+      },
+      relay_proto: {
+        file: "Relay_Prototype_0.1.9k.user.js",
+        purpose: "Relay token handshake and transport visibility prototype for SSP-side panels.",
+        inputs: ["Auth state", "VRID / load id", "Preview mode"],
+        status: "Token capture monitor ready • awaiting relay context",
+        outputs: ["Auth/session health", "Route/map preview", "Relay telemetry feed"],
+      },
+      failed_moves: {
+        file: "Failed%20Container%20Moves%20-%20aakalish-5.4-patched-fans-v3.user.js",
+        purpose: "Detect failed container moves and surface actionable notifications.",
+        inputs: ["Building", "Severity filters", "Reminder cadence"],
+        status: "Notification listener online • reminder queue armed",
+        outputs: ["Failed move incidents", "Escalation/reminder state", "Follow-up shortcuts"],
+      },
+    };
+
+    const def = pages[toolId];
+    if (!def) return toolBody(name);
+
+    return `
+      <div class="dc-box">
+        <div class="dc-strong">${name} Workbench</div>
+        <div class="dc-small" style="margin-top:6px;">${def.purpose}</div>
+        <div class="dc-small" style="margin-top:8px;">Source: <span style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;">${def.file}</span></div>
+      </div>
+      <div style="height:10px;"></div>
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+        <div class="dc-box">
+          <div class="dc-strong">Input Panel</div>
+          <ul class="dc-small" style="margin:8px 0 0 16px; padding:0;">
+            ${def.inputs.map((v) => `<li>${v}</li>`).join("")}
+          </ul>
+        </div>
+        <div class="dc-box">
+          <div class="dc-strong">Execution / Status</div>
+          <div class="dc-small" style="margin-top:8px;">${def.status}</div>
+        </div>
+      </div>
+      <div style="height:10px;"></div>
+      <div class="dc-box">
+        <div class="dc-strong">Output / Results</div>
+        <ul class="dc-small" style="margin:8px 0 0 16px; padding:0;">
+          ${def.outputs.map((v) => `<li>${v}</li>`).join("")}
+        </ul>
       </div>
     `;
   }
@@ -505,38 +577,52 @@
   }
 
   function mountFullView(state, root) {
-  grid.removeAll();
+    grid.removeAll();
 
-  const id = state.active || "flow";
+    const id = state.active || "dock_command";
 
-  const el = grid.addWidget({ x: 0, y: 0, w: 12, h: 12 });
-  el.setAttribute("gs-id", id);
+    const el = grid.addWidget({ x: 0, y: 0, w: 12, h: 12 });
+    el.setAttribute("gs-id", id);
 
-  const contentEl = el.querySelector(".grid-stack-item-content");
-  if (contentEl) contentEl.innerHTML = cardHTML(id, false);
+    const contentEl = el.querySelector(".grid-stack-item-content");
+    if (contentEl) contentEl.innerHTML = cardHTML(id, false);
 
-  bindRemoveButtons(root, state);
-}
+    bindRemoveButtons(root, state);
+  }
 
+  function mountEditView(state, root) {
+    grid.removeAll();
 
-  for (const it of items) {
-  const canRemove = it.id !== "flow";
+    const enabledIds = Object.keys(state.enabled || {}).filter((id) => state.enabled[id]);
+    const seedIds = enabledIds.length ? enabledIds : ["dock_command"];
 
-  const el = grid.addWidget({ x: it.x, y: it.y, w: it.w, h: it.h });
-  el.setAttribute("gs-id", it.id);
+    const fallbackItems = seedIds.map((id, i) => {
+      const t = toolById(id) || { w: 8, h: 9 };
+      return { id, x: (i % 2) * 6, y: Math.floor(i / 2) * 10, w: Math.min(12, t.w), h: t.h };
+    });
 
-  const contentEl = el.querySelector(".grid-stack-item-content");
-  if (contentEl) contentEl.innerHTML = cardHTML(it.id, canRemove);
-}
-bindRemoveButtons(root, state);
+    const layoutById = new Map((state.layout || []).map((it) => [it.id, it]));
+    const items = seedIds.map((id, i) => layoutById.get(id) || fallbackItems[i]);
 
+    for (const it of items) {
+      const canRemove = it.id !== "dock_command";
+
+      const el = grid.addWidget({ x: it.x, y: it.y, w: it.w, h: it.h });
+      el.setAttribute("gs-id", it.id);
+
+      const contentEl = el.querySelector(".grid-stack-item-content");
+      if (contentEl) contentEl.innerHTML = cardHTML(it.id, canRemove);
+    }
+
+    bindRemoveButtons(root, state);
+  }
 
   function bindRemoveButtons(root, state) {
     root.querySelectorAll("[data-remove]").forEach(btn => {
       btn.onclick = (e) => {
         e.stopPropagation();
         const id = btn.getAttribute("data-remove");
-        if (!id || id === "flow") return;
+        if (!id || id === "dock_command") return;
 
         delete state.enabled[id];
 
@@ -545,7 +631,7 @@ bindRemoveButtons(root, state);
 
         if (state.layout) state.layout = state.layout.filter(x => x.id !== id);
 
-        if (state.active === id) state.active = "flow";
+        if (state.active === id) state.active = "dock_command";
 
         saveState(state);
         renderToolList(root, state);
@@ -648,17 +734,35 @@ bindRemoveButtons(root, state);
     mountFullView(state, root);
   }
 
-  const el = grid.addWidget({ x: 0, y: 999, w: Math.min(12, t.w), h: t.h });
-el.setAttribute("gs-id", toolId);
+  function addTool(state, root, toolId) {
+    if (!toolById(toolId)) return;
 
-const contentEl = el.querySelector(".grid-stack-item-content");
-if (contentEl) contentEl.innerHTML = cardHTML(toolId, true);
+    state.enabled[toolId] = true;
+
+    const hasExisting = grid.engine.nodes.some((n) => n.el && n.el.getAttribute("gs-id") === toolId);
+    if (!hasExisting) {
+      const t = toolById(toolId);
+      const el = grid.addWidget({ x: 0, y: 999, w: Math.min(12, t.w), h: t.h });
+      el.setAttribute("gs-id", toolId);
+
+      const contentEl = el.querySelector(".grid-stack-item-content");
+      if (contentEl) contentEl.innerHTML = cardHTML(toolId, toolId !== "dock_command");
+      bindRemoveButtons(root, state);
+    }
+
+    state.layout = grid.engine.nodes
+      .filter((n) => n.el)
+      .map((n) => ({ id: n.el.getAttribute("gs-id"), x: n.x, y: n.y, w: n.w, h: n.h }));
+
+    saveState(state);
+    renderToolList(root, state);
+  }
 
   function toggleLock(state, root) {
     state.locked = !state.locked;
 
     // when unlocking: ensure active tool remains present in grid
-    if (!state.locked && state.active && state.active !== "flow") {
+    if (!state.locked && state.active && state.active !== "dock_command") {
       state.enabled[state.active] = true;
     }
 
@@ -691,15 +795,15 @@ if (contentEl) contentEl.innerHTML = cardHTML(toolId, true);
     const root = ensureRoot();
     const state = loadState() || defaultState();
       // ---- state normalization (prevents toolbox from rendering empty) ----
-if (!state.enabled || typeof state.enabled !== "object") state.enabled = { flow: true };
-if (!state.enabled.flow) state.enabled.flow = true;
+if (!state.enabled || typeof state.enabled !== "object") state.enabled = { dock_command: true };
+if (!state.enabled.dock_command) state.enabled.dock_command = true;
 
 if (!state.groupOpen || typeof state.groupOpen !== "object") state.groupOpen = {};
 for (const g of GROUPS) {
   if (typeof state.groupOpen[g.id] !== "boolean") state.groupOpen[g.id] = true;
 }
 
-if (!state.active || typeof state.active !== "string") state.active = "flow";
+if (!state.active || typeof state.active !== "string") state.active = "dock_command";
 
 
     root.dataset.open = "true";
