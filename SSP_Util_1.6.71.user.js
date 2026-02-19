@@ -1,26 +1,57 @@
 // ==UserScript==
 // @name         SSP Util
 // @namespace    https://deicide.internal/ssp-util-2
-// \g<1>1.6.39
-// NOTE v1.6.19: Fixes stray control-character causing syntax error; restores merge filter dropdown onchange handler.
-// NOTE v1.6.11: Adds Inbound Dock Mgmt route averages cache (completed loads) to estimate unmanifested inbound containers/packages.
-// NOTE v1.6.02: Planning Route hover tries Relay track/map iframe preview (Option C).
-// NOTE v1.5.97: CU_OB now actually tries status ['inFacility','inFaciltiy']; NO_ROOTS is treated as empty; excludes 'Loaded' from CU meta.
-// NOTE v1.5.96: CU_OB uses status 'inFacility' with fallback to legacy 'inFaciltiy'; adds global unitFor/formatters.
-// NOTE v1.5.95: restore unitFor() alias used by container bucket renderer.
+// 1.6.71
+// ===============================
+// VERSION HISTORY
+// ===============================
+//
+// 1.5.x – Merge + Planning Foundation
+// - Introduced merge panel with capacity logic
+// - Added Current Units (CU) pulling per lane
+// - Implemented inbound VRID awareness
+// - Initial planning panel + shift bucketing logic
+// - Container bucket renderer (Loaded / Staged / etc.)
+//
+// 1.6.x – Relay Integration + Stability
+// - Relay integration improvements (track/map, meta badges, auth capture)
+// - Inbound + CU caching by lane and widened prefetch for visible VRIDs
+// - Merge utilization standardized:
+//     (Loaded + Current + WeightedInbound) / Capacity
+// - Planning persistence improvements (avoid overwriting SSP lane labels)
+// - Performance + reliability hardening (guards, syntax fixes, handler restores)
+// - Duplicate/legacy cleanup groundwork
+//
+// 1.7.x – UI & Execution Enhancements
+// - Grid-based dockable UI foundation (toolbox/widgets)
+// - Resize + layout lock behavior
+// - Merge panel inbound summaries + disruptions attention blocks
+// - Atlas widget scaffolding
+//
+// ===============================
 
-// NOTE v1.5.94: CU_OB now pulls inFaciltiy (SSP typo) instead of notArrived to avoid upstream containers.
+
+// NOTE v1.6.49: Fix CU anchor vrId mapping (anchor.vrid vs vrId) so Current Units populate again.
+// NOTE v1.5.94: CU_OB now pulls inFacility (SSP typo) instead of notArrived to avoid upstream containers.
 // @description  CPT utilization + Action/Lane Panels + IB4CPT export + Planning Panel (execution dashboard + staffing to cutoff)
 // @match        https://trans-logistics.amazon.com/ssp/*
 // @match        https://www.amazonlogistics.com/ssp/dock/*
+// @match        https://track.relay.amazon.dev/*
 // @downloadURL  https://axzile.corp.amazon.com/-/carthamus/download_script/ssp-util-8.user.js
 // @updateURL    https://axzile.corp.amazon.com/-/carthamus/download_script/ssp-util-8.user.js
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @require      https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js
 // @connect      track.relay.amazon.dev
+// @connect      trans-logistics.amazon.com
 // @run-at       document-end
 // ==/UserScript==
 
 // -------- Global helpers (must be visible to all modules) --------
+/**
+ * Format a numeric unit value for UI display (round to 0.1; drop trailing .0).
+ */
 function fmtUnits(u) {
   const n = Math.round((Number(u) || 0) * 10) / 10;
   const s = n.toFixed(1);
@@ -48,8 +79,17 @@ const SSP_NET = {
 const DEV_DIAG = false;
 const __sspDiag = { used: Object.create(null) };
 const __sspSeen = { equip: new Set() };
+/**
+ * DEV-only: increment a usage counter for a code path (helps prune legacy branches).
+ */
 function __sspMarkUsed(key){ if(!DEV_DIAG) return; __sspDiag.used[key] = (__sspDiag.used[key]||0)+1; }
+/**
+ * DEV-only: dump aggregated diagnostic counters to the console.
+ */
 function __sspDumpDiag(){ if(!DEV_DIAG) return; try{ console.debug("[SSP Util] DIAG.used", __sspDiag.used); }catch(e){} }
+/**
+ * DEV-only: log current URL query params for debugging host/page differences.
+ */
 function __sspLogUrlParamsOnce(tag="boot"){
   if(!DEV_DIAG) return;
   try{
@@ -59,6 +99,9 @@ function __sspLogUrlParamsOnce(tag="boot"){
     console.debug(`[SSP Util][${tag}] url params error`, e);
   }
 }
+/**
+ * DEV-only: log newly-seen equipment types (useful when normalizing trailer types).
+ */
 function __sspTrackEquip(raw){
   if(!DEV_DIAG) return;
   const k = String(raw||"").trim().toUpperCase();
@@ -70,6 +113,9 @@ function __sspTrackEquip(raw){
 const __sspCache = new Map();  // key -> {ts, value}
 const __sspQueue = [];
 
+/**
+ * Enqueue a network job into the global throttled queue (priority-aware).
+ */
 function __sspEnqueue(task, priority=0) {
   // priority: 2=high,1=normal,0=low
   if (priority >= 2) __sspQueue.unshift(task);
@@ -85,15 +131,27 @@ let __sspInFlight = 0;
 let __sspNextAt = 0;
 let __sspBackoffUntil = 0;
 
+/**
+ * Monotonic-ish wallclock helper used by cache + backoff logic.
+ */
 function __sspNow() { return Date.now(); }
+/**
+ * Promise-based sleep helper used by the request scheduler/backoff.
+ */
 function __sspSleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+/**
+ * Read from the in-memory TTL cache used to dedupe repeated API calls.
+ */
 function __sspCacheGet(key) {
   const hit = __sspCache.get(key);
   if (!hit) return null;
   if ((__sspNow() - hit.ts) > SSP_NET.cacheTtlMs) { __sspCache.delete(key); return null; }
   return hit.value;
 }
+/**
+ * Write to the in-memory TTL cache used to dedupe repeated API calls.
+ */
 function __sspCacheSet(key, value) {
   __sspCache.set(key, { ts: __sspNow(), value });
 }
@@ -141,6 +199,9 @@ async function __sspDrainQueue() {
   }
 }
 
+/**
+ * Public enqueue wrapper used by feature modules (adds metadata and returns a promise).
+ */
 function sspEnqueue(fn, priority=1) {
   return new Promise((resolve, reject) => {
     __sspEnqueue(Object.assign({ fn, resolve, reject }, { __prio: priority }), priority);
@@ -168,6 +229,9 @@ async function sspFetch(...args) {
   return sspEnqueue(() => fetch(...args), priority);
 }
 
+/**
+ * Fetch wrapper that uses window.fetch when same-origin, otherwise GM_xmlhttpRequest for CORS endpoints.
+ */
 function gmFetch(url, opts) {
   return new Promise((resolve, reject) => {
     try {
@@ -231,6 +295,9 @@ const fmtTime = (ms) =>
 
 // Parse SSP date-time strings like "12-Jan-26 05:00" into epoch ms.
 // Returns 0 when parsing fails.
+/**
+ * Parse SSP date/time strings into a JS timestamp (ms). Accepts ISO and common SSP formats.
+ */
 function parseSspDateTime(v) {
   if (!v) return 0;
   if (typeof v === "number") return v;
@@ -261,6 +328,9 @@ function parseSspDateTime(v) {
 // Determine outbound load base type for the Loads dropdown.
 // Rule (LDJ5): route contains "DDU" => ddu; route contains "CYC" => amzl; else other.
 // IMPORTANT: equipment splitting (26/53 strict-only) is handled at the load-group level elsewhere.
+/**
+ * Derive normalized outbound load type label from SSP/FMC payload (CART/CYC/etc).
+ */
 function getOutboundLoadType(load) {
   const routeRaw = (
     load?.route ??
@@ -281,6 +351,9 @@ function getOutboundLoadType(load) {
   return "other";
 }
 
+/**
+ * Extract the canonical loadGroupId from a load record (handles schema variants).
+ */
 function getLoadGroupId(load) {
   try {
     const v =
@@ -294,6 +367,9 @@ function getLoadGroupId(load) {
   }
 }
 
+/**
+ * Compute an equipment signature for a load group (used to infer capacity/unit conversions).
+ */
 function buildLoadGroupEquipSig(loads) {
   const map = new Map(); // lgId -> {has26:boolean, has53:boolean}
   for (const l of (loads || [])) {
@@ -322,6 +398,9 @@ function buildLoadGroupEquipSig(loads) {
 }
 
 // Normalize legacy/label-based load-type filters to internal values.
+/**
+ * Normalize outbound lane/load type tokens for matching/grouping (case/spacing-safe).
+ */
 function normalizeObLoadType(v) {
   const raw = String(v || "all").trim();
   const low = raw.toLowerCase();
@@ -497,6 +576,9 @@ function normalizeObLoadType(v) {
     } catch (e) { return out; }
   }
 
+/**
+ * Index inbound loads by planId for fast lookup during planning/IB4CPT export.
+ */
 function buildIbByPlanId(inboundLoads) {
     const m = new Map();
     try {
@@ -560,6 +642,9 @@ function buildIbByPlanId(inboundLoads) {
 })();
 
 
+/**
+ * Classify a CPT timestamp relative to now (past/soon/future) for coloring and sorting.
+ */
 function getCptState(cptMs, nowMs = Date.now()) {
   if (!cptMs) return 'cpt-ok';
   const diffMin = (cptMs - nowMs) / 60000;
@@ -568,12 +653,18 @@ function getCptState(cptMs, nowMs = Date.now()) {
   return 'cpt-ok';
 }
 
+/**
+ * Render CPT timestamp into a compact label for lane headers (local time).
+ */
 function fmtCptLabel(cptMs) {
   const cls = getCptState(cptMs);
   if (!cptMs) return `<span class="cpt-ok">CPT</span>`;
   return `<span class="${cls}">CPT ${fmtTime(cptMs)}</span>`;
 }
 
+/**
+ * Humanize a delta in minutes/seconds to +/-HH:MM style for ETAs and variance.
+ */
 function formatDelta(n) {
     const v = Number(n);
     if (!Number.isFinite(v)) return "—";
@@ -581,6 +672,9 @@ function formatDelta(n) {
     return v > 0 ? `+${v}` : `${v}`;
   }
 
+/**
+ * Read the latest cached loadGroup status snapshot (avoids refetch storms).
+ */
 function getLatestLoadGroupStatusCache(loadGroupId, status) {
   try {
     const lg = String(loadGroupId || '').trim();
@@ -608,6 +702,9 @@ function getLatestLoadGroupStatusCache(loadGroupId, status) {
 /* ============================
    OPS DAY WINDOW (07:00 → next day 07:00)
    ============================ */
+/**
+ * Return the current operational window boundaries (shift/ops) used for bucketing and KPIs.
+ */
 function getOpsWindow(nowMs = Date.now()) {
   const now = new Date(nowMs);
   const start = new Date(now);
@@ -828,6 +925,173 @@ function getOpsWindow(nowMs = Date.now()) {
 
 (function () {
   "use strict";
+
+  // =====================================================
+  // Track Relay Auth Tap (cross-tab)
+  //
+  // Relay's Track APIs (track.relay.amazon.dev) require an Authorization: Bearer token.
+  // The Relay SPA already obtains and uses that token. Userscripts often fail to send it
+  // (or can't due to SameSite/cookie constraints), resulting in 401s.
+  //
+  // Fix:
+  //  - Inject a tap into the page (where the Relay SPA runs) to capture the Authorization header.
+  //  - Relay the token back to the userscript via window.postMessage.
+  //  - Persist it into Tampermonkey storage (GM_setValue) so it works across tabs/domains.
+  //
+  // Security note:
+  //  - We NEVER log the token.
+  //  - We store only the "Bearer ..." string + timestamp, and we reject expired JWTs.
+  // =====================================================
+
+  const SSP_TRACK_AUTH_KEY = "SSP_TRACK_AUTH_V1";
+
+  function _sspParseJwtExpSeconds(bearer) {
+    try {
+      const s = String(bearer || "");
+      const tok = s.startsWith("Bearer ") ? s.slice(7) : s;
+      const parts = tok.split(".");
+      if (parts.length < 2) return null;
+      const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+      // pad base64
+      const pad = b64.length % 4 ? "=".repeat(4 - (b64.length % 4)) : "";
+      const jsonStr = atob(b64 + pad);
+      const obj = JSON.parse(jsonStr);
+      if (!obj || typeof obj.exp !== "number") return null;
+      return obj.exp;
+    } catch { return null; }
+  }
+
+  function _sspIsBearerValid(bearer) {
+    try {
+      if (!bearer) return false;
+      const s = String(bearer);
+      if (!s.startsWith("Bearer ")) return false;
+      const exp = _sspParseJwtExpSeconds(s);
+      if (!exp) return true; // if we can't parse exp, don't block; still try.
+      const now = Math.floor(Date.now() / 1000);
+      return exp > (now + 60); // require at least 60s of validity
+    } catch { return false; }
+  }
+
+  function _sspPersistTrackAuth(bearer) {
+    try {
+      if (!_sspIsBearerValid(bearer)) return;
+      if (typeof GM_setValue === "function") {
+        GM_setValue(SSP_TRACK_AUTH_KEY, JSON.stringify({
+          bearer: String(bearer),
+          savedAt: Date.now()
+        }));
+      }
+    } catch {}
+  }
+
+  function _sspLoadTrackAuthFromStore() {
+    try {
+      if (typeof GM_getValue !== "function") return null;
+      const raw = GM_getValue(SSP_TRACK_AUTH_KEY, "");
+      if (!raw) return null;
+      const obj = JSON.parse(raw);
+      const bearer = obj && obj.bearer;
+      if (!_sspIsBearerValid(bearer)) return null;
+      return String(bearer);
+    } catch { return null; }
+  }
+
+  function _sspInstallTrackAuthTap() {
+    try {
+      // Listen for page-context token capture.
+      window.addEventListener("message", (ev) => {
+        try {
+          const d = ev && ev.data;
+          if (!d || d.__SSP_TRACK_AUTH__ !== true) return;
+          const bearer = d.bearer;
+          if (!_sspIsBearerValid(bearer)) return;
+          // Set in unsafeWindow too (same tab convenience)
+          try { if (typeof unsafeWindow !== "undefined") unsafeWindow.__SSP_TRACK_AUTH__ = String(bearer); } catch {}
+          _sspPersistTrackAuth(bearer);
+        } catch {}
+      }, false);
+
+      // Inject tap into page context (so we can see the SPA's Authorization header).
+      // This works on track.relay.amazon.dev pages where the Relay UI makes the request.
+      const code = `(function(){
+        try{
+          if (window.__SSP_TRACK_AUTH_TAP_INSTALLED__) return;
+          window.__SSP_TRACK_AUTH_TAP_INSTALLED__ = true;
+
+          const publish = (bearer) => {
+            try{
+              if (!bearer || typeof bearer !== 'string') return;
+              if (!bearer.startsWith('Bearer ')) return;
+              // store on window for same-tab reads
+              window.__SSP_TRACK_AUTH__ = bearer;
+              // send to userscript for cross-tab persistence
+              window.postMessage({ __SSP_TRACK_AUTH__: true, bearer }, '*');
+            }catch(e){}
+          };
+
+          // Tap fetch
+          const _fetch = window.fetch;
+          if (typeof _fetch === 'function') {
+            window.fetch = function(input, init){
+              try{
+                const h = (init && init.headers) || (input && input.headers);
+                let auth = null;
+                if (h && typeof h.get === 'function') auth = h.get('authorization') || h.get('Authorization');
+                else if (h && typeof h === 'object') auth = h.authorization || h.Authorization;
+                if (auth) publish(String(auth));
+              }catch(e){}
+              return _fetch.apply(this, arguments);
+            };
+          }
+
+          // Tap XHR
+          const X = window.XMLHttpRequest;
+          if (X && X.prototype) {
+            const _open = X.prototype.open;
+            const _set = X.prototype.setRequestHeader;
+            X.prototype.open = function(){
+              this.__sspAuth = null;
+              return _open.apply(this, arguments);
+            };
+            X.prototype.setRequestHeader = function(k,v){
+              try{
+                if (String(k).toLowerCase() === 'authorization') this.__sspAuth = String(v);
+              }catch(e){}
+              return _set.apply(this, arguments);
+            };
+            const _send = X.prototype.send;
+            X.prototype.send = function(){
+              try{
+                if (this.__sspAuth) publish(this.__sspAuth);
+              }catch(e){}
+              return _send.apply(this, arguments);
+            };
+          }
+        }catch(e){}
+      })();`;
+
+      const s = document.createElement('script');
+      s.textContent = code;
+      (document.head || document.documentElement).appendChild(s);
+      s.remove();
+    } catch {}
+  }
+
+  function _sspGetTrackAuthHeader() {
+    // Prefer same-tab captured token, fallback to persisted GM storage.
+    try {
+      let v = null;
+      try { if (typeof unsafeWindow !== "undefined") v = unsafeWindow.__SSP_TRACK_AUTH__; } catch {}
+      if (_sspIsBearerValid(v)) return String(v);
+      const stored = _sspLoadTrackAuthFromStore();
+      if (_sspIsBearerValid(stored)) return String(stored);
+      return null;
+    } catch { return null; }
+  }
+
+  // Install auth tap ASAP (on all matched pages).
+  _sspInstallTrackAuthTap();
 
 (function _ssp2InjectButtonCss(){
   try {
@@ -1108,6 +1372,9 @@ window.__SSP_DIAG = window.__SSP_DIAG || {
   }
 
 
+/**
+ * Walk outbound tree nodes and extract container counts by status for a lane group.
+ */
 function extractContainersMetaFromObTree(nodes) {
   // Traverse OB container tree and return distinct container nodes with:
   // - id: best-effort container identifier
@@ -1554,14 +1821,14 @@ async function fetchCurrentUnitsCoordinator({ lg, laneTxt }) {
       nodeId: STATE.nodeId,
       loadGroupId: String(lg),
       planId: String(anchor.planId),
-      vrId: String(anchor.vrId || ''),
+      vrId: String(anchor.vrId || anchor.vrid || ''),
       // SSP typo is REQUIRED
-      status: 'inFacility',
+      status: 'inFaciltiy',
       trailerId: ''
     };
-  // v1.5.97: SSP sites are inconsistent; primary is 'inFacility', fallback is legacy typo 'inFaciltiy'.
+  // v1.5.97: SSP sites are inconsistent; primary is 'inFacility', fallback is legacy typo 'inFacility'.
 // We try both; if ROOT_NODE is empty we treat it as "0 in-facility containers" instead of an error.
-const _tryStatuses = ['inFacility','inFaciltiy'];
+const _tryStatuses = ['inFaciltiy','inFacility'];
 let resp = null;
 let roots = [];
 let usedStatus = null;
@@ -1735,6 +2002,9 @@ _step('roots_extracted', { rootsCount: Array.isArray(roots) ? roots.length : -1,
     return { totalUnitsAll, totalContainersAll, totalUnitsCart, totalContainersCart, byInboundLane };
   }
 
+/**
+ * Normalize SSP/FMC outbound response into a stable array of root nodes.
+ */
 function getObRootNodes(resp) {
     // SSP OB container details response shapes vary by view/version.
     // Prefer ROOT_NODE, but fall back to common alternates or aaData-as-array.
@@ -1787,6 +2057,9 @@ function getObRootNodes(resp) {
   out.sort((a,b) => (b.units - a.units));
   return out;
 }
+/**
+ * Summarize root nodes into lane-level aggregates (capacity, loaded/current/inbound, etc.).
+ */
 function summarizeRootsForLane(roots, laneTokenNorm) {
   const out = {
     vrids: new Set(),
@@ -1901,6 +2174,9 @@ async function fetchFmcExecutionMetaByIds(vrids) {
   return res.json();
 }
 
+/**
+ * Build driver lookup maps from FMC search results for fast driver popovers.
+ */
 function hydrateDriverMapsFromFmcSearch(json) {
   const records = json?.data?.records || json?.returnedObject?.records || json?.records || [];
   for (const r of records) {
@@ -2098,6 +2374,9 @@ function hydrateDriverMapsFromFmcSearch(json) {
       return null;
     }
   }
+/**
+ * Extract per-CPT container totals by status from outbound response payload.
+ */
 function extractCptContainersByStatusFromObResp(resp) {
   // Best-effort extraction of "CPT Container Details" (containers column) by status.
   // Response shapes vary; we look for arrays of row-objects that resemble:
@@ -2171,9 +2450,15 @@ function extractCptContainersByStatusFromObResp(resp) {
 }
 
 // ==== CU Diagnostics helpers (1.5.48)
+/**
+ * Whether CU diagnostics logging is enabled (used to keep console noise controllable).
+ */
 function _cuDiagEnabled() {
   try { return !!(STATE && STATE.settings && STATE.settings.mergeDebug); } catch (e) { return false; }
 }
+/**
+ * Conditional logger for Current Units (CU) pipeline; emits stepwise debug snapshots.
+ */
 function _cuLog(step, data) {
   if (!_cuDiagEnabled()) return;
   try {
@@ -2262,7 +2547,7 @@ function _cuLog(step, data) {
 // Also store a simplified cache entry keyed only by loadGroupId + normalized status.
 // The Action Panel precompute uses these simple keys (e.g., `${lg}::inFacility`, `${lg}::notArrived`).
 try {
-  const stSimple = (st === 'inFaciltiy') ? 'inFacility' : st;
+  const stSimple = (st === 'inFacility') ? 'inFacility' : st;
   const simpleKey = `${lg}::${stSimple}`;
   const prev = STATE.loadGroupContainerCache[simpleKey];
   if (!prev || !prev.ts || prev.ts <= out.ts) STATE.loadGroupContainerCache[simpleKey] = out;
@@ -2323,7 +2608,7 @@ async function dumpObPayloadForVrid(vrid) {
   // Throttled to avoid hammering SSP.
   function ensureVridDetailsRequested(vrid) {
     if (!vrid) return;
-    if (!STATE.mergePanelOpen && !SETTINGS.prefetchObDetails) return;
+    if (!STATE.mergePanelOpen && !STATE.dockOppsOpen && !SETTINGS.prefetchObDetails) return;
     if (STATE.vridLoadedUnits && Number.isFinite(STATE.vridLoadedUnits[vrid])) return; // already have a value
     const d = STATE.vridDetails;
     if (d.requested.has(vrid) || d.inflight.has(vrid)) return;
@@ -2413,6 +2698,9 @@ const DEBUG = {
   clickActions: true,
 };
 
+/**
+ * Structured debug logger (namespaced) used across modules.
+ */
 function dlog(section, payload) {
   if (!DEBUG.enabled) return;
   try {
@@ -2422,6 +2710,9 @@ function dlog(section, payload) {
   }
 }
 
+/**
+ * Console group helper for readable debug output blocks.
+ */
 function dgroup(title, fn) {
   if (!DEBUG.enabled) return;
   try {
@@ -2564,6 +2855,9 @@ function dgroup(title, fn) {
   document.head.appendChild(style);
 }
 
+/**
+ * UI helper: add a clickable phone icon next to a VRID cell when driver contact exists.
+ */
 function injectPhoneIconIntoVridCell(vridCell, vrid) {
   if (!vridCell || !vrid) return;
   ensurePhoneIconStyle();
@@ -2608,6 +2902,9 @@ function injectPhoneIconIntoVridCell(vridCell, vrid) {
  *    showPhoneTooltip() -> showDriverPopover() -> showPhoneTooltip() ...
  *  This wrapper is deliberately one-way.
  */
+/**
+ * Render and position the driver info popover anchored to a UI element.
+ */
 function showDriverPopover(anchorEl, html) {
   try {
     if (typeof showSspUtilPopover === "function") {
@@ -2641,6 +2938,9 @@ function showDriverPopover(anchorEl, html) {
   }
 }
 
+/**
+ * Close and cleanup the driver info popover UI.
+ */
 function closeDriverPopover() {
   try {
     if (typeof closeSspUtilPopover === "function") return closeSspUtilPopover();
@@ -2672,6 +2972,9 @@ function extractScacFromCarrierCellText(text) {
 
 // Extract Relay driver key/ARN from arbitrary objects/strings.
 // Example: "amzn1.relay.dv1.T-6F2K0sKz6qdHLAqlx"
+/**
+ * Extract a Relay driver identifier/ARN from mixed payload shapes (string/object).
+ */
 function extractRelayDriverKey(val) {
   const scan = (x) => {
     if (!x) return "";
@@ -3024,14 +3327,16 @@ async function fetchDriverDetail(scac, driverId) {
     }
 
     const svgId = `ssp-util-barcode-${Math.random().toString(16).slice(2)}`;
+    const wrapId = `ssp-util-barcode-wrap-${Math.random().toString(16).slice(2)}`;
+
     showSspUtilPopover(anchorEl, `
       <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
         <div style="font-weight:950">Attached Load Resource</div>
         <button id="ssp-util-close" style="border:0;background:#f3f4f6;border-radius:8px;padding:4px 8px;cursor:pointer;font-weight:900">Close</button>
       </div>
       <div style="margin-top:8px;font-weight:900;word-break:break-all">${rid}</div>
-      <div style="margin-top:10px;border:1px solid #e5e7eb;border-radius:10px;padding:8px;background:#fff;">
-        <svg id="${svgId}"></svg>
+      <div id="${wrapId}" style="margin-top:10px;border:1px solid #e5e7eb;border-radius:10px;padding:10px;background:#fff;display:inline-block;max-width:92vw;overflow-x:auto;overflow-y:hidden;">
+        <svg id="${svgId}" style="display:block;"></svg>
       </div>
     `);
 
@@ -3042,9 +3347,26 @@ async function fetchDriverDetail(scac, driverId) {
       const ok = await ensureJsBarcode();
       if (!ok) return; // fall back to displaying the id only
       const svg = document.getElementById(svgId);
-      if (!svg) return;
+      const wrap = document.getElementById(wrapId);
+      if (!svg || !wrap) return;
+
       try {
         window.JsBarcode(svg, rid, { format: "CODE128", displayValue: true });
+
+        // Fit wrapper to barcode width (no clipping). If wider than viewport, allow horizontal scroll.
+        // NOTE: getBBox() requires the SVG to have rendered content.
+        try {
+          const bb = svg.getBBox();
+          const desired = Math.ceil((bb?.width || 0) + 20); // padding + borders
+          const max = Math.floor(Math.min(window.innerWidth * 0.92, 980));
+          if (desired > 0) {
+            wrap.style.width = Math.min(desired, max) + "px";
+            wrap.style.maxWidth = max + "px";
+            wrap.style.overflowX = desired > max ? "auto" : "hidden";
+          }
+        } catch (_) {
+          // ignore sizing issues; wrapper is already scroll-safe
+        }
       } catch (e) {
         console.error("JsBarcode render failed", e);
       }
@@ -3744,7 +4066,7 @@ function resolveObAnchorForLg(loadGroupId, laneTxt) {
     }
   }
 
-  return best ? { planId: obPlanId(best), vrid: obVrid(best) } : null;
+  return best ? { planId: obPlanId(best), vrId: obVrid(best), vrid: obVrid(best) } : null;
 }
 
 
@@ -3970,6 +4292,7 @@ function scheduleDriverPrefetch(reason = "") {
           inboundCarts: 0,
           totalCarts: 0,
           inFacilityCarts: 0,
+          loadedCarts: 0,
           upstreamCarts: 0,
           remainingLoads: 0,
           requiredPerLoad: 0,
@@ -4014,6 +4337,7 @@ function scheduleDriverPrefetch(reason = "") {
             inboundCarts: 0,
           totalCarts: 0,
           inFacilityCarts: 0,
+          loadedCarts: 0,
           upstreamCarts: 0,
           remainingLoads: 0,
             requiredPerLoad: 0,
@@ -4034,7 +4358,21 @@ function scheduleDriverPrefetch(reason = "") {
       });
     });
 
-    // classify (lane-level capacity states)
+    
+// Sum loaded units per CPT from OB VRID loaded-unit cache (getOutboundLoadContainerDetails)
+try {
+  Object.keys(map).forEach(k => {
+    const cptMs = Number(k);
+    const cpt = map[cptMs];
+    if (!cpt) return;
+    let loaded = 0;
+    const vrids = cpt.vrids && cpt.vrids.size ? Array.from(cpt.vrids) : [];
+    for (const vrid of vrids) loaded += Number((STATE.vridLoadedUnits && STATE.vridLoadedUnits[vrid]) || 0);
+    cpt.loadedCarts = loaded;
+  });
+} catch (_) {}
+
+// classify (lane-level capacity states)
 // Model:
 // - facility (inFacilityCarts): loaded + current + ready/yard/unloading
 // - upstream (upstreamCarts): in-transit/scheduled
@@ -4046,7 +4384,7 @@ const nowPct   = Number(SETTINGS.capMergeNowPct ?? 1.00);
 const riskPct  = Number(SETTINGS.capRiskPct ?? 1.00);
 
 const baseWRaw = Number(SETTINGS.mergeInboundWeight);
-const baseW = Number.isFinite(baseWRaw) ? baseWRaw : 0.35;
+const baseW = Number.isFinite(baseWRaw) ? Math.max(0, Math.min(baseWRaw, 0.50)) : 0.35;
 
 const adhocOver = Math.max(0, Number(SETTINGS.adhocOverageUnits ?? 8));
 const cancelLeadMin = Math.max(0, Number(SETTINGS.cancelLeadMinutes ?? 120));
@@ -4057,12 +4395,31 @@ const cancelMinObserved = Math.max(0, Number(SETTINGS.cancelMinObservedUnits ?? 
 STATE.mergeStats = { load: 0, soon: 0, now: 0, risk: 0, adhoc: 0, cancel: 0, ok: 0 };
 STATE.mergeDetail = [];
 
+
+// === Compute loaded units per CPT from VRID-level loaded units ===
+// Lane card "Loaded" already comes from STATE.vridLoadedUnits; the capacity-state math must use the same source,
+// otherwise CANCEL/MERGE decisions will be wrong.
+for (const cpt of Object.values(map)) {
+  try {
+    let sumLoaded = 0;
+    const vs = cpt?.vrids ? Array.from(cpt.vrids) : [];
+    for (const vrid of vs) {
+      const n = Number(STATE.vridLoadedUnits?.[vrid] || 0);
+      if (Number.isFinite(n)) sumLoaded += n;
+    }
+    cpt.loadedCarts = sumLoaded;
+  } catch (_) {
+    cpt.loadedCarts = Number(cpt.loadedCarts || 0);
+  }
+}
+
 Object.values(map).forEach(cpt => {
   const loads = Math.max(1, Number(cpt.remainingLoads || 0));
   const capPer = Math.max(1, Number(cpt.capacity || 0)); // carts per trailer
   const capTotal = loads * capPer;
 
-  const facility = Number(cpt.inFacilityCarts || 0);
+  const loaded = Number(cpt.loadedCarts || 0);
+  const facility = loaded + Number(cpt.inFacilityCarts || 0);
   const upstream = Number(cpt.upstreamCarts || 0);
 
   const minsToCpt = Number.isFinite(Number(cpt.cptMs))
@@ -4138,6 +4495,8 @@ Object.values(map).forEach(cpt => {
     capacityPerLoad: capPer,
     loads,
     capTotal,
+    loadedCarts: loaded,
+    currentCarts: Number(cpt.inFacilityCarts || 0),
     inFacilityCarts: facility,
     upstreamCarts: upstream,
     inboundWeight: inboundW,
@@ -4446,6 +4805,15 @@ try {
       };
       const loadedFromApi = Number(STATE.vridLoadedUnits?.[vrid]);
       const loadedUnits = Number.isFinite(loadedFromApi) && loadedFromApi > 0 ? loadedFromApi : n(loadedIdx);
+      try {
+        // Fallback: seed loaded units from the table until OB fetchdata fills STATE.vridLoadedUnits.
+        STATE.vridLoadedUnits = STATE.vridLoadedUnits || {};
+        if (!Number.isFinite(Number(STATE.vridLoadedUnits[vrid])) || Number(STATE.vridLoadedUnits[vrid]) === 0) {
+          const lu0 = Number(loadedUnits || 0);
+          if (lu0 > 0) STATE.vridLoadedUnits[vrid] = lu0;
+        }
+      } catch (_) {}
+
       // "Current" = what's physically here (in-facility) for this VRID/lane.
       // "Inbound" = upstream/notArrived (yard/road/door/etc). Do NOT mix inbound into current.
       const inboundUnits = n(inboundIdx);
@@ -4871,6 +5239,9 @@ try {
     );
   }
 function ensurePanel() {
+    // UI should only render on SSP (trans-logistics). We do run on track.relay.amazon.dev to
+    // capture Relay auth, but we do NOT want the SSP Util overlay/UI injected there.
+    if (!String(location.hostname || "").includes("trans-logistics.amazon.com")) return;
     if (document.getElementById("ssp2-panel")) return;
 
     const p = document.createElement("div");
@@ -4887,7 +5258,7 @@ function ensurePanel() {
 
     p.innerHTML = `
       <div id="ssp2-panelhdr" style="padding:10px;font-weight:800;background:#f3f3f3;cursor:move;border-radius:10px 10px 0 0">
-        SSP Util 1.6.41 — Action Panel
+        SSP Util 1.6.71 — Action Panel
       </div>
       <div style="padding:10px;flex:1;min-height:0;display:flex;flex-direction:column">
         <div id="ssp2-status" style="white-space:pre-wrap"></div>
@@ -4898,6 +5269,8 @@ function ensurePanel() {
           <button id="ssp2-disruptions-ib" style="cursor:pointer;padding:5px 12px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;display:none;">Issues: …</button>
 
           <span style="width:1px;height:18px;background:#e5e7eb;display:inline-block;margin:0 2px;"></span>
+
+          <button id="ssp2-cap-all" style="cursor:pointer;padding:5px 12px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;display:none;">All</button>
 
           <button id="ssp2-cap-cancel" style="cursor:pointer;padding:5px 12px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;display:none;">Cancel</button>
           <button id="ssp2-cap-adhoc" style="cursor:pointer;padding:5px 12px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;display:none;">Adhoc</button>
@@ -4918,7 +5291,7 @@ function ensurePanel() {
         <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">
           <button id="refresh-now">Refresh Now</button>
           <button id="show-error">Last Error</button>
-          <button id="csv-ib">CSV IB CART</button>
+          <button id="csv-ib">CSV XD Graph</button>
           <button id="csv-ib4">CSV IB4CPT</button>
         </div>
 
@@ -5617,6 +5990,7 @@ function renderPanel() {
 // Update capacity signal buttons (Action Panel)
     try {
       const ms = STATE.mergeStatsByLane || STATE.mergeStats || {};
+      const curFilter = String(STATE.mergeFilter || "");
       const defs = [
         ["cancel", "ssp2-cap-cancel", "Cancel"],
         ["adhoc",  "ssp2-cap-adhoc",  "Adhoc"],
@@ -5624,13 +5998,39 @@ function renderPanel() {
         ["now",    "ssp2-cap-now",    "Merge Now"],
         ["soon",   "ssp2-cap-soon",   "Merge Soon"],
       ];
+
+      // Always provide a way back to the unfiltered view.
+      const allBtn = document.getElementById("ssp2-cap-all");
+      if (allBtn) {
+        if (curFilter) {
+          allBtn.style.display = "";
+          allBtn.textContent = "All";
+          allBtn.style.background = "#111827";
+          allBtn.style.color = "#fff";
+          allBtn.style.borderColor = "#111827";
+          allBtn.onclick = () => {
+            try { STATE.mergeFilter = ""; renderPanel(); } catch (_) {}
+          };
+        } else {
+          allBtn.style.display = "none";
+          allBtn.onclick = null;
+        }
+      }
+
       defs.forEach(([key, id, label]) => {
         const el = document.getElementById(id);
         if (!el) return;
         const n = Number(ms[key] || 0);
-        if (n > 0) {
+        const isActive = (curFilter === key);
+
+        // IMPORTANT: keep the active filter button visible even if counts drop to 0,
+        // otherwise there is no way to toggle back.
+        if (n > 0 || isActive) {
           el.style.display = "";
-          el.textContent = `${label}: ${n}`;
+          el.textContent = (n > 0) ? `${label}: ${n}` : `${label}: 0`;
+          el.style.background = isActive ? "#111827" : "#fff";
+          el.style.color = isActive ? "#fff" : "#111827";
+          el.style.borderColor = isActive ? "#111827" : "#d1d5db";
           el.onclick = () => {
             try {
               const cur = String(STATE.mergeFilter || "");
@@ -5640,10 +6040,10 @@ function renderPanel() {
           };
         } else {
           el.style.display = "none";
+          el.onclick = null;
         }
       });
     } catch (_) {}
-
 // Update global disruptions widget (Action Panel)
     try {
       const ibEl = document.getElementById("ssp2-disruptions-ib");
@@ -5880,7 +6280,7 @@ STATE.actionGroups = groups;
             currentSum += Number(curCached.totalUnits || 0);
           } else {
             cuPending = true;
-            fetchContainerDetailsForLoadGroupId(lg, { planId: idx?.planId || "", trailerId: idx?.trailerId || "", vrid }, 'inFaciltiy')
+            fetchContainerDetailsForLoadGroupId(lg, { planId: idx?.planId || "", trailerId: idx?.trailerId || "", vrid }, 'inFacility')
               .then(() => { /* cache populated */ })
               .catch(() => { /* ignore */ });
           }
@@ -5922,6 +6322,74 @@ STATE.actionGroups = groups;
         g.currentUnitsPending = cuPending;
         g.inboundUnitsPending = ibPending;
         g.remainingUnits = Math.max(0, Number(g.capacityTotal || 0) - Number(currentUnits || 0));
+        // Compute lane-level merge/capacity state (DO NOT inherit CPT-level state; CPT buckets can mix lanes).
+        try {
+          const capTotal = Math.max(0, Number(g.capacityTotal || 0));
+          const loads = Math.max(1, new Set((g.vrids || []).map(v => String(v.vrid || v.vrId || "").trim()).filter(Boolean)).size || 0);
+          const capPer = capTotal && loads ? (capTotal / loads) : (Number(SETTINGS.cap53ftCarts) || 36);
+
+          const loaded = Number(g.loadedUnits || 0);
+
+          // Same adjustment as the UI: "Current" should exclude LOADED when the upstream source already includes it.
+          let curAdj = Number(g.currentUnits || 0);
+          if (loaded > 0 && curAdj >= loaded && (curAdj - loaded) <= capTotal) curAdj = Math.max(0, curAdj - loaded);
+
+          const upstream = Number(g.inboundUnits || 0);
+
+          const hardWarn = Number(SETTINGS.capHardWarnPct ?? 0.90);
+          const soonPct  = Number(SETTINGS.capMergeSoonPct ?? 0.85);
+          const nowPct   = Number(SETTINGS.capMergeNowPct ?? 1.00);
+          const riskPct  = Number(SETTINGS.capRiskPct ?? 1.00);
+
+          const baseWRaw = Number(SETTINGS.mergeInboundWeight);
+          const baseW = Number.isFinite(baseWRaw) ? Math.max(0, Math.min(baseWRaw, 0.50)) : 0.35;
+
+          const minsToCpt = Number.isFinite(Number(g.cptMs))
+            ? Math.round((Number(g.cptMs) - Date.now()) / 60000)
+            : NaN;
+
+          let inboundW = baseW;
+          if (Number.isFinite(minsToCpt)) {
+            if (minsToCpt > 180) inboundW = Math.min(inboundW, 0.15);
+            else if (minsToCpt > 90) inboundW = Math.min(inboundW, 0.25);
+            else if (minsToCpt > 45) inboundW = Math.min(inboundW, baseW);
+            else inboundW = Math.max(inboundW, 0.50);
+          }
+
+          const facility = loaded + curAdj;
+          const projUnits = facility + inboundW * upstream;
+
+          const hardPct = capTotal ? (facility / capTotal) : 0;
+          const projPct = capTotal ? (projUnits / capTotal) : 0;
+          const overage = Math.max(0, projUnits - capTotal);
+
+          const adhocOver = Math.max(0, Number(SETTINGS.adhocOverageUnits ?? 8));
+          const cancelLeadMin = Math.max(0, Number(SETTINGS.cancelLeadMinutes ?? 120));
+          const cancelHorizonMin = Math.max(0, Number(SETTINGS.cancelShowHorizonMinutes ?? 360));
+          const cancelMinObserved = Math.max(0, Number(SETTINGS.cancelMinObservedUnits ?? 6));
+
+          const neededLoadsRaw = Math.ceil(projUnits / capPer);
+          const neededLoads = (projUnits <= 0.01) ? 0 : Math.max(1, neededLoadsRaw);
+          const cancelLoads = Math.max(0, loads - neededLoads);
+
+          let st = "load";
+
+          if (cancelLoads > 0 && Number.isFinite(minsToCpt) && minsToCpt >= cancelLeadMin && minsToCpt <= cancelHorizonMin) {
+            const observedUnits = facility + upstream;
+            if (observedUnits >= cancelMinObserved || minsToCpt <= 90) st = "cancel";
+          }
+
+          if (overage >= adhocOver) st = "adhoc";
+
+          if (hardPct >= riskPct || projPct >= (riskPct + 0.10)) st = "risk";
+
+          if (hardPct >= hardWarn && projPct >= nowPct) st = "now";
+          else if (projPct >= soonPct && st === "load") st = "soon";
+
+          g.mergeState = st;
+          g.mergeMeta = { capTotal, loads, capPer, loaded, current: curAdj, upstream, inboundW, hardPct, projPct, overage, neededLoads, cancelLoads, minsToCpt };
+        } catch (_) {}
+
       }
 
 
@@ -6028,9 +6496,16 @@ if (DEBUG.laneGroups) {
               const curRaw = (STATE.vridUnits && Object.prototype.hasOwnProperty.call(STATE.vridUnits, v.vrid)) ? STATE.vridUnits[v.vrid] : null;
               const curTxt = (curRaw === null || curRaw === undefined) ? "—" : String(Number(curRaw) || 0);
               const utilBadge = cap ? ` <span style="margin-left:8px;padding:2px 8px;border-radius:999px;background:#111827;color:#fff;font-weight:900;font-size:12px;">${curTxt}/${cap}</span>` : "";
-              return `                <div style="display:flex;gap:8px;align-items:center;justify-content:space-between;padding:6px 0;border-top:1px solid #f3f4f6;">                  <div style="font-weight:900;">                    ${esc(v.vrid)}${utilBadge}${eqBadge}${locTxt}${doorTxt}${trTxt}                    <div style="margin-top:2px;color:#6b7280;font-weight:800;">${esc(laneTxt)}</div>                  </div>                  <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;">                    ${mkBtn("TT", "tt:" + v.vrid, "Open TT for VRID")}                    ${mkBtn("Relay", "relay:" + v.vrid, "Open Relay for VRID")}                    ${mkBtn("FMC", "fmc:" + v.vrid, "Open FMC for VRID")}                    ${mkBtn("Select", "sel:" + v.vrid, "Toggle SSP row checkbox")}                  </div>                </div>              `;
+              return `                <div style="display:flex;gap:8px;align-items:center;justify-content:space-between;padding:6px 0;border-top:1px solid #f3f4f6;">                  <div style="font-weight:900;">                    ${esc(v.vrid)}${utilBadge}${eqBadge} <span class="ssp-relay-meta" data-vrid="${esc(v.vrid)}" style="margin-left:6px;"><span style="color:#9ca3af;font-weight:800;">—</span></span>${locTxt}${doorTxt}${trTxt}                    <div style="margin-top:2px;color:#6b7280;font-weight:800;">${esc(laneTxt)}</div>                  </div>                  <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;align-items:center;">                    ${mkBtn("TT", "tt:" + v.vrid, "Open TT for VRID")}                    ${mkBtn("Relay", "relay:" + v.vrid, "Open Relay for VRID")}                    ${mkBtn("FMC", "fmc:" + v.vrid, "Open FMC for VRID")}                    ${mkBtn("Select", "sel:" + v.vrid, "Toggle SSP row checkbox")}                  </div>                </div>              `;
             })
             .join("");
+
+          // cache lane->vrids for lane map panel
+          try {
+            STATE.__laneCptToVrids = STATE.__laneCptToVrids || {};
+            STATE.__laneCptToVrids[`${String(g.lane||"")}|${Number(g.cptMs||0)}`] = g.vrids.map(x => String(x.vrid||x.vrId||"").trim()).filter(Boolean);
+          } catch (_) {}
+
 
           // Action Panel should mirror ops-relevant buckets:
           // Capacity (planned), Loaded (on trailer), Current (in-facility), Inbound (not-arrived).
@@ -6048,10 +6523,21 @@ if (DEBUG.laneGroups) {
           const pct = (capTotal > 0 && curNum !== null && !Number.isNaN(curNum)) ? Math.round((curNum / capTotal) * 100) : 0;
           const pctDisp = (!capTotal || curNum === null) ? "…" : String(pct);
 
+          // Display utilization as (Loaded + Current + Inbound*w) / Capacity when mergeMeta is available.
+          const __mm = g && g.mergeMeta ? g.mergeMeta : null;
+          const __utilDen = (__mm && Number.isFinite(__mm.capTotal) && __mm.capTotal > 0) ? Number(__mm.capTotal) : (capTotal > 0 ? Number(capTotal) : 0);
+          const __utilNum = (__mm && __utilDen)
+            ? (Number(__mm.loaded || 0) + Number(__mm.current || 0) + (Number(__mm.inboundW || 0) * Number(__mm.upstream || 0)))
+            : (Number(g.loadedUnits || 0) + (curNum === null ? 0 : Number(curNum || 0)));
+          const __utilPct = (__utilDen > 0) ? Math.round((__utilNum / __utilDen) * 100) : 0;
+          const __utilFactorDisp = (__utilDen > 0 && Number.isFinite(__utilNum))
+            ? `${__utilNum.toFixed(1)}/${__utilDen} (${__utilPct}%)`
+            : "…";
+
           const ibVridsDisp = (g.inboundVridCount && Number(g.inboundVridCount) > 0) ? ` • VRIDs: <b>${Number(g.inboundVridCount)}</b>` : ``;
           const sub =
             g.capacityTotal
-              ? `Capacity: <b>${g.capacityTotal}</b> units | Loaded: <b>${g.loadedUnits || 0}</b> | Current: <b>${curDisp}</b> units | Inbound: <b>${inbDisp}</b> units${ibVridsDisp} (${pctDisp}%)`
+              ? `Capacity: <b>${g.capacityTotal}</b> units | Loaded: <b>${g.loadedUnits || 0}</b> | Current: <b>${curDisp}</b> units | Inbound: <b>${inbDisp}</b> units${ibVridsDisp} <span style="color:#6b7280;">| Util: <b>${__utilFactorDisp}</b></span>`
               : `Capacity: —`;
 
 
@@ -6090,22 +6576,48 @@ const __caseVridCount = (STATE.obCaseVridCountByLaneCpt && typeof STATE.obCaseVr
   ? STATE.obCaseVridCountByLaneCpt[__caseKey]
   : 0;
 
-return `            <details ${idx == 0 ? "open" : ""} style="border:1px solid #e5e7eb;border-radius:12px;padding:10px;margin-bottom:8px;background:#fff;">              <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:10px;">                <div style="font-weight:900;">                  ${esc(g.lane)} (${fmtCptLabel((g && g.cptMs) || (lane && lane.cptMs) || cptMs)})                  <div style="margin-top:2px;color:#111827;font-weight:800;">${sub}</div>${ibContribHtml}                  <div style="margin-top:2px;color:#6b7280;font-weight:800;">Loads shown: ${g.vrids.length} | CPT remaining loads: ${g.remainingLoadsCpt}</div>                </div>                <div style="display:flex;gap:6px;align-items:center;">
+return `            <details ${idx == 0 ? "open" : ""} style="border:1px solid #e5e7eb;border-radius:12px;padding:10px;margin-bottom:8px;background:#fff;">              <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:10px;">                <div style="font-weight:900;">                  <span class="ssp-open-lane-map" data-lane="${esc(g.lane)}" data-cpt="${g.cptMs}" style="cursor:pointer;text-decoration:underline;">${esc(g.lane)}</span> (${fmtCptLabel((g && g.cptMs) || (lane && lane.cptMs) || cptMs)})                  <div style="margin-top:2px;color:#111827;font-weight:800;">${sub}</div>${ibContribHtml}                  <div style="margin-top:2px;color:#6b7280;font-weight:800;">Loads shown: ${g.vrids.length} | CPT remaining loads: ${g.remainingLoadsCpt}</div>                </div>                <div style="display:flex;gap:6px;align-items:center;">
 	                  <span class="cap-dot open-merge" data-lane="${esc(g.lane)}" data-cpt="${g.cptMs}" title="Capacity: ${capLabel(pct)} (${pct}%)" style="cursor:pointer;width:12px;height:12px;border-radius:999px;display:inline-block;border:1px solid #e5e7eb;background:${capColor(pct)};"></span>
 <span class="merge-dot open-merge" data-lane="${esc(g.lane)}" data-cpt="${g.cptMs}" title="Merge: ${stateLabel(g.mergeState)}" style="cursor:pointer;width:12px;height:12px;border-radius:999px;display:inline-block;border:1px solid #e5e7eb;background:${stateColor(g.mergeState)};"></span>
 ${disruptDotHtml}
-	                </div>              </summary>              <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:8px;">                <button class="open-cases" data-lane="${g.laneKey}" data-cpt="${g.cptMs}" title="Open lane cases" style="cursor:pointer;padding:4px 12px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;">Cases${__caseVridCount ? ` (${__caseVridCount})` : ``}</button>                <button class="open-merge" data-lane="${esc(g.lane)}" data-cpt="${g.cptMs}" title="Open lane details" style="cursor:pointer;padding:4px 12px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;">Details</button>              </div>              <div style="margin-top:8px;">${vridRows}</div>            </details>          `;
+	                </div>              </summary>              <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:8px;">                <button class="open-cases" data-lane="${esc(g.lane)}" data-cpt="${g.cptMs}" title="Open lane cases" style="cursor:pointer;padding:4px 12px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;">Cases${__caseVridCount ? ` (${__caseVridCount})` : ``}</button>                <button class="open-merge" data-lane="${esc(g.lane)}" data-cpt="${g.cptMs}" title="Open lane details" style="cursor:pointer;padding:4px 12px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;">Details</button>              </div>              <div style="margin-top:8px;">${vridRows}</div>            </details>          `;
         })
         .join("");
+
+      STATE.dockOppsOpen = true;
 
       list.innerHTML =
         `<div style="font-weight:900;margin-bottom:8px;">Dock Opportunities (Lane → VRIDs)</div>` +
         (groupHtml || `<div style="color:#6b7280;">No outbound loads detected (or outside horizon).</div>`);
+      // Prefetch Relay badges (cases/disruptions/notes) for visible VRIDs (non-blocking).
+      // We keep a conservative cap to avoid hammering Track, but aim to cover what's on-screen.
+      try {
+        const vv = [];
+        for (const g of filteredGroups.slice(0, 16)) {
+          for (const x of (g.vrids || []).slice(0, 6)) {
+            const id = String(x.vrid || x.vrId || "").trim();
+            if (id) vv.push(id);
+          }
+        }
+        _sspPrefetchRelayMetaBadges(vv, 48);
+      } catch (_) {}
+
 
       // attach one delegated handler
       if (!list.dataset.ssp2Bound) {
         list.dataset.ssp2Bound = "1";
         list.addEventListener("click", (e) => {
+
+          // Lane label click: open lane VRID list (Relay-backed) for quick planning glance.
+          const laneSpan = e.target && e.target.closest ? e.target.closest(".ssp-open-lane-map") : null;
+          if (laneSpan) {
+            e.preventDefault();
+            e.stopPropagation();
+            const lane = laneSpan.getAttribute("data-lane") || "";
+            const cpt = Number(laneSpan.getAttribute("data-cpt") || 0);
+            try { openLaneMapPanel(lane, cpt); } catch (_) { window.open(`https://relay.amazon.com/tms/search?query=${encodeURIComponent(lane)}`, "_blank", "noopener"); }
+            return;
+          }
 const dis = e.target.closest(".open-disruptions");
  if (dis) {
    e.preventDefault();
@@ -6122,7 +6634,7 @@ const dis = e.target.closest(".open-disruptions");
    e.stopPropagation();
    const lane = cas.getAttribute("data-lane") || "";
    const cpt = Number(cas.getAttribute("data-cpt") || 0);
-   if (typeof openCasesPanel === "function") openCasesPanel(lane, cpt);
+   if (typeof openRelayCasesPanel === "function") openRelayCasesPanel(lane, cpt);
    return;
  }
 
@@ -6154,7 +6666,17 @@ if (chip) {
           const open = (url) => window.open(url, "_blank", "noopener");
 
           if (kind === "tt") open(buildTTUrl(STATE.nodeId, vrid));
-          else if (kind === "relay") open(buildRelayUrl(vrid));
+          else if (kind === "relay") {
+            // Default: open RelayMini (hover-style) for quick glance. Shift-click: open Relay in a new tab.
+            try {
+              if (e.shiftKey) return open(buildRelayUrl(vrid));
+              _showRelayMiniForAnchor(btn, vrid, (STATE && (STATE.nodeId || STATE.nodeID)) || "");
+              // Prefetch badges for this VRID immediately
+              try { _sspPrefetchRelayMetaBadges([vrid], 1); } catch(_) {}
+            } catch (err) {
+              open(buildRelayUrl(vrid));
+            }
+          }
           else if (kind === "fmc") open(buildFmcUrl(vrid));
           else if (kind === "sel") {
             // toggle native SSP checkbox in the main dashboard row
@@ -6460,6 +6982,7 @@ function _sspRelayExtractCoordinates(root) {
 function _sspRelayRequest(url, timeoutMs = 8000) {
   return new Promise((resolve, reject) => {
     try {
+      const auth = _sspGetTrackAuthHeader();
       GM_xmlhttpRequest({
         method: "GET",
         url,
@@ -6468,6 +6991,7 @@ function _sspRelayRequest(url, timeoutMs = 8000) {
         withCredentials: true,
         headers: {
           "Accept": "application/json, text/plain, */*",
+          ...(auth ? { "Authorization": auth } : {}),
           "Origin": "https://track.relay.amazon.dev",
           "Referer": "https://track.relay.amazon.dev/"
         },
@@ -6482,6 +7006,141 @@ function _sspRelayRequest(url, timeoutMs = 8000) {
       });
     } catch (e) { reject(e); }
   });
+}
+
+
+
+// Relay search: fetch a list of transport-views by a lane search term over a time window.
+// Uses the same /api/v2/transport-views endpoint used by Track & Trace.
+async function _sspRelaySearchTransportViews(searchTerm, startMs, endMs) {
+  const term = String(searchTerm||'').trim();
+  if (!term) return [];
+  if (!_sspGetTrackAuthHeader()) throw new Error('NO_TRACK_AUTH');
+
+  const fmtDate = (ms) => {
+    const d = new Date(ms);
+    const y = String(d.getFullYear());
+    const m = String(d.getMonth()+1).padStart(2,'0');
+    const da = String(d.getDate()).padStart(2,'0');
+    return `${y}-${m}-${da}`;
+  };
+  const fmtTime = (ms) => {
+    const d = new Date(ms);
+    const hh = String(d.getHours()).padStart(2,'0');
+    const mm = String(d.getMinutes()).padStart(2,'0');
+    const ss = String(d.getSeconds()).padStart(2,'0');
+    return `${hh}:${mm}:${ss}`;
+  };
+
+  const sMs = Number.isFinite(startMs) ? startMs : (Date.now()-12*60*60*1000);
+  const eMs = Number.isFinite(endMs) ? endMs : (Date.now()+6*60*60*1000);
+
+  const startDate = fmtDate(sMs);
+  const endDate = fmtDate(eMs);
+  const startTime = fmtTime(sMs);
+  const endTime = fmtTime(eMs);
+
+  const fetchPage = async (page) => {
+    const u = new URL('https://track.relay.amazon.dev/api/v2/transport-views');
+    const qs = u.searchParams;
+    qs.append('searchTerm[]', term);
+    qs.append('type[]', 'vehicleRun');
+    qs.set('module', 'trip');
+    qs.set('page', String(page||1));
+    qs.set('pageSize', '200');
+    qs.set('sortCol', 'sent');
+    qs.set('ascending', 'true');
+    qs.set('startDate', startDate);
+    qs.set('endDate', endDate);
+    qs.set('startTime', startTime);
+    qs.set('endTime', endTime);
+    qs.set('column', 'scheduled_end');
+    qs.set('view', 'detail');
+    qs.set('dateField', 'effectiveEnd');
+
+    const txt = await _sspRelayRequest(u.toString(), 12000);
+    const data = JSON.parse(txt || 'null');
+
+    // common shapes: array, {content:[]}, {results:[]}, {transportViews:[]}, {items:[]}
+    if (Array.isArray(data)) return data;
+    if (data && Array.isArray(data.content)) return data.content;
+    if (data && Array.isArray(data.results)) return data.results;
+    if (data && Array.isArray(data.transportViews)) return data.transportViews;
+    if (data && Array.isArray(data.items)) return data.items;
+    return [];
+  };
+
+  const out = [];
+  const maxPages = 3;
+  for (let page=1; page<=maxPages; page++) {
+    const chunk = await fetchPage(page);
+    if (!chunk || !chunk.length) break;
+    out.push(...chunk);
+    if (chunk.length < 200) break;
+  }
+  return out;
+}
+
+// FMC fallback (same-origin) when track.relay.amazon.dev is not accessible (401/403).
+// Returns the first execution-like object for a VRID if found.
+async function _sspFmcGetExecutionById(vrid) {
+  const v = String(vrid||"").trim();
+  if (!v) return null;
+
+  const payload = {
+    searchIds: [v],
+    searchByIds: true,
+    page: 0,
+    pageSize: 10,
+    bookmarkedSavedSearch: false,
+    executionViewModePreference: "vrs",
+    // Keep dashboardPreferences minimal but present (some environments require it)
+    dashboardPreferences: JSON.stringify({
+      length: 10,
+      order: [[12, "asc"]],
+      search: { search: "", columns: [], statuses: [], filters: [] }
+    })
+  };
+
+  const resp = await sspFetch("https://trans-logistics.amazon.com/fmc/search/execution/by-id", {
+    method: "POST",
+    credentials: "include",
+    headers: {
+      "Accept": "application/json, text/plain, */*",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  }, 2);
+
+  if (!resp || !resp.ok) {
+    const st = resp ? resp.status : 0;
+    throw new Error(`HTTP ${st}`);
+  }
+
+  const data = await resp.json().catch(()=>null);
+  if (!data) return null;
+
+  // Try common shapes.
+  const candidates =
+    (Array.isArray(data.executions) ? data.executions : null) ||
+    (Array.isArray(data.content) ? data.content : null) ||
+    (Array.isArray(data.results) ? data.results : null) ||
+    (data.data && Array.isArray(data.data.executions) ? data.data.executions : null) ||
+    (data.page && Array.isArray(data.page.content) ? data.page.content : null) ||
+    null;
+
+  const first = candidates && candidates.length ? candidates[0] : null;
+  if (first && typeof first === "object") {
+    try { first.__sspSource = "FMC"; } catch(_) {}
+    return first;
+  }
+
+  // Some versions return an object keyed by vrid.
+  if (data[v] && typeof data[v] === "object") {
+    try { data[v].__sspSource = "FMC"; } catch(_) {}
+    return data[v];
+  }
+  return null;
 }
 
 function _sspRelayParseIsoToLocal(iso) {
@@ -6509,13 +7168,53 @@ async function _sspRelayGetDetail(vrid) {
   const hit = cache[v] && cache[v].detail && (now - (cache[v].tDetail||0) < 60_000);
   if (hit) return cache[v].detail;
 
-  const url = `https://track.relay.amazon.dev/api/v2/transport-views/${encodeURIComponent(key)}?view=detail`;
-  const txt = await _sspRelayRequest(url);
-  const obj = JSON.parse(txt);
-  cache[v] = cache[v] || {};
-  cache[v].detail = obj;
-  cache[v].tDetail = now;
-  return obj;
+  // Prefer track.relay.amazon.dev when accessible; fallback to FMC if unauthorized.
+  // If we ever see 401/403 from track.relay, permanently disable it for the session.
+  if (window.__SSP_DISABLE_TRACK_RELAY__ === true) {
+    const obj = await _sspFmcGetExecutionById(v);
+    cache[v] = cache[v] || {};
+    cache[v].detail = obj;
+    cache[v].tDetail = now;
+    return obj;
+  }
+
+  try {
+    // Track Relay endpoints require an Authorization bearer token.
+    // If we haven't seen the Relay SPA make a Track request yet, we won't have it.
+    if (!_sspGetTrackAuthHeader()) {
+      throw new Error("NO_TRACK_AUTH");
+    }
+    const url = `https://track.relay.amazon.dev/api/v2/transport-views/${encodeURIComponent(key)}?view=detail`;
+    const txt = await _sspRelayRequest(url);
+    const obj = JSON.parse(txt);
+    cache[v] = cache[v] || {};
+    cache[v].detail = obj;
+    cache[v].tDetail = now;
+    return obj;
+  } catch (e) {
+    const msg = (e && e.message) ? String(e.message) : "";
+    if (/NO_TRACK_AUTH/i.test(msg)) {
+      // Don't disable track permanently; we just haven't captured the token yet.
+      throw new Error("Relay detail needs Track auth. Open the VRID in Relay once (the 'Open' button) then retry.");
+    }
+    const isAuth = /HTTP\s*(401|403)/i.test(msg) || /unauthor/i.test(msg) || /forbidden/i.test(msg);
+    if (isAuth) {
+      // If we have an auth token and still get 401/403, assume Track is blocked for this session.
+      // (If no token exists, we should have hit NO_TRACK_AUTH above.)
+      window.__SSP_DISABLE_TRACK_RELAY__ = true;
+      try {
+        const obj = await _sspFmcGetExecutionById(v);
+        cache[v] = cache[v] || {};
+        cache[v].detail = obj;
+        cache[v].tDetail = now;
+        return obj;
+      } catch (e2) {
+        const msg2 = (e2 && e2.message) ? String(e2.message) : String(e2);
+        throw new Error(`Relay detail blocked (track HTTP 401/403). FMC fallback failed: ${msg2}`);
+      }
+    }
+    throw e;
+  }
 }
 
 async function _sspRelayGetRoute(vrid) {
@@ -6527,6 +7226,12 @@ async function _sspRelayGetRoute(vrid) {
   if (hit) return cache[v].route;
 
   const key = `NA:VR:${v}`;
+
+  // Track route endpoints also require Track auth. If we haven't captured it yet,
+  // just return null (the mini will display "No route points").
+  if (!_sspGetTrackAuthHeader()) {
+    return null;
+  }
 
   // 1) planned polyline
   let pts = null;
@@ -6558,6 +7263,311 @@ async function _sspRelayGetRoute(vrid) {
   return cache[v].route;
 }
 
+
+// --- Relay supplemental endpoints (notes, cases, disruptions) ---
+// Notes endpoint observed: GET /api/transport-views/NA:VR:<vrid>/notes  (non-v2)
+async function _sspRelayGetNotes(vrid) {
+  const v = String(vrid||"").trim();
+  if (!v) return null;
+  const cache = _sspRelayCache();
+  const now = Date.now();
+  cache[v] = cache[v] || {};
+  if (cache[v].notes && (now - (cache[v].tNotes||0) < 5*60_000)) return cache[v].notes;
+
+  if (!_sspGetTrackAuthHeader()) return null;
+  try {
+    const key = `NA:VR:${v}`;
+    const url = `https://track.relay.amazon.dev/api/transport-views/${encodeURIComponent(key)}/notes`;
+    const txt = await _sspRelayRequest(url);
+    const obj = JSON.parse(txt);
+    cache[v].notes = obj;
+    cache[v].tNotes = now;
+    return obj;
+  } catch (_) {
+    return null;
+  }
+}
+
+function _sspRelayExtractCases(detail) {
+  try {
+    const c = detail && detail.cases;
+    return Array.isArray(c) ? c : [];
+  } catch { return []; }
+}
+
+function _sspRelayExtractDisruptions(detail) {
+  try {
+    const d = detail && detail.disruptions;
+    return Array.isArray(d) ? d : [];
+  } catch { return []; }
+}
+
+function _sspRelayExtractNotesCount(notesObj) {
+  try {
+    if (!notesObj) return 0;
+    if (Array.isArray(notesObj)) return notesObj.length;
+    if (Array.isArray(notesObj.notes)) return notesObj.notes.length;
+    if (Array.isArray(notesObj.content)) return notesObj.content.length;
+    return 0;
+  } catch { return 0; }
+}
+
+// Compute a lightweight "meta badge" summary for a VRID (used in Action Panel rows)
+async function _sspRelayGetMetaBadges(vrid) {
+  const v = String(vrid||"").trim();
+  if (!v) return null;
+  try {
+    const detail = await _sspRelayGetDetail(v);
+    const cases = _sspRelayExtractCases(detail);
+    const disruptions = _sspRelayExtractDisruptions(detail);
+    // Notes are optional; do not block the UI if they fail.
+    let notesCount = 0;
+    try { notesCount = _sspRelayExtractNotesCount(await _sspRelayGetNotes(v)); } catch (_) {}
+    const topDis = (disruptions && disruptions.length)
+      ? (disruptions.find(x => String(x?.severity||"").toUpperCase()==="HIGH") || disruptions[0])
+      : null;
+    return {
+      vrid: v,
+      casesCount: cases.length,
+      disruptionsCount: disruptions.length,
+      notesCount,
+      topDisruptionType: topDis ? (topDis.type || topDis.id || "") : "",
+      topDisruptionSeverity: topDis ? (topDis.severity || "") : ""
+    };
+  } catch (e) {
+    // If we don't have Track auth yet, keep quiet; the mini already tells the user how to seed it.
+    const msg = (e && e.message) ? String(e.message) : "";
+    if (/Track auth/i.test(msg) || /needs Track auth/i.test(msg)) return null;
+    return null;
+  }
+}
+
+function _sspUpdateRelayMetaBadgesInDom(meta) {
+  if (!meta || !meta.vrid) return;
+  const v = String(meta.vrid);
+  const nodes = document.querySelectorAll(`.ssp-relay-meta[data-vrid="${CSS.escape(v)}"]`);
+  if (!nodes || !nodes.length) return;
+
+  const mkBadge = (kind, label, title, bg) => {
+    const b = bg || "#111827";
+    return `<button class="ssp-relay-badge" data-kind="${esc(kind)}" data-vrid="${esc(v)}" title="${esc(title||"")}" onclick="return window.__SSP_RELAY_BADGE_HANDLER ? window.__SSP_RELAY_BADGE_HANDLER(event) : false;"
+      style="padding:1px 8px;border-radius:999px;border:1px solid #e5e7eb;background:${b};color:#fff;font-weight:900;cursor:pointer;pointer-events:auto;">${esc(label)}</button>`;
+  };
+
+  for (const el of nodes) {
+    const parts = [];
+    // Disruptions: indicator only (no per-VRID count in UI)
+    if (meta.disruptionsCount) {
+      const sev = String(meta.topDisruptionSeverity||"").toUpperCase();
+      const col = (sev === "HIGH") ? "#dc2626" : (sev === "MEDIUM") ? "#f59e0b" : "#60a5fa";
+      parts.push(mkBadge("disruptions", "D", `Disruptions present (${meta.disruptionsCount}) ${meta.topDisruptionType||""}`, col));
+    }
+    // Cases: keep count (useful), but clickable
+    if (meta.casesCount) {
+      parts.push(mkBadge("cases", `C:${meta.casesCount}`, `Cases (${meta.casesCount})`, "#111827"));
+    }
+    // Notes: keep count, clickable
+    if (meta.notesCount) {
+      parts.push(mkBadge("notes", `N:${meta.notesCount}`, `Notes (${meta.notesCount})`, "#2563eb"));
+    }
+    el.innerHTML = parts.length ? parts.join(" ") : `<span style="color:#9ca3af;font-weight:800;">—</span>`;
+  }
+}
+
+async function _sspPrefetchRelayMetaBadges(vrids, max=10) {
+  try {
+    const arr = Array.from(new Set((vrids||[]).map(v => String(v||"").trim()).filter(Boolean))).slice(0, max);
+    if (!arr.length) return;
+    STATE.__relayMetaCache = STATE.__relayMetaCache || {};
+    for (const v of arr) {
+      if (STATE.__relayMetaCache[v] && (Date.now() - (STATE.__relayMetaCache[v].t||0) < 2*60_000)) {
+        _sspUpdateRelayMetaBadgesInDom(STATE.__relayMetaCache[v].meta);
+        continue;
+      }
+      // Run in the background; don't block render
+      (async () => {
+        const meta = await _sspRelayGetMetaBadges(v);
+        if (!meta) return;
+        STATE.__relayMetaCache[v] = { t: Date.now(), meta };
+        _sspUpdateRelayMetaBadgesInDom(meta);
+      })();
+    }
+  } catch (_) {}
+}
+
+
+async function _sspPrefetchLaneRisk(laneKey, cptMs, vrids) {
+  try {
+    const lane = String(laneKey||"");
+    const cpt = Number(cptMs||0);
+    const el = document.querySelector(`.ssp-relay-risk[data-lane="${CSS.escape(lane)}"][data-cpt="${String(cpt)}"]`);
+    if (!el) return;
+
+    // Search-driven banner: use base lane (LDJ5->DBK6) and a window around CPT.
+    const laneBase = (lane.split('-')[0] || lane).trim();
+    const anchor = cpt || Date.now();
+    const startMs = anchor - 12*60*60*1000;
+    const endMs = anchor + 6*60*60*1000;
+
+    let items = null;
+    try { items = await _sspRelaySearchTransportViews(laneBase, startMs, endMs); } catch (_) { items = null; }
+    if (!Array.isArray(items) || !items.length) { el.innerHTML = ""; return; }
+
+    const seen = new Set();
+    let casesV = 0, disV = 0;
+    const need = [];
+
+    for (const it of items.slice(0, 240)) {
+      const v = String(it?.vrid || it?.id || it?.qualifiedVrid || it?.qualifiedId || "").trim();
+      if (!v || seen.has(v)) continue;
+      seen.add(v);
+
+      const hasCases = Array.isArray(it?.cases) ? (it.cases.length>0) : null;
+      const hasDis = Array.isArray(it?.disruptions) ? (it.disruptions.length>0) : null;
+
+      if (hasCases === true) casesV++;
+      if (hasDis === true) disV++;
+
+      if (hasCases === null || hasDis === null) need.push(v);
+    }
+
+    // If search results don't include cases/disruptions, fetch detail for a limited subset.
+    if (need.length) {
+      const max = Math.min(need.length, 50);
+      for (let i=0;i<max;i++) {
+        const v = need[i];
+        try {
+          const d = await _sspRelayGetDetail(v);
+          if (!d) continue;
+          if ((_sspRelayExtractCases(d)||[]).length) casesV++;
+          if ((_sspRelayExtractDisruptions(d)||[]).length) disV++;
+        } catch (_) {}
+      }
+    }
+
+    if (!casesV && !disV) { el.innerHTML = ""; return; }
+
+    const parts = [];
+    if (casesV) parts.push(`<span class="ssp-risk-pill" title="VRIDs w/ cases" style="padding:1px 8px;border-radius:999px;border:1px solid #e5e7eb;background:#111827;color:#fff;font-weight:900;cursor:pointer;" data-kind="laneCases" data-lane="${esc(lane)}" data-cpt="${String(cpt)}">Cases:${casesV}</span>`);
+    if (disV) parts.push(`<span class="ssp-risk-pill" title="VRIDs w/ disruptions" style="padding:1px 8px;border-radius:999px;border:1px solid #e5e7eb;background:#dc2626;color:#fff;font-weight:900;cursor:pointer;" data-kind="laneDisruptions" data-lane="${esc(lane)}" data-cpt="${String(cpt)}">Risk:${disV}</span>`);
+    el.innerHTML = parts.join(" ");
+  } catch (_) {}
+}
+
+// Click handlers for lane risk pills (reuses existing panels)
+document.addEventListener("click", (e) => {
+  const pill = e.target.closest(".ssp-risk-pill");
+  if (!pill) return;
+  e.preventDefault(); e.stopPropagation();
+  const kind = pill.getAttribute("data-kind") || "";
+  const lane = pill.getAttribute("data-lane") || "";
+  const cpt = Number(pill.getAttribute("data-cpt") || 0);
+  if (kind === "laneCases") { if (typeof openRelayCasesPanel === "function") openRelayCasesPanel(lane, cpt); }
+  if (kind === "laneDisruptions") { if (typeof openDisruptionsPanel === "function") openDisruptionsPanel(lane, cpt); }
+}, true);
+
+/* =============================
+ * Global click handling for Relay badges/buttons (so panels outside the Action list still work)
+ * ============================= */
+(function __sspRelayGlobalClicks(){
+  if (window.__SSP_RELAY_GLOBAL_CLICKS) return;
+  window.__SSP_RELAY_GLOBAL_CLICKS = true;
+
+  const openOverlay = async (vrid, kind) => {
+    const v = String(vrid||"").trim();
+    if (!v) return;
+    const k = String(kind||"").trim() || "detail";
+    try { _sspEnsureRelayVridOverlay(); } catch(_) {}
+    const ov = document.getElementById("ssp-relay-vrid-overlay");
+    const title = document.getElementById("ssp-relay-vrid-title");
+    const body = document.getElementById("ssp-relay-vrid-body");
+    if (!ov || !body) return;
+
+    ov.style.display = "flex";
+    title.textContent = `Relay ${k} — ${v}`;
+    body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Loading…</div>`;
+
+    let detail = null, notes = null;
+    try { detail = await _sspRelayGetDetail(v); } catch(_) { detail = null; }
+    if (!detail) {
+      body.innerHTML = `<div style="padding:10px;color:#6b7280;">Relay detail unavailable for ${esc(v)}.</div>`;
+      return;
+    }
+    const cases = _sspRelayExtractCases(detail) || [];
+    const disruptions = _sspRelayExtractDisruptions(detail) || [];
+    try { notes = await _sspRelayGetNotes(v); } catch(_) { notes = null; }
+
+    const renderJson = (obj) => `<pre style="margin:0;white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;max-height:420px;overflow:auto;background:#0b1020;color:#e5e7eb;padding:10px;border-radius:12px;">${esc(JSON.stringify(obj, null, 2))}</pre>`;
+
+    if (k === "cases") {
+      body.innerHTML = cases.length
+        ? `<div style="padding:10px;">${renderJson(cases)}</div>`
+        : `<div style="padding:10px;color:#6b7280;">No cases on this VRID.</div>`;
+    } else if (k === "disruptions") {
+      body.innerHTML = disruptions.length
+        ? `<div style="padding:10px;">${renderJson(disruptions)}</div>`
+        : `<div style="padding:10px;color:#6b7280;">No disruptions on this VRID.</div>`;
+    } else if (k === "notes") {
+      const nCount = _sspRelayExtractNotesCount(notes);
+      body.innerHTML = nCount
+        ? `<div style="padding:10px;">${renderJson(notes)}</div>`
+        : `<div style="padding:10px;color:#6b7280;">No notes on this VRID.</div>`;
+    } else {
+      body.innerHTML = `<div style="padding:10px;">${renderJson(detail)}</div>`;
+    }
+  };
+
+  // Expose a stable badge click handler (avoids event delegation edge cases)
+  if (!window.__SSP_OPEN_RELAY_OVERLAY) window.__SSP_OPEN_RELAY_OVERLAY = openOverlay;
+  if (!window.__SSP_RELAY_BADGE_HANDLER) window.__SSP_RELAY_BADGE_HANDLER = function(ev){
+    try { if (ev) { ev.preventDefault(); ev.stopPropagation(); } } catch(_) {}
+    const t = (ev && (ev.currentTarget || ev.target)) || null;
+    const b = t && t.closest ? t.closest('button.ssp-relay-badge') : null;
+    if (!b) return false;
+    const vrid = b.getAttribute('data-vrid') || '';
+    const kind = b.getAttribute('data-kind') || '';
+    openOverlay(vrid, kind);
+    return false;
+  };
+
+  document.addEventListener("click", (e) => {
+    // Relay meta badges
+    const b = e.target.closest("button.ssp-relay-badge");
+    if (b) {
+      e.preventDefault(); e.stopPropagation();
+      const vrid = b.getAttribute("data-vrid") || "";
+      const kind = b.getAttribute("data-kind") || "";
+      openOverlay(vrid, kind);
+      return;
+    }
+
+    // ssp2-act buttons (Relay/Mini etc) inside panels outside Action list
+    const btn = e.target.closest("button.ssp2-act");
+    if (btn) {
+      // let existing list handler run if it is inside the action list (avoid double)
+      const inActionList = !!btn.closest("#ssp2-list");
+      if (inActionList) return;
+      e.preventDefault(); e.stopPropagation();
+      const act = btn.getAttribute("data-act") || "";
+      const parts = act.split(":");
+      const kind = parts[0];
+      const vrid = parts.slice(1).join(":");
+      if (!vrid) return;
+      const open = (url) => window.open(url, "_blank", "noopener");
+      if (kind === "tt") open(buildTTUrl(STATE.nodeId, vrid));
+      else if (kind === "relay") {
+        try {
+          if (e.shiftKey) return open(buildRelayUrl(vrid));
+          _showRelayMiniForAnchor(btn, vrid, (STATE && (STATE.nodeId || STATE.nodeID)) || "");
+          try { _sspPrefetchRelayMetaBadges([vrid], 1); } catch(_) {}
+        } catch (_) { open(buildRelayUrl(vrid)); }
+      } else if (kind === "fmc") open(buildFmcUrl(vrid));
+      else if (kind === "sel") { /* no-op outside table context */ }
+      return;
+    }
+  }, true);
+
+})();
 // Pick stop for node (destination preferred). Returns { planned, eta, aat, nodeCode }
 function _sspRelayTimesForNode(detail, nodeCode) {
   try {
@@ -6572,6 +7582,119 @@ function _sspRelayTimesForNode(detail, nodeCode) {
     const aat = arr.completionTime || "";
     return { planned, eta, aat, nodeCode: match?.location?.nodeCode || match?.location?.name || "" };
   } catch { return { planned:"", eta:"", aat:"", nodeCode:"" }; }
+}
+
+// Build a compact, human-readable meta block from Relay detail.
+// Goal: surface key fields needed for capacity/cancel logic triage (CRID/CRID linkage, adhoc flags,
+// execution status, reject/cancel timestamps, disruptions summary).
+function _sspRelayExtractCurPos(detail) {
+  try {
+    if (!detail || typeof detail !== "object") return null;
+
+    // Most common (observed): detail.assetPosition { latitude, longitude, heading, inMotion, timestamp, geoFeatures[] }
+    const ap = detail.assetPosition || detail.assetposition || null;
+    if (ap) {
+      const lat = Number(ap.latitude ?? ap.lat);
+      const lng = Number(ap.longitude ?? ap.lng ?? ap.lon);
+      if (isFinite(lat) && isFinite(lng)) return { lat, lng, heading: ap.heading, inMotion: ap.inMotion, timestamp: ap.timestamp };
+    }
+
+    // Fallbacks (schema variance)
+    const p1 = detail.position || null;
+    if (p1) {
+      const lat = Number(p1.latitude ?? p1.lat);
+      const lng = Number(p1.longitude ?? p1.lng ?? p1.lon);
+      if (isFinite(lat) && isFinite(lng)) return { lat, lng, timestamp: p1.timestamp };
+    }
+
+    const p2 = (detail.vehicle && (detail.vehicle.position || detail.vehicle.location)) || null;
+    if (p2) {
+      const lat = Number(p2.latitude ?? p2.lat);
+      const lng = Number(p2.longitude ?? p2.lng ?? p2.lon);
+      if (isFinite(lat) && isFinite(lng)) return { lat, lng, timestamp: p2.timestamp };
+    }
+  } catch (_) {}
+  return null;
+}
+
+function _sspRelayFormatMeta(detail, nodeCode, sched, eta, aat, route, curPos) {
+  try {
+    const lines = [];
+    const d = detail || {};
+
+    const execStatus = String(d?.executionStatusV2 || d?.executionStatus || d?.status || "").trim();
+    const biz = String(d?.businessType || "").trim();
+    const equip = String(d?.equipmentType || d?.requiredEquipmentType || d?.equipment || "").trim();
+    const adhoc = (d?.isAdhocLoad === true) ? "YES" : (d?.isAdhocLoad === false ? "NO" : "");
+    const crid = String(d?.crId || d?.crID || d?.carrierRequestId || "").trim();
+    const rejected = String(d?.rejectedTime || d?.rejectedAt || "").trim();
+    const cancelled = String(d?.cancelledTime || d?.canceledTime || d?.cancelledAt || d?.cancellationTime || "").trim();
+    const carrierName = String(d?.carrier?.name || d?.carrierName || "").trim();
+    const carrierScac = String(d?.carrier?.scac || d?.scac || "").trim();
+    const driverName = String(d?.driver?.name || d?.assignedDrivers?.[0]?.name || d?.assignedDrivers?.[0]?.driverName || "").trim();
+    const driverId = String(d?.driver?.id || d?.assignedDrivers?.[0]?.id || d?.driverId || "").trim();
+
+    const dis = Array.isArray(d?.disruptions) ? d.disruptions : [];
+    const disCount = dis.length;
+    const disTypes = (() => {
+      try {
+        const m = new Map();
+        for (const x of dis) {
+          const t = String(x?.type || x?.qualifiedFieldId || x?.id || "").trim();
+          if (!t) continue;
+          m.set(t, (m.get(t) || 0) + 1);
+        }
+        const arr = Array.from(m.entries()).sort((a,b)=>b[1]-a[1]).slice(0, 3);
+        return arr.map(([k,v]) => v > 1 ? `${k}×${v}` : k).join(", ");
+      } catch (_) { return ""; }
+    })();
+
+    lines.push(`Node:  ${String(nodeCode || "").trim()}`);
+    lines.push(`Sched: ${sched || "-"}`);
+    lines.push(`ETA:   ${eta || "-"}`);
+    lines.push(`AAT:   ${aat || "-"}`);
+
+    // route summary (planning glance)
+    try {
+      if (Array.isArray(route) && route.length >= 2) {
+        const miles = _sspRouteMiles(route);
+        const miStr = isFinite(miles) && miles > 0 ? `${Math.round(miles)} mi` : "";
+        let progStr = "";
+        if (curPos && isFinite(curPos.lat) && isFinite(curPos.lng)) {
+          const idx = _sspNearestRouteIndex(route, curPos);
+          if (idx >= 0) {
+            const pct = Math.round((idx / Math.max(1, route.length-1)) * 100);
+            // distance from route (rough)
+            const near = route[idx];
+            const off = (near && isFinite(near.lat) && isFinite(near.lng)) ? _sspHaversineMiles(near, curPos) : NaN;
+            const offStr = isFinite(off) ? ` | off ${off.toFixed(off < 10 ? 1 : 0)} mi` : "";
+            progStr = ` | prog ${pct}%${offStr}`;
+          }
+        }
+        if (miStr || progStr) lines.push(`Route: ${miStr || "-"}${progStr}`);
+      }
+    } catch {}
+
+    if (execStatus) lines.push(`Status: ${execStatus}`);
+    if (biz) lines.push(`Type:   ${biz}${equip ? " | " + equip : ""}${adhoc ? " | Adhoc=" + adhoc : ""}`);
+    else if (equip || adhoc) lines.push(`Type:   ${equip || ""}${adhoc ? (equip ? " | " : "") + "Adhoc=" + adhoc : ""}`);
+
+    if (carrierName || carrierScac) lines.push(`Carrier: ${carrierName || "-"}${carrierScac ? " (" + carrierScac + ")" : ""}`);
+    if (driverName || driverId) lines.push(`Driver:  ${driverName || "-"}${driverId ? " (" + driverId + ")" : ""}`);
+    if (crid) lines.push(`CRID:   ${crid}`);
+    if (cancelled) lines.push(`Cancelled: ${cancelled}`);
+    if (rejected) lines.push(`Rejected:  ${rejected}`);
+
+    if (disCount) lines.push(`Disruptions: ${disCount}${disTypes ? " | " + disTypes : ""}`);
+
+    return lines.join("\n");
+  } catch (e) {
+    try {
+      return `Node: ${String(nodeCode||"").trim()}\nSched: ${sched||"-"}\nETA: ${eta||"-"}\nAAT: ${aat||"-"}`;
+    } catch (_) {
+      return "";
+    }
+  }
 }
 
 function _sspRelayTrackMapUrlForVrid(vrid) {
@@ -6603,13 +7726,15 @@ function _ensureRelayMiniPopover() {
       <div style="font-weight:900;">Relay</div>
       <div id="ssp2-relay-mini-vrid" style="font-weight:800;opacity:.9;"></div>
       <div style="margin-left:auto;display:flex;gap:8px;align-items:center;">
+        <button id="ssp2-relay-mini-dump" title="Dump raw Relay detail/route objects to console" style="padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#e5e7eb;font-weight:900;cursor:pointer;">Dump</button>
+        <button id="ssp2-relay-mini-map" title="Toggle basemap layer" style="padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#e5e7eb;font-weight:900;cursor:pointer;">Map</button>
         <button id="ssp2-relay-mini-open" style="padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#e5e7eb;font-weight:900;cursor:pointer;">Open</button>
         <button id="ssp2-relay-mini-close" style="padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#e5e7eb;font-weight:900;cursor:pointer;">✕</button>
       </div>
     </div>
-    <div style="padding:10px;">
+    <div id="ssp2-relay-mini-body" style="padding:10px;box-sizing:border-box;max-height:calc(100% - 46px);height:calc(100% - 46px);overflow-y:auto;">
       <canvas id="ssp2-relay-mini-cv" width="500" height="180" style="width:100%;height:180px;border-radius:12px;border:1px solid #e5e7eb;background:#f9fafb;"></canvas>
-      <div id="ssp2-relay-mini-meta" style="margin-top:10px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.35;white-space:pre-wrap;"></div>
+      <div id="ssp2-relay-mini-meta" style="margin-top:10px;padding-bottom:8px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.35;white-space:pre-wrap;"></div>
     </div>
   `;
   document.body.appendChild(pop);
@@ -6623,57 +7748,315 @@ function _ensureRelayMiniPopover() {
   pop.addEventListener("mouseenter", cancelHide);
   pop.addEventListener("mouseleave", scheduleHide);
   pop.querySelector("#ssp2-relay-mini-close").onclick = () => { pop.style.display = "none"; };
+
+  // Basemap toggle (visual only)
+  pop.querySelector("#ssp2-relay-mini-map").onclick = () => {
+    try {
+      const cur = !!(window.__SSP_RELAYMINI_BASEMAP);
+      window.__SSP_RELAYMINI_BASEMAP = !cur;
+      try { localStorage.setItem("SSP_RELAYMINI_BASEMAP", window.__SSP_RELAYMINI_BASEMAP ? "1" : "0"); } catch (_) {}
+      // Re-render with existing cached objects
+      try {
+        const cv = pop.querySelector("#ssp2-relay-mini-cv");
+        const route = pop.__sspRelayRoute || null;
+        const detail = pop.__sspRelayDetail || null;
+        const curPos = _sspRelayExtractCurPos(detail);
+        _drawRouteOnCanvas(cv, route, curPos);
+      } catch (_) {}
+    } catch (e) {
+      console.warn("Relay mini basemap toggle failed", e);
+    }
+  };
+
+  // Wire dump button. The data objects are attached by _showRelayMiniForAnchor.
+  pop.querySelector("#ssp2-relay-mini-dump").onclick = () => {
+    try {
+      const d = pop.__sspRelayDetail || null;
+      const r = pop.__sspRelayRoute || null;
+      console.log("[SSP UTIL][RelayMini] detail", d);
+      console.log("[SSP UTIL][RelayMini] route", r);
+      try { window.__SSP_LAST_RELAY_DETAIL = d; window.__SSP_LAST_RELAY_ROUTE = r; } catch (_) {}
+      alert("Dumped Relay objects to console (and window.__SSP_LAST_RELAY_DETAIL).");
+    } catch (e) {
+      console.warn("Relay mini dump failed", e);
+    }
+  };
   pop.__sspCancelHide = cancelHide;
   pop.__sspScheduleHide = scheduleHide;
   return pop;
 }
 
-function _drawRouteOnCanvas(canvas, pts) {
+// --- Relay mini optional basemap (OSM tiles) ---
+const __SSP_OSM_TILE_CACHE = new Map();
+
+function _sspClamp(n, a, b){ n = Number(n); if (!isFinite(n)) return a; return Math.max(a, Math.min(b, n)); }
+
+function _sspLatLngToWorldPx(lat, lng, z) {
+  // Web Mercator world pixel coords at zoom z (tile size 256)
+  const tileSize = 256;
+  const s = tileSize * Math.pow(2, z);
+  const latRad = (lat * Math.PI) / 180;
+  const x = (lng + 180) / 360;
+  const y = (1 - Math.log(Math.tan(latRad) + 1/Math.cos(latRad)) / Math.PI) / 2;
+  return { x: x * s, y: y * s };
+}
+
+function _sspWorldPxToTileXY(px, z) {
+  const tileSize = 256;
+  const n = Math.pow(2, z);
+  const tx = Math.floor(px.x / tileSize);
+  const ty = Math.floor(px.y / tileSize);
+  return { tx: _sspClamp(tx, 0, n-1), ty: _sspClamp(ty, 0, n-1) };
+}
+
+function _sspOSMTileUrl(z, x, y) {
+  // public OSM tile endpoint. Visual only.
+  return `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
+}
+
+function _sspLoadTileImage(z, x, y) {
+  const key = `${z}/${x}/${y}`;
+  if (__SSP_OSM_TILE_CACHE.has(key)) return __SSP_OSM_TILE_CACHE.get(key);
+  const p = new Promise((resolve) => {
+    const url = _sspOSMTileUrl(z, x, y);
+    const finish = (blob) => {
+      try {
+        const img = new Image();
+        img.decoding = "async";
+        img.onload = () => resolve(img);
+        img.onerror = () => resolve(null);
+        // Using object URL avoids CSP img-src issues in many cases.
+        const objUrl = URL.createObjectURL(blob);
+        img.onload = () => { try { URL.revokeObjectURL(objUrl); } catch(_){} resolve(img); };
+        img.onerror = () => { try { URL.revokeObjectURL(objUrl); } catch(_){} resolve(null); };
+        img.src = objUrl;
+      } catch (e) {
+        resolve(null);
+      }
+    };
+    try {
+      if (typeof GM_xmlhttpRequest === "function") {
+        GM_xmlhttpRequest({
+          method: "GET",
+          url,
+          responseType: "blob",
+          onload: (resp) => {
+            try { if (resp && resp.response) return finish(resp.response); } catch(_){}
+            resolve(null);
+          },
+          onerror: () => resolve(null),
+          ontimeout: () => resolve(null)
+        });
+        return;
+      }
+    } catch (_) {}
+    // Fallback: fetch
+    fetch(url).then(r => r.ok ? r.blob() : null).then(b => b ? finish(b) : resolve(null)).catch(() => resolve(null));
+  });
+  __SSP_OSM_TILE_CACHE.set(key, p);
+  return p;
+}
+
+function _sspPickZoomForBBox(minLat, minLng, maxLat, maxLng, w, h) {
+  // Choose a zoom such that tile coverage stays small (<= 25 tiles)
+  const zMax = 15, zMin = 6;
+  for (let z = zMax; z >= zMin; z--) {
+    const a = _sspLatLngToWorldPx(maxLat, minLng, z); // nw
+    const b = _sspLatLngToWorldPx(minLat, maxLng, z); // se
+    const tA = _sspWorldPxToTileXY(a, z);
+    const tB = _sspWorldPxToTileXY(b, z);
+    const tilesWide = (tB.tx - tA.tx + 1);
+    const tilesHigh = (tB.ty - tA.ty + 1);
+    if (tilesWide * tilesHigh <= 25) return z;
+  }
+  return 8;
+}
+
+async function _sspDrawOSMBackground(ctx, w, h, clean, curPos) {
+  try {
+    // Expand bbox slightly with current pos
+    let minLat=Infinity,maxLat=-Infinity,minLng=Infinity,maxLng=-Infinity;
+    for (const p of clean) {
+      if (p.lat<minLat) minLat=p.lat;
+      if (p.lat>maxLat) maxLat=p.lat;
+      if (p.lng<minLng) minLng=p.lng;
+      if (p.lng>maxLng) maxLng=p.lng;
+    }
+    if (curPos && isFinite(curPos.lat) && isFinite(curPos.lng)) {
+      minLat = Math.min(minLat, curPos.lat);
+      maxLat = Math.max(maxLat, curPos.lat);
+      minLng = Math.min(minLng, curPos.lng);
+      maxLng = Math.max(maxLng, curPos.lng);
+    }
+
+    // add a little padding
+    const latPad = (maxLat - minLat) * 0.08 || 0.02;
+    const lngPad = (maxLng - minLng) * 0.08 || 0.02;
+    minLat -= latPad; maxLat += latPad; minLng -= lngPad; maxLng += lngPad;
+
+    const z = _sspPickZoomForBBox(minLat, minLng, maxLat, maxLng, w, h);
+    const nw = _sspLatLngToWorldPx(maxLat, minLng, z);
+    const se = _sspLatLngToWorldPx(minLat, maxLng, z);
+    const topLeft = { x: nw.x, y: nw.y };
+    const bottomRight = { x: se.x, y: se.y };
+
+    // scale world bbox into canvas
+    const spanX = (bottomRight.x - topLeft.x) || 1;
+    const spanY = (bottomRight.y - topLeft.y) || 1;
+    const sx = w / spanX;
+    const sy = h / spanY;
+
+    const tNW = _sspWorldPxToTileXY(topLeft, z);
+    const tSE = _sspWorldPxToTileXY(bottomRight, z);
+    const tileSize = 256;
+
+    const jobs = [];
+    for (let ty = tNW.ty; ty <= tSE.ty; ty++) {
+      for (let tx = tNW.tx; tx <= tSE.tx; tx++) {
+        jobs.push({ z, tx, ty });
+      }
+    }
+    // draw tiles
+    const imgs = await Promise.all(jobs.map(j => _sspLoadTileImage(j.z, j.tx, j.ty)));
+    for (let i = 0; i < jobs.length; i++) {
+      const j = jobs[i];
+      const img = imgs[i];
+      if (!img) continue;
+      const tileWorldX = j.tx * tileSize;
+      const tileWorldY = j.ty * tileSize;
+      const dx = (tileWorldX - topLeft.x) * sx;
+      const dy = (tileWorldY - topLeft.y) * sy;
+      const dw = tileSize * sx;
+      const dh = tileSize * sy;
+      ctx.drawImage(img, dx, dy, dw, dh);
+    }
+
+    // return projectors for overlay
+    return {
+      project: (lat, lng) => {
+        const p = _sspLatLngToWorldPx(lat, lng, z);
+        return { x: (p.x - topLeft.x) * sx, y: (p.y - topLeft.y) * sy };
+      }
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+async function _drawRouteOnCanvas(canvas, pts, curPos) {
   if (!canvas) return;
   const ctx = canvas.getContext("2d");
-  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if (!ctx) return;
+
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+
+  // If no route points yet, at least draw the background grid (or basemap if enabled later).
   if (!Array.isArray(pts) || pts.length < 2) {
-    ctx.fillStyle = "#6b7280";
-    ctx.font = "14px ui-monospace, Menlo, Consolas, monospace";
-    ctx.fillText("No route points", 16, 28);
+    try {
+      ctx.save();
+      ctx.strokeStyle = "rgba(17,24,39,0.08)";
+      ctx.lineWidth = 1;
+      const step = 24;
+      for (let xg = 0; xg <= w; xg += step) { ctx.beginPath(); ctx.moveTo(xg,0); ctx.lineTo(xg,h); ctx.stroke(); }
+      for (let yg = 0; yg <= h; yg += step) { ctx.beginPath(); ctx.moveTo(0,yg); ctx.lineTo(w,yg); ctx.stroke(); }
+      ctx.restore();
+    } catch (_) {}
     return;
   }
-  let minLat=Infinity,maxLat=-Infinity,minLng=Infinity,maxLng=-Infinity;
+
+  // normalize points
+  const clean = [];
   for (const p of pts) {
-    const lat=Number(p.lat), lng=Number(p.lng);
-    if (!isFinite(lat)||!isFinite(lng)) continue;
-    if (lat<minLat) minLat=lat;
-    if (lat>maxLat) maxLat=lat;
-    if (lng<minLng) minLng=lng;
-    if (lng>maxLng) maxLng=lng;
+    const lat = Number(p && p.lat);
+    const lng = Number(p && p.lng);
+    if (isFinite(lat) && isFinite(lng)) clean.push({lat, lng});
   }
+  if (clean.length < 2) return;
+
+  let minLat=Infinity,maxLat=-Infinity,minLng=Infinity,maxLng=-Infinity;
+  for (const p of clean) {
+    if (p.lat<minLat) minLat=p.lat;
+    if (p.lat>maxLat) maxLat=p.lat;
+    if (p.lng<minLng) minLng=p.lng;
+    if (p.lng>maxLng) maxLng=p.lng;
+  }
+  let project = null;
+  // Load basemap if enabled (visual only). Falls back to grid.
+  try {
+    if (window.__SSP_RELAYMINI_BASEMAP == null) {
+      try { window.__SSP_RELAYMINI_BASEMAP = (localStorage.getItem("SSP_RELAYMINI_BASEMAP") === "1"); } catch(_) { window.__SSP_RELAYMINI_BASEMAP = false; }
+    }
+    if (window.__SSP_RELAYMINI_BASEMAP) {
+      const bg = await _sspDrawOSMBackground(ctx, w, h, clean, curPos);
+      if (bg && typeof bg.project === "function") project = bg.project;
+      // soft mask so line remains readable
+      ctx.save();
+      ctx.fillStyle = "rgba(255,255,255,0.15)";
+      ctx.fillRect(0,0,w,h);
+      ctx.restore();
+    }
+  } catch (_) {}
+
+  // fallback background grid (subtle)
+  if (!project) {
+    ctx.save();
+    ctx.strokeStyle = "rgba(17,24,39,0.08)";
+    ctx.lineWidth = 1;
+    const step = 24;
+    for (let xg = 0; xg <= w; xg += step) { ctx.beginPath(); ctx.moveTo(xg,0); ctx.lineTo(xg,h); ctx.stroke(); }
+    for (let yg = 0; yg <= h; yg += step) { ctx.beginPath(); ctx.moveTo(0,yg); ctx.lineTo(w,yg); ctx.stroke(); }
+    ctx.restore();
+  }
+
   const pad=10;
-  const w=canvas.width, h=canvas.height;
   const latSpan = (maxLat-minLat)||1;
   const lngSpan = (maxLng-minLng)||1;
 
-  const x = (lng)=> pad + ((lng-minLng)/lngSpan)*(w-2*pad);
-  const y = (lat)=> pad + ((maxLat-lat)/latSpan)*(h-2*pad);
+  const X = (lng)=> pad + ((lng-minLng)/lngSpan)*(w-2*pad);
+  const Y = (lat)=> pad + ((maxLat-lat)/latSpan)*(h-2*pad);
 
+  const P = (lat, lng) => {
+    if (project) return project(lat, lng);
+    return { x: X(lng), y: Y(lat) };
+  };
+
+  // route polyline
   ctx.strokeStyle = "#111827";
   ctx.lineWidth = 2;
   ctx.beginPath();
-  let started=false;
-  for (const p of pts) {
-    const lat=+p.lat,lng=+p.lng;
-    if (!isFinite(lat)||!isFinite(lng)) continue;
-    const xx=x(lng), yy=y(lat);
-    if (!started){ ctx.moveTo(xx,yy); started=true; }
-    else ctx.lineTo(xx,yy);
-  }
+  { const p0 = P(clean[0].lat, clean[0].lng); ctx.moveTo(p0.x, p0.y); }
+  for (let i=1;i<clean.length;i++) { const p = P(clean[i].lat, clean[i].lng); ctx.lineTo(p.x, p.y); }
   ctx.stroke();
 
+  // waypoint dots (every ~N points)
+  ctx.fillStyle = "rgba(17,24,39,0.35)";
+  const every = Math.max(4, Math.floor(clean.length / 32));
+  for (let i=0;i<clean.length;i+=every) {
+    const p = clean[i];
+    const q = P(p.lat, p.lng);
+    ctx.beginPath(); ctx.arc(q.x, q.y, 1.6, 0, Math.PI*2); ctx.fill();
+  }
+
   // start/end markers
-  const first = pts[0], last = pts[pts.length-1];
+  const first = clean[0], last = clean[clean.length-1];
   ctx.fillStyle = "#16a34a";
-  ctx.beginPath(); ctx.arc(x(first.lng), y(first.lat), 4, 0, Math.PI*2); ctx.fill();
+  { const p = P(first.lat, first.lng); ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI*2); ctx.fill(); }
   ctx.fillStyle = "#dc2626";
-  ctx.beginPath(); ctx.arc(x(last.lng), y(last.lat), 4, 0, Math.PI*2); ctx.fill();
+  { const p = P(last.lat, last.lng); ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI*2); ctx.fill(); }
+
+  // current position marker (if present)
+  if (curPos && isFinite(curPos.lat) && isFinite(curPos.lng)) {
+    const qp = P(curPos.lat, curPos.lng);
+    const cx = qp.x, cy = qp.y;
+    // outer ring
+    ctx.strokeStyle = "rgba(37,99,235,0.9)";
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(cx, cy, 6, 0, Math.PI*2); ctx.stroke();
+    // fill
+    ctx.fillStyle = "rgba(37,99,235,0.65)";
+    ctx.beginPath(); ctx.arc(cx, cy, 4, 0, Math.PI*2); ctx.fill();
+  }
 }
 
 async function _showRelayMiniForAnchor(anchorEl, vrid, nodeCode) {
@@ -6705,7 +8088,7 @@ async function _showRelayMiniForAnchor(anchorEl, vrid, nodeCode) {
   if (meta) meta.textContent = "Loading Relay…";
 
   const cv = pop.querySelector("#ssp2-relay-mini-cv");
-  try { _drawRouteOnCanvas(cv, null); } catch {}
+  try { _drawRouteOnCanvas(cv, null, null); } catch {}
 
   try {
     const [detail, route] = await Promise.all([
@@ -6721,14 +8104,18 @@ async function _showRelayMiniForAnchor(anchorEl, vrid, nodeCode) {
     const eta = _sspRelayParseIsoToLocal(t.eta);
     const aat = _sspRelayParseIsoToLocal(t.aat);
 
+    const curPos = _sspRelayExtractCurPos(detail);
+
+    // Attach raw objects for the Dump button.
+    try {
+      pop.__sspRelayDetail = detail || null;
+      pop.__sspRelayRoute = route || null;
+    } catch (_) {}
+
     if (meta) {
-      meta.textContent =
-        `Node: ${t.nodeCode || nodeCode || ""}\n` +
-        `Sched: ${sched || "-"}\n` +
-        `ETA:   ${eta || "-"}\n` +
-        `AAT:   ${aat || "-"}`;
+      meta.textContent = _sspRelayFormatMeta(detail, (t.nodeCode || nodeCode || ""), sched, eta, aat, route, curPos);
     }
-    if (route) _drawRouteOnCanvas(cv, route);
+    if (route) _drawRouteOnCanvas(cv, route, curPos);
   } catch (e) {
     if (meta) meta.textContent = `Relay unavailable: ${e && e.message ? e.message : e}`;
   }
@@ -6774,7 +8161,7 @@ function ensurePlanningPanel() {
       </div>
 
       <div style="padding:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-        <button id="plan-csv-ib" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:900;cursor:pointer;">CSV IB CART</button>
+        <button id="plan-csv-ib" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:900;cursor:pointer;">CSV XD Graph</button>
         <button id="plan-csv-ib4" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:900;cursor:pointer;">CSV IB4CPT</button>
         <button id="plan-refresh" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:900;cursor:pointer;">Refresh</button>
         <span id="ssp2-plan-count" style="margin-left:auto;font-weight:900;"></span>
@@ -6897,29 +8284,113 @@ document.body.appendChild(p);
     // Refresh
     p.querySelector("#plan-refresh").onclick = () => run(true);
 
-    // CSV: IB CART
+  // CSV: XD Graph (replaces IB CART)
     p.querySelector("#plan-csv-ib").onclick = () => {
-      const rows = (STATE.inboundLoads || []).map((l) => ({
-        planId: l?.planId || "",
-        vrId: l?.vrId || l?.vrid || "",
-        route: l?.route || l?.lane || "",
-        scac: l?.carrierScac || l?.scac || "",
-        scheduledArrivalTime: l?.scheduledArrivalTime || "",
-        estimatedArrivalTime: l?.estimatedArrivalTime || "",
-        actualArrivalTime: l?.actualArrivalTime || "",
-        status: l?.status || "",
-        equipmentType: l?.equipmentType || l?.trailerEquipmentType || "",
-        location: l?.location || "",
-      }));
-      const headers = ["planId","vrId","route","scac","scheduledArrivalTime","estimatedArrivalTime","actualArrivalTime","status","equipmentType","location"];
-      downloadTextFile(
-        `IB_CART_${STATE.nodeId || "NODE"}_${new Date().toISOString().slice(0,10)}.csv`,
-        toCsv(rows, headers),
-        "text/csv;charset=utf-8"
-      );
+      try {
+        const nowMs = Date.now();
+        const ops = getOpsWindow(nowMs);
+        const baseDay0Ms = _getShiftBaseDay0Ms(nowMs);
+
+        const loads = Array.isArray(STATE?.inboundLoads) ? STATE.inboundLoads : [];
+        if (!loads.length) { alert("No inbound loads loaded yet. Hit Refresh first."); return; }
+
+        const normStatus = (st) => String(st || "").toUpperCase();
+        const isTransit = (st) => {
+          const s = normStatus(st);
+          return s.includes("SCHEDULED") || s.includes("NOTARRIVED") || s.includes("NOT_ARRIVED") || s.includes("IN_TRANSIT") || s.includes("INTRANSIT");
+        };
+        const isCompleted = (st) => normStatus(st).includes("COMPLETED");
+        const isInFacility = (st) => {
+          const s = normStatus(st);
+          if (!s) return false;
+          if (isCompleted(s)) return false;
+          if (isTransit(s)) return false;
+          return true;
+        };
+        const statusBucket = (st) => isInFacility(st) ? "ON_DOOR" : (isTransit(st) ? "ON_SCHEDULE" : "OTHER");
+
+        const getCounts = (l) => {
+          const planId = String(l?.planId || "").trim();
+          const m = planId ? (STATE?.ibContainerCount?.[planId]) : null;
+          const it = m?.inTrailerCount || {};
+          const C = (typeof it?.C === "number") ? it.C : 0;
+          const P = (typeof it?.P === "number") ? it.P : 0;
+          const missing = (!m || (!it || (typeof it?.C !== "number" && typeof it?.P !== "number")));
+          return { C, P, missing };
+        };
+
+        // Build responsibility buckets (gap-safe: bucket starts at previous bucket end)
+        const shifts = _getEnabledShifts();
+        const shiftWindows = (shifts || [])
+          .map(s => {
+            const w = _shiftToWindowMs(s, baseDay0Ms);
+            return {
+              name: String(s.name || s.label || s.key || "Shift"),
+              endClipped: Math.min(w.endMs, ops.endMs),
+            };
+          })
+          .filter(x => x.endClipped > ops.startMs)
+          .sort((a,b) => a.endClipped - b.endClipped);
+
+        const buckets = [];
+        let prevEnd = ops.startMs;
+        for (const it of shiftWindows) {
+          const a = Math.max(prevEnd, ops.startMs);
+          const b = Math.min(it.endClipped, ops.endMs);
+          if (b > a) buckets.push({ shift: it.name, a, b });
+          prevEnd = Math.max(prevEnd, it.endClipped);
+        }
+
+        const hourBucket = (ms) => {
+          const d = new Date(ms);
+          d.setMinutes(0,0,0);
+          const yyyy = d.getFullYear();
+          const mm = String(d.getMonth()+1).padStart(2,"0");
+          const dd = String(d.getDate()).padStart(2,"0");
+          const hh = String(d.getHours()).padStart(2,"0");
+          return `${yyyy}-${mm}-${dd} ${hh}:00`;
+        };
+
+        const agg = new Map(); // shift||hour||status -> record
+        for (const l of loads) {
+          const t = _getLoadTimeForPlanning(l);
+          if (!t) continue;
+          if (t < ops.startMs || t >= ops.endMs) continue;
+          if (isCompleted(l?.status || l?.loadStatus)) continue;
+
+          let shiftName = null;
+          for (const b of buckets) { if (t >= b.a && t < b.b) { shiftName = b.shift; break; } }
+          if (!shiftName) continue;
+
+          const hb = hourBucket(t);
+          const sb = statusBucket(l?.status || l?.loadStatus);
+          const { C, missing } = getCounts(l);
+
+          const k = `${shiftName}||${hb}||${sb}`;
+          const r = agg.get(k) || { shift: shiftName, hourBucket: hb, statusBucket: sb, loads: 0, carts: 0, missingCounts: 0 };
+          r.loads += 1;
+          r.carts += (C || 0);
+          if (missing) r.missingCounts += 1;
+          agg.set(k, r);
+        }
+
+        const rows = Array.from(agg.values())
+          .sort((a,b) => String(a.shift).localeCompare(String(b.shift)) || String(a.hourBucket).localeCompare(String(b.hourBucket)) || String(a.statusBucket).localeCompare(String(b.statusBucket)));
+
+        const headers = ["shift","hourBucket","statusBucket","loads","carts","missingCounts"];
+
+        downloadTextFile(
+          `XD_GRAPH_${STATE.nodeId || "NODE"}_${new Date().toISOString().slice(0,10)}.csv`,
+          toCsv(rows, headers),
+          "text/csv;charset=utf-8"
+        );
+      } catch (e) {
+        console.error(e);
+        alert("XD Graph export failed.");
+      }
     };
 
-    // CSV: IB4CPT
+  // CSV: IB4CPT
     p.querySelector("#plan-csv-ib4").onclick = () => {
       try {
         if (typeof exportIB4CPT === "function") return exportIB4CPT();
@@ -7067,10 +8538,9 @@ function renderPlanningPanel() {
       for (const v of vrids.slice(0, 60)) {
         try {
           const detail = await _sspRelayGetDetail(v);
-                    try {
-            const lane = _sspRelayLaneLabel(detail);
-            if (lane) panel.querySelectorAll(`span[data-ssp-relay="lane"][data-vrid="${v}"]`).forEach(el => el.textContent = lane);
-          } catch {}
+          // NOTE: Do NOT overwrite the route/lane labels shown in SSP.
+          // Relay detail often only provides origin→dest (and may omit CART/CYC/DR1 suffixes),
+          // which is confusing for site ops. Keep SSP's own lane string as the source of truth.
           const t = _sspRelayTimesForNode(detail, node);
           const sched = _sspRelayParseIsoToLocal(t.planned);
           const eta = _sspRelayParseIsoToLocal(t.eta);
@@ -9477,6 +10947,97 @@ async function computeOutboundCasesForLaneCpt(laneKey, cptMs) {
   }
 }
 
+
+// =====================================================
+// Lane Map Panel (Relay-backed VRID list; optional jump to Relay)
+// - Triggered by clicking the lane label in Action Panel cards.
+// - Shows VRIDs for that lane+CPT and lets you open RelayMini per VRID.
+// =====================================================
+function ensureLaneMapPanel() {
+  let p = document.getElementById("ssp2-lane-map-panel");
+  if (p) return p;
+  p = document.createElement("div");
+  p.id = "ssp2-lane-map-panel";
+  p.style.position = "fixed";
+  p.style.right = "14px";
+  p.style.bottom = "14px";
+  p.style.width = "460px";
+  p.style.maxHeight = "75vh";
+  p.style.zIndex = "999999";
+  p.style.background = "#fff";
+  p.style.border = "1px solid #d1d5db";
+  p.style.borderRadius = "14px";
+  p.style.boxShadow = "0 18px 45px rgba(0,0,0,.22)";
+  p.style.display = "none";
+  p.style.overflow = "hidden";
+  p.innerHTML = `
+    <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid #e5e7eb;background:#0b1020;color:#e5e7eb;">
+      <div style="font-weight:900;">Lane</div>
+      <div id="ssp2-lane-map-title" style="font-weight:800;opacity:.95;"></div>
+      <div style="margin-left:auto;display:flex;gap:8px;">
+        <button id="ssp2-lane-map-open-relay" style="padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#e5e7eb;font-weight:900;cursor:pointer;">Open in Relay</button>
+        <button id="ssp2-lane-map-close" style="padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#e5e7eb;font-weight:900;cursor:pointer;">✕</button>
+      </div>
+    </div>
+    <div id="ssp2-lane-map-body" style="padding:10px;max-height:calc(75vh - 46px);overflow:auto;">
+      <div id="ssp2-lane-map-list" style="display:flex;flex-direction:column;gap:8px;"></div>
+    </div>
+  `;
+  document.body.appendChild(p);
+  p.querySelector("#ssp2-lane-map-close").onclick = () => { p.style.display = "none"; };
+  return p;
+}
+
+function openLaneMapPanel(lane, cptMs) {
+  const p = ensureLaneMapPanel();
+  const title = p.querySelector("#ssp2-lane-map-title");
+  const list = p.querySelector("#ssp2-lane-map-list");
+  const laneStr = String(lane||"—");
+  const cptStr = fmtCptLabel(Number(cptMs||0));
+  if (title) title.textContent = `${laneStr} (${cptStr})`;
+  const key = `${laneStr}|${Number(cptMs||0)}`;
+  const vrids = (STATE.__laneCptToVrids && STATE.__laneCptToVrids[key]) ? STATE.__laneCptToVrids[key] : [];
+  const nodeCode = (STATE && (STATE.nodeId || STATE.nodeID)) || "";
+  if (list) {
+    list.innerHTML = (vrids && vrids.length)
+      ? vrids.slice(0, 40).map(v => {
+          const vv = String(v);
+          return `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;border:1px solid #e5e7eb;border-radius:12px;padding:8px;">
+            <div style="font-weight:900;">${esc(vv)} <span class="ssp-relay-meta" data-vrid="${esc(vv)}" style="margin-left:8px;"></span></div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;">
+              <button class="ssp-lane-vrid-mini" data-vrid="${esc(vv)}" style="padding:4px 10px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;cursor:pointer;">Mini</button>
+              <a href="${esc(buildRelayUrl(vv))}" target="_blank" rel="noopener" style="padding:4px 10px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;text-decoration:none;color:#111827;">Relay</a>
+            </div>
+          </div>`;
+        }).join("")
+      : `<div style="color:#6b7280;">No VRIDs cached for this lane/CPT (open Action Panel first).</div>`;
+  }
+
+  const openBtn = p.querySelector("#ssp2-lane-map-open-relay");
+  if (openBtn) {
+    openBtn.onclick = () => {
+      // Relay doesn't have a perfect lane query; open search with VRIDs (best-effort).
+      const qs = (vrids && vrids.length) ? vrids.slice(0, 10).join(" ") : laneStr;
+      const url = `https://relay.amazon.com/tms/search?query=${encodeURIComponent(qs)}`;
+      window.open(url, "_blank", "noopener,noreferrer");
+    };
+  }
+
+  // delegate clicks for Mini buttons
+  p.onclick = (e) => {
+    const b = e.target && e.target.closest && e.target.closest("button.ssp-lane-vrid-mini");
+    if (!b) return;
+    const vrid = b.getAttribute("data-vrid") || "";
+    if (!vrid) return;
+    _showRelayMiniForAnchor(b, vrid, nodeCode);
+    try { _sspPrefetchRelayMetaBadges([vrid], 1); } catch(_) {}
+  };
+
+  p.style.display = "block";
+  // prefetch badges for lane list
+  try { _sspPrefetchRelayMetaBadges(vrids, 12); } catch(_) {}
+}
+
 function ensureCasesPanel() {
   if (document.getElementById("ssp-cases-overlay")) return;
 
@@ -11345,7 +12906,7 @@ function renderContainerBucketsV2(meta) {
     // Group by trailerId-like label (locationLabel on TRAILER context)
     const groups = groupByLoc(items);
     return groups.map(([loc, arr]) => {
-      const units = arr.reduce((s,x)=>s+unitFor(x.contType),0);
+      const units = arr.reduce((s,x)=>s+unitsFor(x.contType),0);
       return `<details open style="margin-top:8px;">
         <summary style="cursor:pointer;font-weight:800;">
           ${esc(loc)} — ${arr.length} ctrs • ${fmtUnits(units)} units
@@ -11421,68 +12982,56 @@ function renderContainerBucketsV2(meta) {
   return parts.join('');
 }
 
-function renderContainerBuckets(meta) {
-(meta) => {
-  const baseOrder = ['Loaded','Received','Staged','Stacked','Sorter','Unknown'];
-  const esc = s => String(s ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+function renderContainerBuckets(meta = {}) {
+  if (!meta || typeof meta !== 'object') return '';
 
-  const buckets = Array.from(new Set((meta||[]).map(m => String(m.bucket || 'Unknown') || 'Unknown')));
-  // stable ordering + include any unexpected buckets at the end
-  const order = baseOrder.filter(b => buckets.includes(b)).concat(buckets.filter(b => !baseOrder.includes(b)).sort());
-
-  const byBucket = (meta||[]).reduce((a,m) => {
-    const b = String(m.bucket || 'Unknown') || 'Unknown';
-    (a[b] ||= []).push(m);
-    return a;
-  }, {});
-
-  const total = (meta||[]).length;
-  const sum = order.reduce((s,b) => s + ((byBucket[b]||[]).length), 0);
-  const recon = (sum === total) ? '' : (`<div style="margin-top:6px;color:#dc2626;font-size:12px;">Bucket mismatch: ${sum}/${total}</div>`);
-
-  // Visual: stacked location bar + compact legend
   const colors = {
-    Loaded:   '#16a34a',
-    Received: '#0ea5e9',
-    Staged:   '#2563eb',
-    Stacked:  '#6b7280',
-    Sorter:   '#9333ea',
-    Unknown:  '#9ca3af',
+    Loaded: '#22c55e',
+    Received: '#3b82f6',
+    Staged: '#f59e0b',
+    Inbound: '#a855f7',
+    Cancelled: '#ef4444',
+    Unbucketed: '#9ca3af'
   };
 
-  const counts = order.map(k => ({ k, n: (byBucket[k]||[]).length })).filter(x => x.n > 0);
-  const bar = total ? `<div style="margin-top:6px;">
-      <div style="display:flex;height:10px;border-radius:999px;overflow:hidden;background:#e5e7eb;" title="${esc(counts.map(x=>`${x.k}:${x.n}`).join(' | '))}">
-        ${counts.map(x => {
-          const pct = Math.max(0.5, (x.n/total)*100); // keep tiny segments visible
-          const c = colors[x.k] || colors.Unknown;
-          return `<div style="width:${pct}%;background:${c};" title="${esc(x.k)}: ${x.n} (${Math.round((x.n/total)*100)}%)"></div>`;
-        }).join('')}
-      </div>
-      <div style="margin-top:6px;font-size:12px;color:#374151;display:flex;flex-wrap:wrap;gap:10px;">
-        ${counts.map(x => {
-          const c = colors[x.k] || colors.Unknown;
-          return `<span style="display:inline-flex;align-items:center;gap:6px;">
-            <span style="width:10px;height:10px;border-radius:3px;background:${c};display:inline-block;"></span>
-            <span><b>${esc(x.k)}</b>: ${x.n}</span>
-          </span>`;
-        }).join('')}
-      </div>
-    </div>` : '';
+  const unitFor = (contType) => {
+    if (!contType) return 1;
+    return String(contType).toUpperCase().includes('53') ? 2 : 1;
+  };
 
-  return bar + recon + order.map((k) => {
-    const items = (byBucket[k] || []);
-    // open non-empty buckets; Loaded open by default
-    const open = (k === 'Loaded') || (items.length > 0 && k !== 'Unknown');
-    return `<details style="margin-top:8px;" ${open ? 'open' : ''}>
-      <summary style="cursor:pointer;font-weight:800;">${esc(k)} (${items.length})</summary>
-      <div style="margin-top:6px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;white-space:pre-wrap;">
-        ${items.length ? items.map(x=>`${esc(x.label)}  [${esc(x.locationLabel)}]`).join('\n') : '—'}
-      </div>
-    </details>`;
-  }).join('');
-}};
-/* ===== end v1.5.10 ===== */
+  const renderRawList = (items) =>
+    items.map(x => `${x.id || x.containerId || 'Unknown'} (${x.contType || 'UNK'})`).join('\n');
+
+  const section = (name, items = []) => {
+    if (!items.length) return '';
+
+    const units = items.reduce((sum, x) => sum + unitFor(x.contType), 0);
+    const color = colors[name] || '#9ca3af';
+
+    return `
+      <details style="margin-top:10px;" ${name === 'Loaded' || name === 'Staged' ? 'open' : ''}>
+        <summary style="cursor:pointer;font-weight:900;display:flex;align-items:center;gap:8px;">
+          <span style="width:10px;height:10px;border-radius:3px;background:${color};display:inline-block;"></span>
+          ${name} — ${items.length} containers / ${units} units
+        </summary>
+        <div style="margin-top:6px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;white-space:pre-wrap;">
+          ${renderRawList(items)}
+        </div>
+      </details>
+    `;
+  };
+
+  return `
+    ${section('Loaded', meta.loaded)}
+    ${section('Received', meta.received)}
+    ${section('Staged', meta.staged)}
+    ${section('Inbound', meta.inbound)}
+    ${section('Cancelled', meta.cancelled)}
+    ${section('Unbucketed', meta.unbucketed)}
+  `;
+}
+
+
 
 
 
@@ -11540,3 +13089,729 @@ function __sspRenderPullDebug(kind) {
   );
 }
 /* ===== end v1.5.17 ===== */
+/* =============================
+ * Relay Cases (primary)
+ * ============================= */
+
+function _sspRelaySummarizeCase(c) {
+  try {
+    const o = c || {};
+    const id = o.caseId || o.id || o.uuid || o.case || o.case_id || "";
+    const status = o.status || o.state || o.caseStatus || "";
+    const topic = o.topic || o.type || o.category || o.reason || "";
+    const updated = o.updatedTime || o.lastUpdatedTime || o.lastModifiedTime || o.lastModified || o.updateTime || "";
+    return { id: String(id||""), status: String(status||""), topic: String(topic||""), updated: String(updated||"") };
+  } catch { return { id: "", status: "", topic: "", updated: "" }; }
+}
+
+async function openRelayCasesPanel(laneKey, cptMs) {
+  try { ensureCasesPanel(); } catch (_) {}
+  const overlay = document.getElementById("ssp-cases-overlay");
+  const subEl = document.getElementById("ssp-cases-subtitle");
+  const body = document.getElementById("ssp-cases-body");
+  if (!overlay || !body) return;
+
+  const laneLabel = String(laneKey || "—");
+  const cptLabel = cptMs ? fmtTime(Number(cptMs || 0)) : "";
+  if (subEl) subEl.textContent = cptLabel ? `${laneLabel} (CPT ${cptLabel})` : laneLabel;
+
+  overlay.style.display = "flex";
+  body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Loading Relay cases…</div>`;
+
+  // Lane group from Action Panel model
+  let g = null;
+  try { g = _getActionGroup(laneKey, cptMs); } catch (_) {}
+  const vs = (g && g.vrids) ? g.vrids : [];
+  if (!vs.length) {
+    body.innerHTML = `<div style="padding:10px;color:#6b7280;">No VRIDs found for this lane/CPT.</div>`;
+    return;
+  }
+
+  const rows = [];
+  for (const v of vs.slice(0, 80)) {
+    const vrid = String(v?.vrid || v?.vrId || "").trim();
+    if (!vrid) continue;
+    let detail = null;
+    try { detail = await _sspRelayGetDetail(vrid); } catch (_) { detail = null; }
+    if (!detail) continue;
+    let cases = [];
+    try { cases = _sspRelayExtractCases(detail) || []; } catch (_) { cases = []; }
+    if (!cases.length) continue;
+    const summaries = cases.map(_sspRelaySummarizeCase);
+    rows.push({ vrid, count: summaries.length, cases: summaries, raw: cases });
+  }
+
+  if (!rows.length) {
+    body.innerHTML = `<div style="padding:10px;color:#6b7280;">No Relay cases found for this lane/CPT.</div>`;
+    return;
+  }
+
+  const renderRow = (r, i) => {
+    const zebra = (i % 2) ? "background:#f9fafb;" : "background:#fff;";
+    const vr = esc(String(r.vrid || ""));
+    const relayUrl = (typeof _sspRelayTrackMapUrlForVrid === "function") ? _sspRelayTrackMapUrlForVrid(vr) : "";
+    const vrLink = relayUrl
+      ? `<a href="${esc(relayUrl)}" target="_blank" rel="noopener" style="font-weight:900;text-decoration:none;color:#111827;">${vr}</a>`
+      : `<span style="font-weight:900;color:#111827;">${vr}</span>`;
+
+    const chips = (r.cases || []).slice(0, 6).map((c) => {
+      const id = c.id ? `#${esc(c.id)}` : "(no id)";
+      const st = c.status ? esc(c.status) : "";
+      const tp = c.topic ? esc(c.topic) : "";
+      const up = c.updated ? esc(c.updated) : "";
+      const t = [id, st, tp, up].filter(Boolean).join(" • ");
+      return `<span title="${t}" style="padding:4px 10px;border-radius:999px;border:1px solid #e5e7eb;background:#f3f4f6;font-weight:900;color:#111827;">${id}${st?` • ${st}`:""}</span>`;
+    }).join(" ");
+
+    const more = (r.count > 6) ? `<span style="color:#6b7280;font-weight:800;">+${r.count-6} more</span>` : "";
+
+    const detailsBtn = `<button class="ssp-relay-case-details" data-vrid="${vr}" style="cursor:pointer;padding:4px 10px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;">Raw</button>`;
+
+    return `
+      <div style="display:grid;grid-template-columns:170px 90px 1fr;gap:10px;align-items:center;padding:10px 10px;border-radius:12px;${zebra}">
+        <div>${vrLink}</div>
+        <div style="font-weight:900;">${Number(r.count)||0} case${(Number(r.count)||0)===1?"":"s"}</div>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end;">${chips} ${more} ${detailsBtn}</div>
+      </div>
+      <div class="ssp-relay-case-raw" data-vridraw="${vr}" style="display:none;margin:-4px 10px 10px 10px;padding:10px 10px;border:1px solid #e5e7eb;border-radius:12px;background:#fff;">
+        <pre style="margin:0;white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;max-height:320px;overflow:auto;background:#0b1020;color:#e5e7eb;padding:10px;border-radius:12px;">${esc(JSON.stringify(r.raw, null, 2))}</pre>
+      </div>
+    `;
+  };
+
+  body.innerHTML = `
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+      <div style="font-weight:900;">Relay cases (${rows.length} VRIDs)</div>
+      <div style="margin-left:auto;color:#6b7280;font-weight:800;font-size:12px;">(primary source: Relay detail.cases[])</div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:6px;">
+      ${rows.map(renderRow).join("")}
+    </div>
+  `;
+
+  body.querySelectorAll("button.ssp-relay-case-details").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const vrid = btn.getAttribute("data-vrid") || "";
+      if (!vrid) return;
+      const box = body.querySelector(`.ssp-relay-case-raw[data-vridraw="${CSS.escape(vrid)}"]`);
+      if (!box) return;
+      box.style.display = (box.style.display === "none") ? "block" : "none";
+    });
+  });
+}
+
+/* =============================
+ * Relay Cases (primary)
+ * ============================= */
+
+function _sspRelaySummarizeCase(c) {
+  const o = c || {};
+  const id = o.caseId || o.id || o.uuid || o.case || o.case_id || '';
+  const status = o.status || o.state || o.caseStatus || '';
+  const topic = o.topic || o.type || o.category || o.reason || '';
+  const msg = o.message || o.summary || o.title || '';
+  return {
+    id: String(id || '').trim(),
+    status: String(status || '').trim(),
+    topic: String(topic || '').trim(),
+    message: String(msg || '').trim()
+  };
+}
+
+async function openRelayCasesPanel(laneKey, cptMs) {
+  // Uses Relay/Track transport view detail (detail.cases[]). FMC case search is not used.
+  try { ensureCasesPanel(); } catch (_) {}
+  const overlay = document.getElementById('ssp-cases-overlay');
+  const subEl = document.getElementById('ssp-cases-subtitle');
+  const body = document.getElementById('ssp-cases-body');
+  if (!overlay || !body) return;
+
+  const laneLabel = String(laneKey || '—');
+  const cptLabel = cptMs ? fmtTime(Number(cptMs || 0)) : '';
+  if (subEl) subEl.textContent = cptLabel ? `${laneLabel} (CPT ${cptLabel})` : laneLabel;
+
+  overlay.style.display = 'flex';
+  body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Loading cases from Relay…</div>`;
+
+  // Resolve VRIDs for lane/cpt from the current Action Panel grouping.
+  let group = null;
+  try { group = _getActionGroup(laneKey, cptMs); } catch (_) { group = null; }
+  const vs = (group && group.vrids) ? group.vrids : [];
+  const vrids = [];
+  for (const v of vs) {
+    const id = String(v?.vrid || v?.vrId || '').trim();
+    if (id) vrids.push(id);
+  }
+
+  if (!vrids.length) {
+    body.innerHTML = `<div style="padding:10px;color:#6b7280;">No VRIDs found for this lane/CPT.</div>`;
+    return;
+  }
+
+  // Fetch details in a controlled fanout.
+  const rows = [];
+  const max = Math.min(60, vrids.length);
+  for (let i = 0; i < max; i++) {
+    const vrid = vrids[i];
+    let detail = null;
+    try { detail = await _sspRelayGetDetail(vrid); } catch (_) { detail = null; }
+    if (!detail) continue;
+    let cases = [];
+    try { cases = _sspRelayExtractCases(detail) || []; } catch (_) { cases = []; }
+    if (!cases.length) continue;
+    const summaries = cases.map(_sspRelaySummarizeCase);
+    rows.push({ vrid, count: cases.length, cases: summaries });
+  }
+
+  if (!rows.length) {
+    body.innerHTML = `<div style="padding:10px;color:#6b7280;">No Relay cases found for this lane/CPT.</div>`;
+    return;
+  }
+
+  const renderRow = (r, i) => {
+    const zebra = (i % 2) ? 'background:#f9fafb;' : 'background:#fff;';
+    const vr = esc(String(r.vrid || ''));
+    const relayUrl = (typeof _sspRelayTrackMapUrlForVrid === 'function') ? _sspRelayTrackMapUrlForVrid(vr) : '';
+    const vrLink = relayUrl
+      ? `<a href="${esc(relayUrl)}" target="_blank" rel="noopener" style="font-weight:900;text-decoration:none;color:#111827;">${vr}</a>`
+      : `<span style="font-weight:900;color:#111827;">${vr}</span>`;
+
+    const casesHtml = (r.cases || []).slice(0, 12).map((c) => {
+      const id = c.id ? `#${esc(c.id)}` : '';
+      const st = c.status ? esc(c.status) : '';
+      const tp = c.topic ? esc(c.topic) : '';
+      const msg = c.message ? esc(c.message) : '';
+      const bits = [id, st, tp].filter(Boolean).join(' • ');
+      return `<div style="padding:6px 8px;border:1px solid #e5e7eb;border-radius:10px;background:#fff;">
+        <div style="font-weight:900;">${bits || 'Case'}</div>
+        ${msg ? `<div style="color:#6b7280;font-weight:800;font-size:11px;margin-top:2px;">${msg}</div>` : ''}
+      </div>`;
+    }).join('');
+
+    const more = (r.count > 12) ? `<div style="color:#6b7280;font-weight:800;font-size:11px;margin-top:6px;">+${r.count-12} more…</div>` : '';
+
+    return `<div style="padding:10px;border-radius:12px;${zebra}">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
+        <div>${vrLink}<div style="color:#6b7280;font-weight:800;font-size:11px;margin-top:2px;">${r.count} case${r.count===1?'':'s'}</div></div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <a href="${esc(_sspRelayTrackMapUrlForVrid(vr))}" target="_blank" rel="noopener" style="padding:4px 10px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;text-decoration:none;color:#111827;">Open in Relay</a>
+        </div>
+      </div>
+      <div style="margin-top:8px;display:flex;flex-direction:column;gap:6px;">${casesHtml}${more}</div>
+    </div>`;
+  };
+
+  body.innerHTML = `
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+      <div style="font-weight:900;">Relay cases (${rows.length} VRIDs)</div>
+      <div style="margin-left:auto;color:#6b7280;font-weight:800;font-size:12px;">(Relay is the source of truth)</div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:6px;">${rows.map(renderRow).join('')}</div>
+  `;
+}
+
+
+/* =============================
+ * PATCH v1.6.69 — Relay case details + badge click fix
+ * - Clicking C/D/N badges now always works (global capture handler)
+ * - Cases: use caseId -> /api/v2/transport-views?module=issue&type[]=case&searchId[]=... to fetch case detail
+ * - Correspondence: /api/cases/NA:CASE:<id>/correspondences
+ * ============================= */
+(function(){
+  try {
+    // ---------- helpers ----------
+    const _esc = (s) => (typeof esc === "function") ? esc(s) : String(s||"").replace(/[&<>"']/g, (c)=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+    const _safeJson = (x) => {
+      try { return JSON.stringify(x, null, 2); } catch (e) { return String(x); }
+    };
+
+    function _sspRelayQualifiedCaseId(caseObjOrId){
+      const o = caseObjOrId;
+      if (o && typeof o === "object") {
+        const q = o.qualifiedId || o.qualifiedCaseId || o.qualified || "";
+        if (q) return String(q);
+        const id = o.id || o.caseId || o.caseID || "";
+        if (id) return `NA:CASE:${String(id)}`;
+      }
+      const id = String(o||"").trim();
+      if (!id) return "";
+      if (id.includes(":")) return id;
+      return `NA:CASE:${id}`;
+    }
+
+    function _sspRelayExtractCaseIdsFromDetail(detail){
+      try {
+        const arr = (detail && Array.isArray(detail.cases)) ? detail.cases : [];
+        const ids = [];
+        for (const c of arr) {
+          const q = _sspRelayQualifiedCaseId(c);
+          if (q) ids.push(q);
+        }
+        return Array.from(new Set(ids));
+      } catch (_) { return []; }
+    }
+
+    async function _sspRelaySearchCasesByIds(qualifiedCaseIds){
+      const ids = (qualifiedCaseIds||[]).map(x=>String(x||"").trim()).filter(Boolean);
+      if (!ids.length) return [];
+      if (typeof _sspRelayRequest !== "function") return [];
+      if (typeof _sspGetTrackAuthHeader === "function" && !_sspGetTrackAuthHeader()) throw new Error("NO_TRACK_AUTH");
+
+      // Track endpoint accepts numeric searchId; use numeric portion for searchId[].
+      const nums = ids.map(q => {
+        const m = String(q).match(/(\d{6,})/);
+        return m ? m[1] : "";
+      }).filter(Boolean);
+
+      if (!nums.length) return [];
+
+      const qs = nums.map(n => `searchId[]=${encodeURIComponent(n)}`).join("&");
+      const url = `https://track.relay.amazon.dev/api/v2/transport-views?${qs}&module=issue&type[]=case&view=detail&sortCol=sent&ascending=true`;
+      const txt = await _sspRelayRequest(url, 12000);
+      let js = null;
+      try { js = JSON.parse(txt); } catch (_) { js = null; }
+      // Response is typically an array of { vrid, case: {...}, module:'issue', ... }
+      if (Array.isArray(js)) return js;
+      if (js && Array.isArray(js.items)) return js.items;
+      return [];
+    }
+
+    async function _sspRelayGetCaseCorrespondences(qualifiedCaseId){
+      const qid = _sspRelayQualifiedCaseId(qualifiedCaseId);
+      if (!qid) return [];
+      const url = `https://track.relay.amazon.dev/api/cases/${encodeURIComponent(qid)}/correspondences`;
+      const txt = await _sspRelayRequest(url, 12000);
+      let js = null;
+      try { js = JSON.parse(txt); } catch (_) { js = null; }
+      return Array.isArray(js) ? js : (js && Array.isArray(js.items) ? js.items : []);
+    }
+
+    // ---------- overlay render ----------
+    async function _sspOpenCasesOverlayForVrid(vrid){
+      const v = String(vrid||"").trim();
+      if (!v) return;
+      if (typeof __sspEnsureRelayOverlay === "function") __sspEnsureRelayOverlay();
+      const overlay = document.getElementById("ssp-relay-overlay");
+      const titleEl = document.getElementById("ssp-relay-overlay-title");
+      const body = document.getElementById("ssp-relay-overlay-body");
+      if (!overlay || !body) return;
+
+      overlay.style.display = "flex";
+      if (titleEl) titleEl.textContent = `Cases — ${v}`;
+      body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Loading case details…</div>`;
+
+      let detail = null;
+      try { detail = (typeof _sspRelayGetDetail === "function") ? await _sspRelayGetDetail(v) : null; } catch (_) { detail = null; }
+      if (!detail) {
+        body.innerHTML = `<div style="padding:10px;color:#6b7280;">Unable to load Relay detail for ${_esc(v)}.</div>`;
+        return;
+      }
+
+      const caseIds = _sspRelayExtractCaseIdsFromDetail(detail);
+      if (!caseIds.length) {
+        body.innerHTML = `<div style="padding:10px;color:#6b7280;">No cases on this VRID.</div>`;
+        return;
+      }
+
+      // Fetch case detail (issue module) and render a compact list. Correspondence loads on expand.
+      let caseItems = [];
+      try { caseItems = await _sspRelaySearchCasesByIds(caseIds); } catch (_) { caseItems = []; }
+
+      // Map by numeric id for easy join
+      const mapByNum = new Map();
+      for (const it of (caseItems||[])) {
+        const c = it && (it.case || it.caze || it.issue || it);
+        const q = _sspRelayQualifiedCaseId(c);
+        const m = String(q).match(/(\d{6,})/);
+        const num = m ? m[1] : "";
+        if (num) mapByNum.set(num, { it, caseObj: c, qid: q });
+      }
+
+      const rows = [];
+      for (const qid of caseIds) {
+        const m = String(qid).match(/(\d{6,})/);
+        const num = m ? m[1] : "";
+        const hit = num ? mapByNum.get(num) : null;
+        const c = hit ? hit.caseObj : { qualifiedId: qid };
+        const status = c?.status || c?.state || c?.caseStatus || "";
+        const sev = c?.severity ?? c?.priority ?? "";
+        const subject = c?.subject || c?.title || c?.summary || "";
+        const queue = c?.queue || c?.queueName || "";
+        rows.push({ qid, num, status, sev, subject, queue, raw: c });
+      }
+
+      const render = rows.map((r, idx) => {
+        const zebra = (idx%2) ? "background:#0b1020;" : "background:#0a0f1d;";
+        const header = `
+          <div style="display:flex;align-items:center;gap:10px;">
+            <div style="font-weight:900;">${_esc(r.num || r.qid)}</div>
+            ${r.status?`<span style="padding:1px 8px;border:1px solid #374151;border-radius:999px;font-weight:900;">${_esc(r.status)}</span>`:""}
+            ${String(r.sev)!==""?`<span style="padding:1px 8px;border:1px solid #374151;border-radius:999px;font-weight:900;">sev:${_esc(String(r.sev))}</span>`:""}
+            ${r.queue?`<span style="padding:1px 8px;border:1px solid #374151;border-radius:999px;font-weight:900;">${_esc(r.queue)}</span>`:""}
+            <span style="margin-left:auto;display:flex;gap:8px;">
+              <button class="ssp-case-open" data-qid="${_esc(r.qid)}" style="cursor:pointer;padding:4px 10px;border-radius:999px;border:1px solid #374151;background:#111827;color:#fff;font-weight:900;">Open</button>
+              <button class="ssp-case-raw" data-qid="${_esc(r.qid)}" style="cursor:pointer;padding:4px 10px;border-radius:999px;border:1px solid #374151;background:#0b1020;color:#e5e7eb;font-weight:900;">Raw</button>
+            </span>
+          </div>`;
+        const subj = r.subject ? `<div style="margin-top:6px;color:#e5e7eb;font-weight:900;">${_esc(r.subject)}</div>` : "";
+        return `
+          <div style="border:1px solid #1f2937;border-radius:14px;padding:10px;${zebra}">
+            ${header}
+            ${subj}
+            <div class="ssp-case-correspondence" data-qid="${_esc(r.qid)}" style="display:none;margin-top:10px;border-top:1px solid #1f2937;padding-top:10px;">
+              <div style="color:#9ca3af;font-weight:800;">Loading correspondence…</div>
+            </div>
+            <div class="ssp-case-rawbox" data-qid="${_esc(r.qid)}" style="display:none;margin-top:10px;">
+              <pre style="white-space:pre-wrap;font-size:11px;max-height:280px;overflow:auto;background:#000;border:1px solid #1f2937;color:#e5e7eb;padding:10px;border-radius:12px;margin:0;">${_esc(_safeJson(r.raw))}</pre>
+            </div>
+          </div>
+        `;
+      }).join("");
+
+      body.innerHTML = `
+        <div style="padding:10px;">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+            <div style="font-weight:900;color:#e5e7eb;">${rows.length} case${rows.length===1?"":"s"}</div>
+            <div style="margin-left:auto;color:#9ca3af;font-weight:800;font-size:12px;">(Relay: issue→case + correspondences)</div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:8px;">${render}</div>
+        </div>
+      `;
+
+      body.querySelectorAll("button.ssp-case-open").forEach(btn=>{
+        btn.addEventListener("click", async (e)=>{
+          e.preventDefault(); e.stopPropagation();
+          const qid = btn.getAttribute("data-qid") || "";
+          const box = body.querySelector(`.ssp-case-correspondence[data-qid="${CSS.escape(qid)}"]`);
+          if (!box) return;
+          const open = (box.style.display === "none");
+          box.style.display = open ? "block" : "none";
+          if (!open) return;
+          // Load once
+          if (box.getAttribute("data-loaded")==="1") return;
+          box.setAttribute("data-loaded","1");
+          let items = [];
+          try { items = await _sspRelayGetCaseCorrespondences(qid); } catch (err) { items = []; }
+          if (!items.length) {
+            box.innerHTML = `<div style="color:#9ca3af;font-weight:800;">No correspondence found.</div>`;
+            return;
+          }
+          const msgs = items.map((m)=>{
+            const from = m?.fromAddress || m?.from || m?.sender || "";
+            const created = m?.createdAt || m?.sentAt || m?.time || "";
+            const desc = m?.description || m?.body || m?.text || "";
+            const head = `<div style="display:flex;gap:10px;align-items:center;">
+              <div style="font-weight:900;color:#e5e7eb;">${_esc(from||"")}</div>
+              <div style="margin-left:auto;color:#9ca3af;font-weight:800;font-size:12px;">${_esc(created||"")}</div>
+            </div>`;
+            const bodyTxt = `<div style="margin-top:6px;white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;color:#e5e7eb;">${_esc(desc||"")}</div>`;
+            return `<div style="padding:10px;border:1px solid #1f2937;border-radius:12px;background:#000;margin-top:8px;">${head}${bodyTxt}</div>`;
+          }).join("");
+          box.innerHTML = msgs;
+        });
+      });
+
+      body.querySelectorAll("button.ssp-case-raw").forEach(btn=>{
+        btn.addEventListener("click", (e)=>{
+          e.preventDefault(); e.stopPropagation();
+          const qid = btn.getAttribute("data-qid") || "";
+          const raw = body.querySelector(`.ssp-case-rawbox[data-qid="${CSS.escape(qid)}"]`);
+          if (!raw) return;
+          raw.style.display = (raw.style.display==="none") ? "block" : "none";
+        });
+      });
+    }
+
+    // Override the overlay opener for badges
+    if (window.__SSP_OPEN_RELAY_OVERLAY && !window.__SSP_OPEN_RELAY_OVERLAY_ORIG) window.__SSP_OPEN_RELAY_OVERLAY_ORIG = window.__SSP_OPEN_RELAY_OVERLAY;
+    window.__SSP_OPEN_RELAY_OVERLAY = async function(vrid, kind){
+      const k = String(kind||"").toLowerCase();
+      if (k === "cases") return _sspOpenCasesOverlayForVrid(vrid);
+      // fall back to existing implementation if present
+      if (typeof window.__SSP_OPEN_RELAY_OVERLAY_ORIG === "function") return window.__SSP_OPEN_RELAY_OVERLAY_ORIG(vrid, kind);
+      try {
+        // Basic JSON fallback for disruptions/notes/detail
+        if (typeof __sspEnsureRelayOverlay === "function") __sspEnsureRelayOverlay();
+        const overlay = document.getElementById("ssp-relay-overlay");
+        const titleEl = document.getElementById("ssp-relay-overlay-title");
+        const body = document.getElementById("ssp-relay-overlay-body");
+        if (!overlay || !body) return;
+        overlay.style.display = "flex";
+        if (titleEl) titleEl.textContent = `${String(kind||"detail")} — ${String(vrid||"")}`;
+        let payload = null;
+        if (k === "notes" && typeof _sspRelayGetNotes === "function") payload = await _sspRelayGetNotes(vrid);
+        else if (typeof _sspRelayGetDetail === "function") payload = await _sspRelayGetDetail(vrid);
+        body.innerHTML = `<div style="padding:10px;">${(typeof renderJson==="function") ? renderJson(payload) : `<pre>${_esc(_safeJson(payload))}</pre>`}</div>`;
+      } catch (e) {}
+    };
+
+    // Preserve original if not already preserved
+    if (!window.__SSP_OPEN_RELAY_OVERLAY_ORIG && window.__SSP_OPEN_RELAY_OVERLAY && window.__SSP_OPEN_RELAY_OVERLAY !== window.__SSP_OPEN_RELAY_OVERLAY_ORIG) {
+      // (noop; set below only once)
+    }
+
+    // Capture handler: always route badge clicks to our overlay
+    document.addEventListener("click", (e)=>{
+      const b = e.target && e.target.closest ? e.target.closest("button.ssp-relay-badge") : null;
+      if (!b) return;
+      e.preventDefault(); e.stopPropagation();
+      const vrid = b.getAttribute("data-vrid") || "";
+      const kind = b.getAttribute("data-kind") || "";
+      if (typeof window.__SSP_OPEN_RELAY_OVERLAY === "function") window.__SSP_OPEN_RELAY_OVERLAY(vrid, kind);
+    }, true);
+
+  } catch (_) {}
+})();
+
+/* PATCH 1.6.70 — lane cases panel uses Relay issue APIs */
+(function(){
+  try {
+    const _esc = (s)=> (typeof esc==='function') ? esc(s) : String(s||'').replace(/[&<>"']/g,(c)=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+    const pad = (n)=> String(n).padStart(2,'0');
+    const dateStr = (d)=> `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+    const timeStr = (d)=> `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    const laneBase = (laneKey)=>{
+      const s = String(laneKey||'').trim();
+      const parts = s.split('->');
+      if (parts.length<2) return s;
+      const o = parts[0].trim();
+      const rest = parts.slice(1).join('->').trim();
+      const d = rest.split('-')[0].trim();
+      return (o && d) ? `${o}->${d}` : s;
+    };
+
+    async function searchLaneViews(laneKey, cptMs){
+      const lane = laneBase(laneKey);
+      const cpt = Number(cptMs||0) || Date.now();
+      const start = new Date(cpt - 12*60*60*1000);
+      const end = new Date(cpt + 6*60*60*1000);
+      const qs = new URLSearchParams();
+      qs.append('module','trip');
+      qs.append('page','1');
+      qs.append('pageSize','200');
+      qs.append('sortCol','sent');
+      qs.append('ascending','true');
+      qs.append('column','scheduled_end');
+      qs.append('view','detail');
+      qs.append('dateField','effectiveEnd');
+      qs.append('searchTerm[]', lane);
+      qs.append('type[]','vehicleRun');
+      qs.append('startDate', dateStr(start));
+      qs.append('endDate', dateStr(end));
+      qs.append('startTime', timeStr(start));
+      qs.append('endTime', timeStr(end));
+      const url = `https://track.relay.amazon.dev/api/v2/transport-views?${qs.toString()}`;
+      if (typeof _sspRelayRequest!=='function') throw new Error('relay req not ready');
+      const res = await _sspRelayRequest(url,{method:'GET'});
+      if (Array.isArray(res)) return res;
+      if (res && Array.isArray(res.items)) return res.items;
+      if (res && Array.isArray(res.results)) return res.results;
+      return [];
+    }
+
+    const vridFromRow = (r)=> String((r&& (r.vrid||r.vrId||r.vehicleRunId||r.id||r.vr))||'').trim();
+    const extractCaseStubs = (o)=>{
+      const obj = o||{};
+      const xs = Array.isArray(obj.cases) ? obj.cases : (obj.case ? [obj.case] : []);
+      return xs.map((c)=>{
+        const cc=c||{};
+        const id = (cc.id||cc.caseId||cc.case||cc.case_id||'').toString().replace(/^NA:CASE:/,'');
+        const qid = (cc.qualifiedId||`NA:CASE:${id}`);
+        return { caseId:id, qualifiedId:qid, raw:cc };
+      }).filter(x=>x.caseId);
+    };
+
+    async function fetchIssueCase(caseId){
+      const id = String(caseId||'').replace(/^NA:CASE:/,'').trim();
+      if (!id) return null;
+      const qs = new URLSearchParams();
+      qs.append('searchId[]', id);
+      qs.append('module','issue');
+      qs.append('type[]','case');
+      qs.append('view','detail');
+      qs.append('sortCol','sent');
+      qs.append('ascending','true');
+      const url = `https://track.relay.amazon.dev/api/v2/transport-views?${qs.toString()}`;
+      const res = await _sspRelayRequest(url,{method:'GET'});
+      if (Array.isArray(res)) return res[0]||null;
+      if (res && Array.isArray(res.items)) return res.items[0]||null;
+      if (res && Array.isArray(res.results)) return res.results[0]||null;
+      return null;
+    }
+
+    async function fetchCorr(caseId){
+      const id = String(caseId||'').replace(/^NA:CASE:/,'').trim();
+      if (!id) return [];
+      const url = `https://track.relay.amazon.dev/api/cases/NA:CASE:${id}/correspondences`;
+      let res=null; try{ res=await _sspRelayRequest(url,{method:'GET'}); }catch(_){ res=null; }
+      return Array.isArray(res) ? res : (res && Array.isArray(res.items) ? res.items : []);
+    }
+
+    const sumIssue = (ir)=>{
+      const r=ir||{};
+      const c=r.case||{};
+      const id = String((c.id||c.caseId||r.id||'')).replace(/^NA:CASE:/,'');
+      return {
+        id,
+        status: c.status||r.status||'',
+        severity: (c.severity!==undefined?c.severity:''),
+        queue: c.queue||'',
+        subject: c.subject||c.title||c.summary||'',
+        raw: ir
+      };
+    };
+
+    async function mapLimit(items, limit, fn){
+      const out=new Array(items.length);
+      let idx=0;
+      const workers=new Array(Math.min(limit, items.length)).fill(0).map(async ()=>{
+        while(idx<items.length){
+          const i=idx++;
+          try{ out[i]=await fn(items[i],i); }catch(_){ out[i]=null; }
+        }
+      });
+      await Promise.all(workers);
+      return out;
+    }
+
+    // Override lane cases panel entrypoint
+    window.openRelayCasesPanel = async function(laneKey, cptMs){
+      try{ if (typeof ensureCasesPanel==='function') ensureCasesPanel(); }catch(_){ }
+      const overlay=document.getElementById('ssp-cases-overlay');
+      const subEl=document.getElementById('ssp-cases-subtitle');
+      const body=document.getElementById('ssp-cases-body');
+      if (!overlay||!body) return;
+      const laneLabel=String(laneKey||'—');
+      const cptLabel=cptMs?(typeof fmtTime==='function'?fmtTime(Number(cptMs||0)):''):'';
+      if (subEl) subEl.textContent = cptLabel ? `${laneLabel} (CPT ${cptLabel})` : laneLabel;
+      overlay.style.display='flex';
+      body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Loading lane cases from Relay…</div>`;
+
+      // Search lane VRIDs (Relay)
+      let rows=[]; try{ rows = await searchLaneViews(laneKey, cptMs); }catch(_){ rows=[]; }
+
+      const vridToCaseIds = new Map();
+      for (const r of rows){
+        const vrid = vridFromRow(r);
+        if (!vrid) continue;
+        const stubs = extractCaseStubs(r);
+        if (!stubs.length) continue;
+        const cur = vridToCaseIds.get(vrid) || [];
+        stubs.forEach(s=> cur.push(String(s.caseId)));
+        vridToCaseIds.set(vrid, cur);
+      }
+
+      // Fallback: if search didn't include case stubs, use current Action Panel VRIDs and VRID detail.cases[]
+      if (vridToCaseIds.size===0 && typeof _getActionGroup==='function' && typeof _sspRelayGetDetail==='function'){
+        let group=null; try{ group=_getActionGroup(laneKey, cptMs); }catch(_){ group=null; }
+        const vs=(group&&group.vrids)?group.vrids:[];
+        const vrids=vs.map(v=>String(v?.vrid||v?.vrId||'').trim()).filter(Boolean).slice(0,80);
+        await mapLimit(vrids, 6, async (vrid)=>{
+          const d=await _sspRelayGetDetail(vrid);
+          const stubs=extractCaseStubs(d);
+          if (!stubs.length) return;
+          vridToCaseIds.set(vrid, stubs.map(s=>String(s.caseId)));
+        });
+      }
+
+      const vrids=Array.from(vridToCaseIds.keys());
+      if (!vrids.length){
+        body.innerHTML = `<div style="padding:10px;color:#6b7280;">No cases found for this lane.</div>`;
+        return;
+      }
+
+      const uniq=[]; const seen=new Set();
+      for (const ids of vridToCaseIds.values()){
+        (ids||[]).forEach((x)=>{ const id=String(x||'').replace(/^NA:CASE:/,'').trim(); if(!id||seen.has(id)) return; seen.add(id); uniq.push(id); });
+      }
+
+      body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Fetching ${uniq.length} case(s)…</div>`;
+
+      const issueRows = await mapLimit(uniq, 6, fetchIssueCase);
+      const byId = new Map();
+      issueRows.forEach((ir)=>{ if(!ir) return; const s=sumIssue(ir); if(s.id) byId.set(String(s.id), s); });
+
+      const vrSection = (vrid)=>{
+        const ids = Array.from(new Set((vridToCaseIds.get(vrid)||[]).map(x=>String(x||'').replace(/^NA:CASE:/,'').trim()).filter(Boolean)));
+        const relayUrl = (typeof _sspRelayTrackMapUrlForVrid==='function') ? _sspRelayTrackMapUrlForVrid(vrid) : '';
+        const head = `<div style="display:flex;align-items:center;gap:10px;">
+          ${relayUrl ? `<a href="${_esc(relayUrl)}" target="_blank" rel="noopener" style="font-weight:900;text-decoration:none;color:#e5e7eb;">${_esc(vrid)}</a>` : `<div style="font-weight:900;color:#e5e7eb;">${_esc(vrid)}</div>`}
+          <div style="margin-left:auto;color:#9ca3af;font-weight:800;">${ids.length} case${ids.length===1?'':'s'}</div>
+        </div>`;
+        const cards = ids.map((cid)=>{
+          const c = byId.get(String(cid)) || {};
+          const status = c.status ? _esc(c.status) : '';
+          const queue = c.queue ? _esc(c.queue) : '';
+          const subject = c.subject ? _esc(c.subject) : '';
+          const sev = (c.severity!==undefined && c.severity!==null && String(c.severity)!=='') ? _esc(String(c.severity)) : '';
+          const top = [status, queue].filter(Boolean).join(' • ');
+          return `<div style="padding:10px;border:1px solid #1f2937;border-radius:12px;background:#000;">
+            <div style="display:flex;gap:10px;align-items:center;">
+              <div style="font-weight:900;color:#e5e7eb;">#${_esc(cid)}</div>
+              ${sev?`<div style="padding:2px 8px;border-radius:999px;border:1px solid #374151;background:#111827;color:#e5e7eb;font-weight:900;font-size:11px;">sev ${sev}</div>`:''}
+              <div style="margin-left:auto;display:flex;gap:8px;">
+                <button class="ssp-case-thread-btn" data-cid="${_esc(cid)}" style="cursor:pointer;padding:4px 10px;border-radius:999px;border:1px solid #374151;background:#111827;color:#e5e7eb;font-weight:900;">Thread</button>
+                <button class="ssp-case-raw-btn" data-cid="${_esc(cid)}" style="cursor:pointer;padding:4px 10px;border-radius:999px;border:1px solid #374151;background:#111827;color:#e5e7eb;font-weight:900;">Raw</button>
+              </div>
+            </div>
+            ${top?`<div style="margin-top:6px;color:#e5e7eb;font-weight:800;font-size:12px;">${top}</div>`:''}
+            ${subject?`<div style="margin-top:4px;color:#9ca3af;font-weight:800;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:900px;">${subject}</div>`:''}
+            <div class="ssp-case-thread" data-cid="${_esc(cid)}" data-loaded="0" style="display:none;margin-top:10px;"></div>
+            <div class="ssp-case-raw" data-cid="${_esc(cid)}" style="display:none;margin-top:10px;">
+              <pre style="margin:0;white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;max-height:260px;overflow:auto;background:#0b1020;color:#e5e7eb;padding:10px;border-radius:12px;">${_esc(JSON.stringify((c.raw)||{}, null, 2))}</pre>
+            </div>
+          </div>`;
+        }).join('');
+        return `<div style="padding:12px;border:1px solid #1f2937;border-radius:14px;background:#000;margin-top:10px;">${head}<div style="margin-top:10px;display:flex;flex-direction:column;gap:8px;">${cards}</div></div>`;
+      };
+
+      body.innerHTML = `<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+        <div style="font-weight:900;">Lane Cases (Relay)</div>
+        <div style="margin-left:auto;color:#9ca3af;font-weight:800;font-size:12px;">${_esc(laneBase(laneKey))} • ${vrids.length} VRIDs</div>
+      </div>
+      <div style="max-height:70vh;overflow:auto;padding-right:6px;">${vrids.slice(0,120).map(vrSection).join('')}</div>`;
+
+      body.querySelectorAll('button.ssp-case-raw-btn').forEach((btn)=>{
+        btn.addEventListener('click',(e)=>{
+          e.preventDefault(); e.stopPropagation();
+          const cid=btn.getAttribute('data-cid')||'';
+          const box=body.querySelector(`.ssp-case-raw[data-cid="${CSS.escape(cid)}"]`);
+          if (!box) return;
+          box.style.display = (box.style.display==='none') ? 'block' : 'none';
+        });
+      });
+
+      body.querySelectorAll('button.ssp-case-thread-btn').forEach((btn)=>{
+        btn.addEventListener('click',async (e)=>{
+          e.preventDefault(); e.stopPropagation();
+          const cid=btn.getAttribute('data-cid')||'';
+          const box=body.querySelector(`.ssp-case-thread[data-cid="${CSS.escape(cid)}"]`);
+          if (!box) return;
+          const open = (box.style.display==='none');
+          box.style.display = open ? 'block' : 'none';
+          if (!open) return;
+          if (box.getAttribute('data-loaded')==='1') return;
+          box.setAttribute('data-loaded','1');
+          box.innerHTML = `<div style="color:#9ca3af;font-weight:800;">Loading correspondence…</div>`;
+          const msgs = await fetchCorr(cid);
+          if (!msgs.length){ box.innerHTML = `<div style="color:#9ca3af;font-weight:800;">No correspondence found.</div>`; return; }
+          box.innerHTML = msgs.map((m)=>{
+            const from=m?.fromAddress||m?.from||m?.sender||'';
+            const created=m?.createdAt||m?.sentAt||m?.time||'';
+            const desc=m?.description||m?.body||m?.text||'';
+            return `<div style="padding:10px;border:1px solid #1f2937;border-radius:12px;background:#0b1020;margin-top:8px;">
+              <div style="display:flex;gap:10px;align-items:center;">
+                <div style="font-weight:900;color:#e5e7eb;">${_esc(from)}</div>
+                <div style="margin-left:auto;color:#9ca3af;font-weight:800;font-size:12px;">${_esc(created)}</div>
+              </div>
+              <div style="margin-top:6px;white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;color:#e5e7eb;">${_esc(desc)}</div>
+            </div>`;
+          }).join('');
+        });
+      });
+    };
+
+  } catch (_) {}
+})();
