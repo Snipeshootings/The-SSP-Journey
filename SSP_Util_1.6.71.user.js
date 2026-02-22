@@ -1654,6 +1654,10 @@ function extractContainersMetaFromObTree(nodes) {
   function unitsForContainerType(contType) {
     return getUnitWeight(contType);
   }
+  // Back-compat alias (some panel paths still reference this older helper name).
+  function unitsForBucket(contType) {
+    return unitsForContainerType(contType);
+  }
 
 
   function countUnitsFromTree(nodes) {
@@ -6708,7 +6712,7 @@ ${disruptDotHtml}
             e.stopPropagation();
             const lane = laneSpan.getAttribute("data-lane") || "";
             const cpt = Number(laneSpan.getAttribute("data-cpt") || 0);
-            try { openLaneMapPanel(lane, cpt); } catch (_) { window.open(`https://relay.amazon.com/tms/search?query=${encodeURIComponent(lane)}`, "_blank", "noopener"); }
+            try { openLaneMapPanel(lane, cpt); } catch (_) { window.open("https://track.relay.amazon.dev/", "_blank", "noopener"); }
             return;
           }
 const dis = e.target.closest(".open-disruptions");
@@ -7466,8 +7470,32 @@ async function _sspRelayGetNotes(vrid) {
 
 function _sspRelayExtractCases(detail) {
   try {
-    const c = detail && detail.cases;
-    return Array.isArray(c) ? c : [];
+    if (!detail) return [];
+    const direct = detail.cases;
+    if (Array.isArray(direct)) return direct;
+
+    const candidates = [
+      detail.caseSummaries,
+      detail.issues,
+      detail.issueSummaries,
+      detail.returnedObject?.cases,
+      detail.returnedObject?.caseSummaries,
+      detail.returnedObject,
+      detail.case,
+      detail.issue,
+      Array.isArray(detail.items) ? detail.items.map((x) => x?.case || x?.issue || x).filter(Boolean) : null,
+    ];
+
+    for (const c of candidates) {
+      if (Array.isArray(c)) {
+        const mapped = c.map((x) => x?.case || x?.issue || x).filter((x) => x && typeof x === "object");
+        if (mapped.length) return mapped;
+      }
+      if (c && typeof c === "object" && (c.caseId || c.id || c.caseStatus || c.status)) {
+        return [c];
+      }
+    }
+    return [];
   } catch { return []; }
 }
 
@@ -8638,7 +8666,7 @@ function _getInboundLoadIdForHierarchy(l) {
 function _relayTrackMapUrlForVrid(vrid) {
   const v = String(vrid || "").trim();
   if (!v) return "";
-  return `https://relay.amazon.com/tms/search?query=${encodeURIComponent(v)}`;
+  return `https://track.relay.amazon.dev/view/NA:VR:${encodeURIComponent(v)}`;
 }
 
 function _ensureRelayPreviewPopover() {
@@ -9403,7 +9431,7 @@ try {
       let vrEl = null;
       if (vrid) {
         const a = document.createElement("a");
-        a.href = `https://relay.amazon.com/tms/search?query=${encodeURIComponent(vrid)}`;
+        a.href = (typeof _sspRelayTrackMapUrlForVrid === "function") ? _sspRelayTrackMapUrlForVrid(vrid) : buildRelayUrl(vrid);
         a.target = "_blank";
         a.rel = "noopener noreferrer";
         a.textContent = vrid;
@@ -11258,8 +11286,8 @@ function openLaneMapPanel(lane, cptMs) {
   const title = p.querySelector("#ssp2-lane-map-title");
   const list = p.querySelector("#ssp2-lane-map-list");
   const laneStr = String(lane||"—");
-  const cptStr = fmtCptLabel(Number(cptMs||0));
-  if (title) title.textContent = `${laneStr} (${cptStr})`;
+  const cptStr = fmtTime(Number(cptMs||0));
+  if (title) title.textContent = `${laneStr} (CPT ${cptStr || "—"})`;
   const key = `${laneStr}|${Number(cptMs||0)}`;
   const vrids = (STATE.__laneCptToVrids && STATE.__laneCptToVrids[key]) ? STATE.__laneCptToVrids[key] : [];
   const nodeCode = (STATE && (STATE.nodeId || STATE.nodeID)) || "";
@@ -11281,9 +11309,8 @@ function openLaneMapPanel(lane, cptMs) {
   const openBtn = p.querySelector("#ssp2-lane-map-open-relay");
   if (openBtn) {
     openBtn.onclick = () => {
-      // Relay doesn't have a perfect lane query; open search with VRIDs (best-effort).
-      const qs = (vrids && vrids.length) ? vrids.slice(0, 10).join(" ") : laneStr;
-      const url = `https://relay.amazon.com/tms/search?query=${encodeURIComponent(qs)}`;
+      const firstVrid = (vrids && vrids.length) ? String(vrids[0] || "").trim() : "";
+      const url = firstVrid ? buildRelayUrl(firstVrid) : "https://track.relay.amazon.dev/";
       window.open(url, "_blank", "noopener,noreferrer");
     };
   }
@@ -13340,121 +13367,6 @@ function __sspRenderPullDebug(kind) {
  * ============================= */
 
 function _sspRelaySummarizeCase(c) {
-  try {
-    const o = c || {};
-    const id = o.caseId || o.id || o.uuid || o.case || o.case_id || "";
-    const status = o.status || o.state || o.caseStatus || "";
-    const topic = o.topic || o.type || o.category || o.reason || "";
-    const updated = o.updatedTime || o.lastUpdatedTime || o.lastModifiedTime || o.lastModified || o.updateTime || "";
-    return { id: String(id||""), status: String(status||""), topic: String(topic||""), updated: String(updated||"") };
-  } catch { return { id: "", status: "", topic: "", updated: "" }; }
-}
-
-async function openRelayCasesPanel(laneKey, cptMs) {
-  try { ensureCasesPanel(); } catch (_) {}
-  const overlay = document.getElementById("ssp-cases-overlay");
-  const subEl = document.getElementById("ssp-cases-subtitle");
-  const body = document.getElementById("ssp-cases-body");
-  if (!overlay || !body) return;
-
-  const laneLabel = String(laneKey || "—");
-  const cptLabel = cptMs ? fmtTime(Number(cptMs || 0)) : "";
-  if (subEl) subEl.textContent = cptLabel ? `${laneLabel} (CPT ${cptLabel})` : laneLabel;
-
-  overlay.style.display = "flex";
-  body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Loading Relay cases…</div>`;
-
-  // Lane group from Action Panel model
-  let g = null;
-  try { g = _getActionGroup(laneKey, cptMs); } catch (_) {}
-  const vs = (g && g.vrids) ? g.vrids : [];
-  const allowedVrids = new Set(getFilteredOutboundVridsForLaneCpt(laneKey, cptMs, { debugKey: "relay-bulk-vrid-open" }));
-  const scopedVs = vs.filter((v) => allowedVrids.has(String(v?.vrid || v?.vrId || "").trim()));
-  if (!scopedVs.length) {
-    body.innerHTML = `<div style="padding:10px;color:#6b7280;">No VRIDs found for this lane/CPT.</div>`;
-    return;
-  }
-
-  const rows = [];
-  for (const v of scopedVs.slice(0, 80)) {
-    const vrid = String(v?.vrid || v?.vrId || "").trim();
-    if (!vrid) continue;
-    let detail = null;
-    try { detail = await _sspRelayGetDetail(vrid); } catch (_) { detail = null; }
-    if (!detail) continue;
-    let cases = [];
-    try { cases = _sspRelayExtractCases(detail) || []; } catch (_) { cases = []; }
-    if (!cases.length) continue;
-    const summaries = cases.map(_sspRelaySummarizeCase);
-    rows.push({ vrid, count: summaries.length, cases: summaries, raw: cases });
-  }
-
-  if (!rows.length) {
-    body.innerHTML = `<div style="padding:10px;color:#6b7280;">No Relay cases found for this lane/CPT.</div>`;
-    return;
-  }
-
-  const renderRow = (r, i) => {
-    const zebra = (i % 2) ? "background:#f9fafb;" : "background:#fff;";
-    const vr = esc(String(r.vrid || ""));
-    const relayUrl = (typeof _sspRelayTrackMapUrlForVrid === "function") ? _sspRelayTrackMapUrlForVrid(vr) : "";
-    const vrLink = relayUrl
-      ? `<a href="${esc(relayUrl)}" target="_blank" rel="noopener" style="font-weight:900;text-decoration:none;color:#111827;">${vr}</a>`
-      : `<span style="font-weight:900;color:#111827;">${vr}</span>`;
-
-    const chips = (r.cases || []).slice(0, 6).map((c) => {
-      const id = c.id ? `#${esc(c.id)}` : "(no id)";
-      const st = c.status ? esc(c.status) : "";
-      const tp = c.topic ? esc(c.topic) : "";
-      const up = c.updated ? esc(c.updated) : "";
-      const t = [id, st, tp, up].filter(Boolean).join(" • ");
-      return `<span title="${t}" style="padding:4px 10px;border-radius:999px;border:1px solid #e5e7eb;background:#f3f4f6;font-weight:900;color:#111827;">${id}${st?` • ${st}`:""}</span>`;
-    }).join(" ");
-
-    const more = (r.count > 6) ? `<span style="color:#6b7280;font-weight:800;">+${r.count-6} more</span>` : "";
-
-    const detailsBtn = `<button class="ssp-relay-case-details" data-vrid="${vr}" style="cursor:pointer;padding:4px 10px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;">Raw</button>`;
-
-    return `
-      <div style="display:grid;grid-template-columns:170px 90px 1fr;gap:10px;align-items:center;padding:10px 10px;border-radius:12px;${zebra}">
-        <div>${vrLink}</div>
-        <div style="font-weight:900;">${Number(r.count)||0} case${(Number(r.count)||0)===1?"":"s"}</div>
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end;">${chips} ${more} ${detailsBtn}</div>
-      </div>
-      <div class="ssp-relay-case-raw" data-vridraw="${vr}" style="display:none;margin:-4px 10px 10px 10px;padding:10px 10px;border:1px solid #e5e7eb;border-radius:12px;background:#fff;">
-        <pre style="margin:0;white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;max-height:320px;overflow:auto;background:#0b1020;color:#e5e7eb;padding:10px;border-radius:12px;">${esc(JSON.stringify(r.raw, null, 2))}</pre>
-      </div>
-    `;
-  };
-
-  body.innerHTML = `
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
-      <div style="font-weight:900;">Relay cases (${rows.length} VRIDs)</div>
-      <div style="margin-left:auto;color:#6b7280;font-weight:800;font-size:12px;">(primary source: Relay detail.cases[])</div>
-    </div>
-    <div style="display:flex;flex-direction:column;gap:6px;">
-      ${rows.map(renderRow).join("")}
-    </div>
-  `;
-
-  body.querySelectorAll("button.ssp-relay-case-details").forEach((btn) => {
-    btn.addEventListener("click", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      const vrid = btn.getAttribute("data-vrid") || "";
-      if (!vrid) return;
-      const box = body.querySelector(`.ssp-relay-case-raw[data-vridraw="${CSS.escape(vrid)}"]`);
-      if (!box) return;
-      box.style.display = (box.style.display === "none") ? "block" : "none";
-    });
-  });
-}
-
-/* =============================
- * Relay Cases (primary)
- * ============================= */
-
-function _sspRelaySummarizeCase(c) {
   const o = c || {};
   const id = o.caseId || o.id || o.uuid || o.case || o.case_id || '';
   const status = o.status || o.state || o.caseStatus || '';
@@ -13487,10 +13399,11 @@ async function openRelayCasesPanel(laneKey, cptMs) {
   let group = null;
   try { group = _getActionGroup(laneKey, cptMs); } catch (_) { group = null; }
   const vs = (group && group.vrids) ? group.vrids : [];
+  const allowedVrids = new Set(getFilteredOutboundVridsForLaneCpt(laneKey, cptMs, { debugKey: "relay-bulk-vrid-open" }));
   const vrids = [];
   for (const v of vs) {
     const id = String(v?.vrid || v?.vrId || '').trim();
-    if (id) vrids.push(id);
+    if (id && allowedVrids.has(id)) vrids.push(id);
   }
 
   if (!vrids.length) {
@@ -13514,7 +13427,11 @@ async function openRelayCasesPanel(laneKey, cptMs) {
   }
 
   if (!rows.length) {
-    body.innerHTML = `<div style="padding:10px;color:#6b7280;">No Relay cases found for this lane/CPT.</div>`;
+    const rc = STATE.relayConnectivity || {};
+    const hint = (String(rc.state || "") === "fallback" || String(rc.state || "") === "no_auth")
+      ? `<div style="margin-top:6px;color:#9ca3af;font-size:12px;">Relay Track is not fully available (${esc(String(rc.state||"unknown"))}). Open a VRID in Track and retry.</div>`
+      : "";
+    body.innerHTML = `<div style="padding:10px;color:#6b7280;">No Relay cases found for this lane/CPT.</div>${hint}`;
     return;
   }
 
