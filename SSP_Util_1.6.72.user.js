@@ -7744,6 +7744,220 @@ function _sspEnsureRelayVridOverlay() {
   }
 }
 
+function _sspRelayToLocalDateTime(raw) {
+  try {
+    if (raw == null || raw === "") return "";
+    const d = new Date(raw);
+    if (isNaN(d.getTime())) return String(raw);
+    return d.toLocaleString([], {
+      year: "numeric",
+      month: "short",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit"
+    });
+  } catch (_) {
+    return String(raw || "");
+  }
+}
+
+function _sspRelayExtractNotesList(notesObj) {
+  try {
+    if (!notesObj) return [];
+    if (Array.isArray(notesObj)) return notesObj.filter(Boolean);
+    if (Array.isArray(notesObj.notes)) return notesObj.notes.filter(Boolean);
+    if (Array.isArray(notesObj.content)) return notesObj.content.filter(Boolean);
+    if (Array.isArray(notesObj.items)) return notesObj.items.filter(Boolean);
+    return [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function _sspRelayPhonetoolHref(userValue) {
+  const userRaw = String(userValue || "").trim();
+  if (!userRaw) return { label: "Unknown user", href: "" };
+  const alias = userRaw.includes("@") ? userRaw.split("@")[0] : userRaw;
+  const href = alias ? `https://phonetool.amazon.com/users/${encodeURIComponent(alias)}` : "";
+  return { label: userRaw, href };
+}
+
+function _sspRelayRenderNotesHtml(notesObj) {
+  const items = _sspRelayExtractNotesList(notesObj)
+    .map((x) => (x && typeof x === "object") ? x : { content: String(x || "") })
+    .sort((a, b) => {
+      const ams = new Date(a?.createdDate || a?.createdTime || a?.createdAt || 0).getTime() || 0;
+      const bms = new Date(b?.createdDate || b?.createdTime || b?.createdAt || 0).getTime() || 0;
+      return bms - ams;
+    });
+
+  if (!items.length) {
+    return `<div style="padding:12px;color:#6b7280;">No notes on this VRID.</div>`;
+  }
+
+  const rows = items.map((n, idx) => {
+    const external = (n?.externallyVisible === true) || (String(n?.externallyVisible || "").toLowerCase() === "true");
+    const createdRaw = n?.createdDate || n?.createdTime || n?.createdAt || "";
+    const created = _sspRelayToLocalDateTime(createdRaw);
+    const contentRaw = n?.content ?? n?.note ?? n?.text ?? n?.description ?? "";
+    const content = (contentRaw && typeof contentRaw === "object")
+      ? JSON.stringify(contentRaw)
+      : String(contentRaw || "").trim();
+    const userRaw =
+      (n?.user && typeof n.user === "object")
+        ? (n.user.login || n.user.user || n.user.email || n.user.alias || n.user.name || "")
+        : (n?.user || n?.createdBy || n?.author || "");
+    const user = _sspRelayPhonetoolHref(userRaw);
+    const cardBg = external ? "#eff6ff" : "#f8fafc";
+    const cardBd = external ? "#60a5fa" : "#d1d5db";
+    const metaTag = external
+      ? `<span style="color:#1d4ed8;font-weight:900;">(Visible to Carrier and any drivers)</span>`
+      : "";
+    const userHtml = user.href
+      ? `<a href="${esc(user.href)}" target="_blank" rel="noopener" style="color:#1d4ed8;text-decoration:underline;font-weight:900;">${esc(user.label)}</a>`
+      : `<span style="font-weight:900;color:#111827;">${esc(user.label)}</span>`;
+    const createdHtml = created ? esc(created) : "Unknown time";
+    const bodyHtml = content
+      ? esc(content).replace(/\n/g, "<br>")
+      : `<span style="color:#9ca3af;">(No note content)</span>`;
+
+    return `
+      <div style="border:1px solid ${cardBd};background:${cardBg};border-radius:12px;padding:10px 12px;${idx ? "margin-top:8px;" : ""}">
+        <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;color:#111827;">
+          ${userHtml}
+          <span style="color:#6b7280;font-weight:800;">- ${createdHtml}</span>
+          ${metaTag}
+        </div>
+        <div style="margin-top:8px;color:#111827;white-space:normal;line-height:1.35;">${bodyHtml}</div>
+      </div>
+    `;
+  }).join("");
+
+  return `
+    <div style="padding:10px;">
+      <div style="font-weight:900;color:#111827;margin-bottom:6px;">Notes (${items.length})</div>
+      ${rows}
+    </div>
+  `;
+}
+
+function _sspRelayRenderDisruptionsHtml(disruptions) {
+  const arr = Array.isArray(disruptions) ? disruptions.filter((x) => x && typeof x === "object") : [];
+  if (!arr.length) {
+    return `<div style="padding:12px;color:#6b7280;">No disruptions on this VRID.</div>`;
+  }
+
+  const sevRank = (sev) => {
+    const s = String(sev || "").toUpperCase();
+    if (s === "HIGH" || s === "SEV1" || s === "CRITICAL") return 0;
+    if (s === "MEDIUM" || s === "SEV2") return 1;
+    if (s === "LOW" || s === "SEV3") return 2;
+    return 3;
+  };
+  const sevColor = (sev) => {
+    const s = String(sev || "").toUpperCase();
+    if (s === "HIGH" || s === "SEV1" || s === "CRITICAL") return ["#7f1d1d", "#fecaca", "#b91c1c"];
+    if (s === "MEDIUM" || s === "SEV2") return ["#78350f", "#fde68a", "#b45309"];
+    if (s === "LOW" || s === "SEV3") return ["#1e3a8a", "#bfdbfe", "#2563eb"];
+    return ["#374151", "#e5e7eb", "#4b5563"];
+  };
+  const toMs = (v) => {
+    const t = new Date(v || 0).getTime();
+    return Number.isFinite(t) ? t : 0;
+  };
+
+  const now = Date.now();
+  const mapped = arr.map((d) => {
+    const severity = String(d?.severity || d?.priority || "UNKNOWN").toUpperCase();
+    const status = String(d?.status || "").toUpperCase();
+    const createdRaw = d?.createdTime || d?.createdDate || d?.createdAt || "";
+    const lastRaw = d?.lastModifiedTime || d?.modifiedTime || d?.updatedAt || "";
+    const impactRaw = d?.impactTime || d?.endTime || d?.untilTime || "";
+    const impactMs = toMs(impactRaw);
+    const statusActive = status === "ACTIVE";
+    const withinImpactWindow = !impactMs || impactMs > now;
+    const isActive = statusActive && withinImpactWindow;
+    return {
+      raw: d,
+      severity,
+      status,
+      id: String(d?.id || d?.disruptionId || "").trim(),
+      type: String(d?.type || d?.disruptionType || "UNKNOWN").trim(),
+      createdRaw,
+      lastRaw,
+      impactRaw,
+      createdMs: toMs(createdRaw),
+      lastMs: toMs(lastRaw),
+      isActive
+    };
+  });
+
+  const active = mapped
+    .filter((d) => d.isActive)
+    .sort((a, b) =>
+      (sevRank(a.severity) - sevRank(b.severity)) ||
+      (b.createdMs - a.createdMs) ||
+      (b.lastMs - a.lastMs)
+    );
+  const inactiveCount = mapped.length - active.length;
+
+  if (!active.length) {
+    return `<div style="padding:12px;color:#6b7280;">No active disruptions right now.${inactiveCount ? ` (${inactiveCount} inactive or impact window elapsed)` : ""}</div>`;
+  }
+
+  const grouped = new Map();
+  for (const d of active) {
+    const key = d.severity || "UNKNOWN";
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(d);
+  }
+  const order = Array.from(grouped.keys()).sort((a, b) => sevRank(a) - sevRank(b));
+
+  const groupsHtml = order.map((severity) => {
+    const items = grouped.get(severity) || [];
+    const col = sevColor(severity);
+    const cards = items.map((d) => {
+      const created = _sspRelayToLocalDateTime(d.createdRaw);
+      const lastMod = _sspRelayToLocalDateTime(d.lastRaw);
+      const impact = _sspRelayToLocalDateTime(d.impactRaw);
+      const idText = d.id ? `#${esc(d.id)}` : "(no id)";
+      const typeText = d.type || "UNKNOWN";
+      return `
+        <div style="border:1px solid #d1d5db;border-radius:12px;background:#ffffff;padding:10px;">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <span style="font-weight:900;color:#111827;">${esc(typeText)}</span>
+            <span style="color:#6b7280;font-weight:800;">${idText}</span>
+            <span style="margin-left:auto;padding:1px 8px;border-radius:999px;border:1px solid #86efac;background:#dcfce7;color:#166534;font-weight:900;">Active</span>
+          </div>
+          <div style="margin-top:6px;color:#374151;font-weight:800;font-size:12px;">Created: ${esc(created || "Unknown")}</div>
+          <div style="margin-top:2px;color:#374151;font-weight:800;font-size:12px;">Last modified: ${esc(lastMod || "Unknown")}</div>
+          <div style="margin-top:2px;color:#374151;font-weight:800;font-size:12px;">Active until: ${esc(impact || "Unknown")}</div>
+        </div>
+      `;
+    }).join("");
+
+    return `
+      <div style="border:1px solid ${col[1]};background:#f9fafb;border-radius:12px;padding:10px;${severity === order[0] ? "" : "margin-top:10px;"}">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span style="padding:2px 8px;border-radius:999px;border:1px solid ${col[2]};background:${col[1]};color:${col[0]};font-weight:900;">${esc(severity)}</span>
+          <span style="color:#6b7280;font-weight:800;">${items.length} active disruption${items.length === 1 ? "" : "s"}</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px;margin-top:8px;">${cards}</div>
+      </div>
+    `;
+  }).join("");
+
+  return `
+    <div style="padding:10px;">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+        <div style="font-weight:900;color:#111827;">Active Disruptions (${active.length})</div>
+        ${inactiveCount ? `<div style="margin-left:auto;color:#6b7280;font-weight:800;font-size:12px;">${inactiveCount} inactive/expired hidden</div>` : ""}
+      </div>
+      ${groupsHtml}
+    </div>
+  `;
+}
+
 /* =============================
  * Global click handling for Relay badges/buttons (so panels outside the Action list still work)
  * ============================= */
@@ -7776,7 +7990,9 @@ function _sspEnsureRelayVridOverlay() {
     }
     const cases = _sspRelayExtractCases(detail) || [];
     const disruptions = _sspRelayExtractDisruptions(detail) || [];
-    try { notes = await _sspRelayGetNotes(v); } catch(_) { notes = null; }
+    if (k === "notes") {
+      try { notes = await _sspRelayGetNotes(v); } catch(_) { notes = null; }
+    }
 
     const renderJson = (obj) => `<pre style="margin:0;white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;max-height:420px;overflow:auto;background:#0b1020;color:#e5e7eb;padding:10px;border-radius:12px;">${esc(JSON.stringify(obj, null, 2))}</pre>`;
 
@@ -7785,14 +8001,9 @@ function _sspEnsureRelayVridOverlay() {
         ? `<div style="padding:10px;">${renderJson(cases)}</div>`
         : `<div style="padding:10px;color:#6b7280;">No cases on this VRID.</div>`;
     } else if (k === "disruptions") {
-      body.innerHTML = disruptions.length
-        ? `<div style="padding:10px;">${renderJson(disruptions)}</div>`
-        : `<div style="padding:10px;color:#6b7280;">No disruptions on this VRID.</div>`;
+      body.innerHTML = _sspRelayRenderDisruptionsHtml(disruptions);
     } else if (k === "notes") {
-      const nCount = _sspRelayExtractNotesCount(notes);
-      body.innerHTML = nCount
-        ? `<div style="padding:10px;">${renderJson(notes)}</div>`
-        : `<div style="padding:10px;color:#6b7280;">No notes on this VRID.</div>`;
+      body.innerHTML = _sspRelayRenderNotesHtml(notes);
     } else {
       body.innerHTML = `<div style="padding:10px;">${renderJson(detail)}</div>`;
     }
