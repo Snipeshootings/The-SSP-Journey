@@ -58,6 +58,23 @@ function fmtUnits(u) {
   return s.endsWith(".0") ? s.slice(0, -2) : s;
 }
 
+/**
+ * SSP UI host guard.
+ *
+ * UI widgets should render on both SSP host variants:
+ * - trans-logistics.amazon.com
+ * - www.amazonlogistics.com / amazonlogistics.com
+ */
+function isSspHost() {
+  const host = String((location && location.hostname) || "").toLowerCase();
+  return (
+    host.includes("trans-logistics.amazon.com") ||
+    host === "www.amazonlogistics.com" ||
+    host === "amazonlogistics.com" ||
+    host.endsWith(".amazonlogistics.com")
+  );
+}
+
 /* ================================
  * Network Throttling / Caching
  * - Prevents service throttling (429) by serializing + slowing requests
@@ -5351,9 +5368,8 @@ try {
     );
   }
 function ensurePanel() {
-    // UI should only render on SSP (trans-logistics). We do run on track.relay.amazon.dev to
-    // capture Relay auth, but we do NOT want the SSP Util overlay/UI injected there.
-    if (!String(location.hostname || "").includes("trans-logistics.amazon.com")) return;
+    // UI should render on supported SSP hosts only (not Relay pages).
+    if (!isSspHost()) return;
     if (document.getElementById("ssp2-panel")) return;
 
     const p = document.createElement("div");
@@ -9527,6 +9543,7 @@ try {
      PILLAR HEADER + SETTINGS MODAL + SETTINGS MODAL
   ====================================================== */
   function ensurePillarHeader() {
+    if (!isSspHost()) return;
     if (document.getElementById("ssp2-pillar")) return;
 
     const bar = document.createElement("div");
