@@ -7686,6 +7686,64 @@ document.addEventListener("click", (e) => {
   if (kind === "laneDisruptions") { if (typeof openDisruptionsPanel === "function") openDisruptionsPanel(lane, cpt); }
 }, true);
 
+function _sspWarnRelayOverlayMissingOnce(context, missingIds) {
+  try {
+    if (window.__SSP_RELAY_OVERLAY_MISSING_WARNED) return;
+    window.__SSP_RELAY_OVERLAY_MISSING_WARNED = true;
+    const miss = Array.isArray(missingIds) && missingIds.length
+      ? ` Missing: ${missingIds.join(", ")}.`
+      : "";
+    console.warn(`[SSP] Relay overlay host nodes missing (${String(context || "unknown")}). Expected ssp-relay-vrid-overlay contract.${miss}`);
+  } catch (_) {}
+}
+
+function _sspEnsureRelayVridOverlay() {
+  try {
+    let overlay = document.getElementById("ssp-relay-vrid-overlay");
+    if (!overlay) {
+      overlay = document.createElement("div");
+      overlay.id = "ssp-relay-vrid-overlay";
+      overlay.style.cssText = "position:fixed;inset:0;z-index:2147483000;background:rgba(2,6,23,.55);display:none;align-items:center;justify-content:center;padding:14px;";
+      overlay.innerHTML = `
+        <div id="ssp-relay-vrid-panel" style="width:min(1100px,96vw);max-height:92vh;overflow:hidden;background:#f8fafc;border:1px solid #cbd5e1;border-radius:14px;box-shadow:0 25px 90px rgba(2,6,23,.45);display:flex;flex-direction:column;">
+          <div style="display:flex;align-items:center;gap:10px;padding:10px 12px;background:#111827;color:#e5e7eb;border-bottom:1px solid #0b1220;">
+            <div id="ssp-relay-vrid-title" style="font-weight:900;">Relay detail</div>
+            <button id="ssp-relay-vrid-close" style="margin-left:auto;cursor:pointer;padding:5px 10px;border-radius:999px;border:1px solid #475569;background:#0b1220;color:#e5e7eb;font-weight:900;">Close</button>
+          </div>
+          <div id="ssp-relay-vrid-body" style="padding:0;overflow:auto;max-height:calc(92vh - 56px);"></div>
+        </div>
+      `;
+      document.body.appendChild(overlay);
+      const close = () => { overlay.style.display = "none"; };
+      overlay.querySelector("#ssp-relay-vrid-close")?.addEventListener("click", close);
+      overlay.addEventListener("click", (ev) => { if (ev.target === overlay) close(); });
+      if (!window.__SSP_RELAY_VRID_ESC_BOUND) {
+        window.__SSP_RELAY_VRID_ESC_BOUND = true;
+        document.addEventListener("keydown", (ev) => {
+          if (ev.key !== "Escape") return;
+          const ov = document.getElementById("ssp-relay-vrid-overlay");
+          if (ov && ov.style.display !== "none") ov.style.display = "none";
+        });
+      }
+    }
+
+    const title = document.getElementById("ssp-relay-vrid-title");
+    const body = document.getElementById("ssp-relay-vrid-body");
+    if (!overlay || !title || !body) {
+      const missing = [];
+      if (!overlay) missing.push("#ssp-relay-vrid-overlay");
+      if (!title) missing.push("#ssp-relay-vrid-title");
+      if (!body) missing.push("#ssp-relay-vrid-body");
+      _sspWarnRelayOverlayMissingOnce("_sspEnsureRelayVridOverlay", missing);
+      return null;
+    }
+    return { overlay, title, body };
+  } catch (_) {
+    _sspWarnRelayOverlayMissingOnce("_sspEnsureRelayVridOverlay:exception", []);
+    return null;
+  }
+}
+
 /* =============================
  * Global click handling for Relay badges/buttons (so panels outside the Action list still work)
  * ============================= */
@@ -7697,11 +7755,14 @@ document.addEventListener("click", (e) => {
     const v = String(vrid||"").trim();
     if (!v) return;
     const k = String(kind||"").trim() || "detail";
-    try { _sspEnsureRelayVridOverlay(); } catch(_) {}
-    const ov = document.getElementById("ssp-relay-vrid-overlay");
-    const title = document.getElementById("ssp-relay-vrid-title");
-    const body = document.getElementById("ssp-relay-vrid-body");
-    if (!ov || !body) return;
+    const host = _sspEnsureRelayVridOverlay();
+    if (!host) {
+      _sspWarnRelayOverlayMissingOnce("global-click-open", ["#ssp-relay-vrid-overlay", "#ssp-relay-vrid-title", "#ssp-relay-vrid-body"]);
+      return;
+    }
+    const ov = host.overlay;
+    const title = host.title;
+    const body = host.body;
 
     ov.style.display = "flex";
     title.textContent = `Relay ${k} — ${v}`;
@@ -7746,7 +7807,8 @@ document.addEventListener("click", (e) => {
     if (!b) return false;
     const vrid = b.getAttribute('data-vrid') || '';
     const kind = b.getAttribute('data-kind') || '';
-    openOverlay(vrid, kind);
+    const opener = (typeof window.__SSP_OPEN_RELAY_OVERLAY === "function") ? window.__SSP_OPEN_RELAY_OVERLAY : openOverlay;
+    opener(vrid, kind);
     return false;
   };
 
@@ -7757,7 +7819,8 @@ document.addEventListener("click", (e) => {
       e.preventDefault(); e.stopPropagation();
       const vrid = b.getAttribute("data-vrid") || "";
       const kind = b.getAttribute("data-kind") || "";
-      openOverlay(vrid, kind);
+      const opener = (typeof window.__SSP_OPEN_RELAY_OVERLAY === "function") ? window.__SSP_OPEN_RELAY_OVERLAY : openOverlay;
+      opener(vrid, kind);
       return;
     }
 
@@ -13567,11 +13630,16 @@ async function openRelayCasesPanel(laneKey, cptMs) {
     async function _sspOpenCasesOverlayForVrid(vrid){
       const v = String(vrid||"").trim();
       if (!v) return;
-      if (typeof __sspEnsureRelayOverlay === "function") __sspEnsureRelayOverlay();
-      const overlay = document.getElementById("ssp-relay-overlay");
-      const titleEl = document.getElementById("ssp-relay-overlay-title");
-      const body = document.getElementById("ssp-relay-overlay-body");
-      if (!overlay || !body) return;
+      const host = (typeof _sspEnsureRelayVridOverlay === "function") ? _sspEnsureRelayVridOverlay() : null;
+      if (!host) {
+        if (typeof _sspWarnRelayOverlayMissingOnce === "function") {
+          _sspWarnRelayOverlayMissingOnce("cases-open", ["#ssp-relay-vrid-overlay", "#ssp-relay-vrid-title", "#ssp-relay-vrid-body"]);
+        }
+        return;
+      }
+      const overlay = host.overlay;
+      const titleEl = host.title;
+      const body = host.body;
 
       overlay.style.display = "flex";
       if (titleEl) titleEl.textContent = `Cases — ${v}`;
@@ -13707,12 +13775,17 @@ async function openRelayCasesPanel(laneKey, cptMs) {
       // fall back to existing implementation if present
       if (typeof window.__SSP_OPEN_RELAY_OVERLAY_ORIG === "function") return window.__SSP_OPEN_RELAY_OVERLAY_ORIG(vrid, kind);
       try {
-        // Basic JSON fallback for disruptions/notes/detail
-        if (typeof __sspEnsureRelayOverlay === "function") __sspEnsureRelayOverlay();
-        const overlay = document.getElementById("ssp-relay-overlay");
-        const titleEl = document.getElementById("ssp-relay-overlay-title");
-        const body = document.getElementById("ssp-relay-overlay-body");
-        if (!overlay || !body) return;
+        // Basic JSON fallback for disruptions/notes/detail on vrid overlay host nodes.
+        const host = (typeof _sspEnsureRelayVridOverlay === "function") ? _sspEnsureRelayVridOverlay() : null;
+        if (!host) {
+          if (typeof _sspWarnRelayOverlayMissingOnce === "function") {
+            _sspWarnRelayOverlayMissingOnce("overlay-fallback", ["#ssp-relay-vrid-overlay", "#ssp-relay-vrid-title", "#ssp-relay-vrid-body"]);
+          }
+          return;
+        }
+        const overlay = host.overlay;
+        const titleEl = host.title;
+        const body = host.body;
         overlay.style.display = "flex";
         if (titleEl) titleEl.textContent = `${String(kind||"detail")} — ${String(vrid||"")}`;
         let payload = null;
@@ -13726,17 +13799,6 @@ async function openRelayCasesPanel(laneKey, cptMs) {
     if (!window.__SSP_OPEN_RELAY_OVERLAY_ORIG && window.__SSP_OPEN_RELAY_OVERLAY && window.__SSP_OPEN_RELAY_OVERLAY !== window.__SSP_OPEN_RELAY_OVERLAY_ORIG) {
       // (noop; set below only once)
     }
-
-    // Capture handler: always route badge clicks to our overlay
-    document.addEventListener("click", (e)=>{
-      const b = e.target && e.target.closest ? e.target.closest("button.ssp-relay-badge") : null;
-      if (!b) return;
-      e.preventDefault(); e.stopPropagation();
-      const vrid = b.getAttribute("data-vrid") || "";
-      const kind = b.getAttribute("data-kind") || "";
-      if (typeof window.__SSP_OPEN_RELAY_OVERLAY === "function") window.__SSP_OPEN_RELAY_OVERLAY(vrid, kind);
-    }, true);
-
   } catch (_) {}
 })();
 
@@ -13755,6 +13817,10 @@ async function openRelayCasesPanel(laneKey, cptMs) {
       const rest = parts.slice(1).join('->').trim();
       const d = rest.split('-')[0].trim();
       return (o && d) ? `${o}->${d}` : s;
+    };
+    const relayJson = async (url, timeoutMs = 12000) => {
+      const txt = await _sspRelayRequest(url, timeoutMs);
+      try { return JSON.parse(txt || "null"); } catch (_) { return null; }
     };
 
     async function searchLaneViews(laneKey, cptMs){
@@ -13779,7 +13845,7 @@ async function openRelayCasesPanel(laneKey, cptMs) {
       qs.append('endTime', timeStr(end));
       const url = `https://track.relay.amazon.dev/api/v2/transport-views?${qs.toString()}`;
       if (typeof _sspRelayRequest!=='function') throw new Error('relay req not ready');
-      const res = await _sspRelayRequest(url,{method:'GET'});
+      const res = await relayJson(url);
       if (Array.isArray(res)) return res;
       if (res && Array.isArray(res.items)) return res.items;
       if (res && Array.isArray(res.results)) return res.results;
@@ -13809,7 +13875,7 @@ async function openRelayCasesPanel(laneKey, cptMs) {
       qs.append('sortCol','sent');
       qs.append('ascending','true');
       const url = `https://track.relay.amazon.dev/api/v2/transport-views?${qs.toString()}`;
-      const res = await _sspRelayRequest(url,{method:'GET'});
+      const res = await relayJson(url);
       if (Array.isArray(res)) return res[0]||null;
       if (res && Array.isArray(res.items)) return res.items[0]||null;
       if (res && Array.isArray(res.results)) return res.results[0]||null;
@@ -13820,7 +13886,7 @@ async function openRelayCasesPanel(laneKey, cptMs) {
       const id = String(caseId||'').replace(/^NA:CASE:/,'').trim();
       if (!id) return [];
       const url = `https://track.relay.amazon.dev/api/cases/NA:CASE:${id}/correspondences`;
-      let res=null; try{ res=await _sspRelayRequest(url,{method:'GET'}); }catch(_){ res=null; }
+      let res=null; try{ res=await relayJson(url); }catch(_){ res=null; }
       return Array.isArray(res) ? res : (res && Array.isArray(res.items) ? res.items : []);
     }
 
