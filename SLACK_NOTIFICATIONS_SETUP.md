@@ -129,3 +129,27 @@ Updated at: 14:25 by ops_user
 ## Questions?
 - Review Slack API docs: [api.slack.com/incoming-webhooks](https://api.slack.com/incoming-webhooks)
 - Check SSP Util console for error messages: `[SSP Util]` prefix
+ 
+ ## Workflow trigger (alternate)
+ The Slack Workflow Builder can expose a webhook trigger that runs a configured workflow when your userscript POSTs to it. This is convenient when you want Slack to run a sequence of steps (e.g., post formatted message, run additional actions) without creating a full app.
+
+ Setup:
+ 1. Open Slack → Workflow Builder
+ 2. Create a new workflow and choose the trigger "Webhook" (or "Incoming webhook trigger")
+ 3. Add the workflow step "Send a message" and map any incoming payload variables you want to use
+ 4. Save the workflow and copy the provided trigger URL
+ 5. Paste the trigger URL into the "Workflow Trigger URL" field in SSP Util's Slack config modal
+
+ Notes:
+ - The workflow URL accepts JSON POSTs. Include keys your workflow expects (e.g., `text`, `vrid`, `lane`).
+ - The SSP Util `sendSlackMessage()` method will send to the Workflow URL when you select the "Workflow trigger" delivery method in the config modal.
+ - Treat the workflow URL as a secret; anyone with it can trigger the workflow.
+
+ Example payload to trigger a workflow (from the browser console or userscript):
+ ```javascript
+ await fetch('YOUR_WORKFLOW_URL', {
+	 method: 'POST',
+	 headers: { 'Content-Type': 'application/json' },
+	 body: JSON.stringify({ text: '*🚨 ALERT* VRID: ABC123', vrid: 'ABC123', lane: 'LDJ5->DAB8-CYC1' })
+ });
+ ```

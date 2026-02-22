@@ -285,3 +285,19 @@ If messages aren't reaching Slack:
 ---
 
 **Questions?** See [SLACK_NOTIFICATIONS_SETUP.md](SLACK_NOTIFICATIONS_SETUP.md) for full documentation.
+
+## Workflow Trigger Payload Examples
+
+When configured to use a Workflow trigger, `sendSlackMessage()` will POST JSON to the Workflow URL. Example payloads:
+
+```javascript
+// Basic text + fields the workflow can reference
+await fetch('YOUR_WORKFLOW_URL', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ text: '*🚨 ALERT* Lane LDJ5->DAB8', vrid: 'ABC123', lane: 'LDJ5->DAB8-CYC1' })
+});
+
+// From userscript convenience helper
+await sendSlackMessage('*⚠️ MERGE NOW* Lane: LDJ5->DAB8', { vrid: 'ABC123', lane: 'LDJ5->DAB8-CYC1' });
+```

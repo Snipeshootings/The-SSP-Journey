@@ -1199,6 +1199,15 @@ function getOpsWindow(nowMs = Date.now()) {
     }
   }
 
+  // Expose a global alias for manual testing from the browser console.
+  // Provide both plural and singular names to avoid ReferenceErrors when called interactively.
+  try {
+    if (typeof window !== 'undefined') {
+      window.importInboundCsvEstimates = importInboundCsvEstimates;
+      window.importInboundCsvEstimate = importInboundCsvEstimates; // legacy/single-name alias
+    }
+  } catch (_) {}
+
   /**
    * Get estimate for a load using CSV-based statistics (with fallback to route averages).
    * Lookup order: route::loadType::equipment -> route::__all::equipment -> route::__all::__all
@@ -1592,44 +1601,46 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
   const SLACK_CONFIG = {
     storageKey: "ssp2:slack-config",
   };
-
   function getSlackConfig() {
     try {
-      return lsGet(SLACK_CONFIG.storageKey, { webhookUrl: "", enabled: false });
+      return lsGet(SLACK_CONFIG.storageKey, { webhookUrl: "", workflowUrl: "", enabled: false, useWorkflow: false });
     } catch {
-      return { webhookUrl: "", enabled: false };
+      return { webhookUrl: "", workflowUrl: "", enabled: false, useWorkflow: false };
     }
   }
 
   function setSlackConfig(config) {
     try {
-      lsSet(SLACK_CONFIG.storageKey, config);
-      SETTINGS.slackWebhookUrl = config.webhookUrl || "";
-      SETTINGS.slackEnabled = config.enabled || false;
+      const safe = {
+        webhookUrl: String(config.webhookUrl || "").trim(),
+        workflowUrl: String(config.workflowUrl || "").trim(),
+        enabled: !!config.enabled,
+        useWorkflow: !!config.useWorkflow,
+      };
+      lsSet(SLACK_CONFIG.storageKey, safe);
+      SETTINGS.slackWebhookUrl = safe.webhookUrl || "";
+      SETTINGS.slackWorkflowUrl = safe.workflowUrl || "";
+      SETTINGS.slackEnabled = !!safe.enabled;
       persistSettings();
     } catch {}
   }
 
-  async function sendSlackMessage(message) {
+  async function sendSlackMessage(message, extras) {
     try {
       const config = getSlackConfig();
-      if (!config.webhookUrl) {
-        console.warn("[SSP Util] Slack webhook URL not configured");
+      const payload = Object.assign({ text: message, mrkdwn: true, username: "SSP Util Bot", icon_emoji: ":robot_face:" }, (extras || {}));
+
+      // Choose destination: workflow trigger vs incoming webhook
+      const useWorkflow = !!config.useWorkflow;
+      const url = useWorkflow ? config.workflowUrl : config.webhookUrl;
+      if (!url) {
+        console.warn("[SSP Util] Slack endpoint not configured");
         return false;
       }
 
-      const payload = {
-        text: message,
-        mrkdwn: true,
-        username: "SSP Util Bot",
-        icon_emoji: ":robot_face:",
-      };
-
-      const res = await fetch(config.webhookUrl, {
+      const res = await fetch(url, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
 
@@ -1669,11 +1680,26 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
     `;
 
     modal.innerHTML = `
-      <div style="font-weight:900;font-size:16px;margin-bottom:15px">Slack Webhook Configuration</div>
+      <div style="font-weight:900;font-size:16px;margin-bottom:15px">Slack Notification Configuration</div>
       <div style="margin-bottom:12px;">
-        <label style="display:block;margin-bottom:6px;font-weight:700">Webhook URL:</label>
+        <div style="font-weight:700;margin-bottom:6px">Delivery method</div>
+        <label style="display:inline-flex;align-items:center;gap:8px;margin-right:12px;">
+          <input type="radio" name="slack-method" value="webhook" ${!config.useWorkflow ? 'checked' : ''}> Incoming Webhook
+        </label>
+        <label style="display:inline-flex;align-items:center;gap:8px;">
+          <input type="radio" name="slack-method" value="workflow" ${config.useWorkflow ? 'checked' : ''}> Workflow trigger
+        </label>
+      </div>
+      <div style="margin-bottom:12px;">
+        <label style="display:block;margin-bottom:6px;font-weight:700">Incoming Webhook URL:</label>
         <input type="password" id="slack-webhook-input" placeholder="https://hooks.slack.com/services/..." 
-          value="${config.webhookUrl}" 
+          value="${config.webhookUrl || ''}" 
+          style="width:100%;padding:8px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:12px;">
+      </div>
+      <div style="margin-bottom:12px;">
+        <label style="display:block;margin-bottom:6px;font-weight:700">Workflow Trigger URL:</label>
+        <input type="password" id="slack-workflow-input" placeholder="https://hooks.workflow.slack.com/..." 
+          value="${config.workflowUrl || ''}"
           style="width:100%;padding:8px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:12px;">
       </div>
       <div style="margin-bottom:15px;display:flex;align-items:center;gap:8px;">
@@ -1681,25 +1707,19 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
         <label for="slack-enabled-check" style="cursor:pointer;font-weight:700">Enable Slack notifications</label>
       </div>
       <div style="color:#666;margin-bottom:15px;font-size:12px;">
-        <div style="margin-bottom:8px;"><strong>How to get a webhook URL:</strong></div>
+        <div style="margin-bottom:8px;"><strong>How to get a webhook or workflow trigger URL:</strong></div>
         <ol style="margin:0;padding-left:20px;">
           <li>Go to <a href="https://api.slack.com/apps" target="_blank" style="color:#0066cc;text-decoration:underline;">api.slack.com/apps</a></li>
-          <li>Create a new app for your workspace</li>
-          <li>Enable "Incoming Webhooks"</li>
-          <li>Click "Add New Webhook to Workspace"</li>
-          <li>Copy the webhook URL and paste it above</li>
+          <li>Create a new app for your workspace (or use an existing app)</li>
+          <li>For simple posting: enable "Incoming Webhooks" and create a webhook URL</li>
+          <li>For Workflow trigger: open Workflow Builder → Create workflow → Add "Webhook" trigger and copy the trigger URL</li>
+          <li>Paste the appropriate URL into the matching field above</li>
         </ol>
       </div>
       <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:15px;">
-        <button id="slack-test-btn" style="padding:8px 14px;border-radius:6px;border:1px solid #d1d5db;background:#fff;cursor:pointer;font-weight:700;">
-          Test Message
-        </button>
-        <button id="slack-save-btn" style="padding:8px 14px;border-radius:6px;border:1px solid #333;background:#333;color:#fff;cursor:pointer;font-weight:700;">
-          Save
-        </button>
-        <button id="slack-cancel-btn" style="padding:8px 14px;border-radius:6px;border:1px solid #d1d5db;background:#f3f4f6;cursor:pointer;font-weight:700;">
-          Cancel
-        </button>
+        <button id="slack-test-btn" style="padding:8px 14px;border-radius:6px;border:1px solid #d1d5db;background:#fff;cursor:pointer;font-weight:700;">Test Message</button>
+        <button id="slack-save-btn" style="padding:8px 14px;border-radius:6px;border:1px solid #333;background:#333;color:#fff;cursor:pointer;font-weight:700;">Save</button>
+        <button id="slack-cancel-btn" style="padding:8px 14px;border-radius:6px;border:1px solid #d1d5db;background:#f3f4f6;cursor:pointer;font-weight:700;">Cancel</button>
       </div>
     `;
 
@@ -1710,50 +1730,31 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
     };
 
     const input = document.getElementById("slack-webhook-input");
+    const workflowInput = document.getElementById("slack-workflow-input");
     const checkbox = document.getElementById("slack-enabled-check");
+    const methodRadios = Array.from(modal.querySelectorAll('input[name="slack-method"]'));
     const testBtn = document.getElementById("slack-test-btn");
     const saveBtn = document.getElementById("slack-save-btn");
     const cancelBtn = document.getElementById("slack-cancel-btn");
 
     testBtn.addEventListener("click", async () => {
-      const url = input.value.trim();
-      if (!url) {
-        alert("Please enter a webhook URL first");
-        return;
-      }
-      testBtn.disabled = true;
-      testBtn.textContent = "Sending...";
+      const method = methodRadios.find(r => r.checked)?.value || 'webhook';
+      const url = method === 'workflow' ? workflowInput.value.trim() : input.value.trim();
+      if (!url) { alert("Please enter a URL for the selected delivery method"); return; }
+      testBtn.disabled = true; testBtn.textContent = "Sending...";
       try {
-        const payload = {
-          text: "🧪 *SSP Util* – Test message from dashboard configuration",
-          mrkdwn: true,
-          username: "SSP Util Bot",
-          icon_emoji: ":robot_face:",
-        };
-        const res = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        if (res.ok) {
-          alert("✅ Test message sent to Slack!");
-        } else {
-          alert(`❌ Failed: ${res.status} ${res.statusText}`);
-        }
-      } catch (e) {
-        alert(`❌ Error: ${String(e && e.message ? e.message : e)}`);
-      } finally {
-        testBtn.disabled = false;
-        testBtn.textContent = "Test Message";
-      }
+        const payload = { text: "🧪 *SSP Util* – Test message from dashboard configuration", mrkdwn: true };
+        const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        if (res.ok) alert("✅ Test message sent to Slack!"); else alert(`❌ Failed: ${res.status} ${res.statusText}`);
+      } catch (e) { alert(`❌ Error: ${String(e && e.message ? e.message : e)}`); }
+      finally { testBtn.disabled = false; testBtn.textContent = "Test Message"; }
     });
 
     saveBtn.addEventListener("click", () => {
-      const url = input.value.trim();
-      const enabled = checkbox.checked;
-      setSlackConfig({ webhookUrl: url, enabled });
-      alert("✅ Slack configuration saved!");
-      closeModal();
+      const webhook = input.value.trim(); const workflow = workflowInput.value.trim(); const enabled = checkbox.checked;
+      const method = methodRadios.find(r => r.checked)?.value || 'webhook'; const useWorkflow = method === 'workflow';
+      setSlackConfig({ webhookUrl: webhook, workflowUrl: workflow, enabled, useWorkflow });
+      alert("✅ Slack configuration saved!"); closeModal();
     });
 
     cancelBtn.addEventListener("click", closeModal);
