@@ -4227,8 +4227,33 @@ function scheduleDriverPrefetch(reason = "") {
 
     STATE.mergeStats = { load: 0, soon: 0, now: 0, risk: 0, adhoc: 0, cancel: 0, ok: 0 };
 
+    const mode = normalizeObLoadType(SETTINGS.obLoadType || "all");
+    const rawOutbound = Array.isArray(STATE.outboundLoads) ? STATE.outboundLoads : [];
+    const lgEquipSig =
+      (mode === "amzl53" || mode === "amzl26")
+        ? buildLoadGroupEquipSig(rawOutbound.filter((l) => getOutboundLoadType(l) === "amzl"))
+        : null;
+
+    const filteredOutbound = rawOutbound.filter((l) => {
+      if (mode === "all") return true;
+      const t = getOutboundLoadType(l);
+      if (mode === "ddu") return t === "ddu";
+      if (mode === "amzl_all") return t === "amzl";
+      if (mode === "amzl53" || mode === "amzl26") {
+        if (t !== "amzl") return false;
+        const lgid = getLoadGroupId(l);
+        if (!lgid || !lgEquipSig) return false;
+        const sig = lgEquipSig.get(lgid);
+        if (!sig) return false;
+        const only53 = !!sig.has53 && !sig.has26;
+        const only26 = !!sig.has26 && !sig.has53;
+        return mode === "amzl53" ? only53 : only26;
+      }
+      return true;
+    });
+
     // OB: remaining loads per CPT, capacity per equipment
-    for (const load of STATE.outboundLoads) {
+    for (const load of filteredOutbound) {
       const cptMs = toMs(load?.criticalPullTime);
       if (!cptMs) continue;
 
@@ -4308,11 +4333,26 @@ function scheduleDriverPrefetch(reason = "") {
     }
 
     // IB4CPT: counts only (no container list by design)
-    Object.values(STATE.ib4cpt).forEach(groups => {
+    // Include only inbound loads expected by/before CPT for the lane+CPT group.
+    Object.entries(STATE.ib4cpt || {}).forEach(([inboundLoadId, groups]) => {
       if (!Array.isArray(groups)) return;
+
+      const ibLoad = (STATE.ibByPlanId && typeof STATE.ibByPlanId.get === "function")
+        ? STATE.ibByPlanId.get(String(inboundLoadId || "").trim())
+        : null;
+      const ibExpectedMs = ibLoad
+        ? (
+            parseSspDateTime(ibLoad?.scheduledArrivalTime) ||
+            parseSspDateTime(ibLoad?.estimatedArrivalTime) ||
+            parseSspDateTime(ibLoad?.actualArrivalTime) ||
+            0
+          )
+        : 0;
+
       groups.forEach(g => {
         const cptMs = toMs(g?.criticalPullTime);
         if (!cptMs) return;
+        if (ibExpectedMs && ibExpectedMs > cptMs) return;
 
         if (!map[cptMs]) {
           // if IB has CPT not present in OB yet, still track it with 53' default capacity
@@ -4353,7 +4393,14 @@ try {
     if (!cpt) return;
     let loaded = 0;
     const vrids = cpt.vrids && cpt.vrids.size ? Array.from(cpt.vrids) : [];
-    for (const vrid of vrids) loaded += Number((STATE.vridLoadedUnits && STATE.vridLoadedUnits[vrid]) || 0);
+    for (const vrid of vrids) {
+      const vinfo = STATE.vridIndex?.[vrid] || null;
+      const status = String(vinfo?.status || "").toUpperCase();
+      const sdtMs = Number(vinfo?.sdtMs || 0);
+      if (status.includes("DEPART")) continue;
+      if (sdtMs && Date.now() > sdtMs) continue;
+      loaded += Number((STATE.vridLoadedUnits && STATE.vridLoadedUnits[vrid]) || 0);
+    }
     cpt.loadedCarts = loaded;
   });
 } catch (_) {}
@@ -4390,6 +4437,11 @@ for (const cpt of Object.values(map)) {
     let sumLoaded = 0;
     const vs = cpt?.vrids ? Array.from(cpt.vrids) : [];
     for (const vrid of vs) {
+      const vinfo = STATE.vridIndex?.[vrid] || null;
+      const status = String(vinfo?.status || "").toUpperCase();
+      const sdtMs = Number(vinfo?.sdtMs || 0);
+      if (status.includes("DEPART")) continue;
+      if (sdtMs && Date.now() > sdtMs) continue;
       const n = Number(STATE.vridLoadedUnits?.[vrid] || 0);
       if (Number.isFinite(n)) sumLoaded += n;
     }
@@ -8280,6 +8332,17 @@ document.body.appendChild(p);
         const loads = Array.isArray(STATE?.inboundLoads) ? STATE.inboundLoads : [];
         if (!loads.length) { alert("No inbound loads loaded yet. Hit Refresh first."); return; }
 
+        // XD Graph is an expected-volume view: prefer scheduled/ETA over actual arrival.
+        const getExpectedTimeForXdGraph = (load) => (
+          parseSspDateTime(load?.scheduledArrivalTime) ||
+          parseSspDateTime(load?.estimatedArrivalTime) ||
+          parseSspDateTime(load?.actualArrivalTime) ||
+          toMs(load?.scheduledArrivalTime) ||
+          toMs(load?.estimatedArrivalTime) ||
+          toMs(load?.actualArrivalTime) ||
+          0
+        );
+
         const normStatus = (st) => String(st || "").toUpperCase();
         const isTransit = (st) => {
           const s = normStatus(st);
@@ -8339,7 +8402,7 @@ document.body.appendChild(p);
 
         const agg = new Map(); // shift||hour||status -> record
         for (const l of loads) {
-          const t = _getLoadTimeForPlanning(l);
+          const t = getExpectedTimeForXdGraph(l);
           if (!t) continue;
           if (t < ops.startMs || t >= ops.endMs) continue;
           if (isCompleted(l?.status || l?.loadStatus)) continue;
@@ -8350,12 +8413,13 @@ document.body.appendChild(p);
 
           const hb = hourBucket(t);
           const sb = statusBucket(l?.status || l?.loadStatus);
-          const { C, missing } = getCounts(l);
+          const { C, P, missing } = getCounts(l);
 
           const k = `${shiftName}||${hb}||${sb}`;
-          const r = agg.get(k) || { shift: shiftName, hourBucket: hb, statusBucket: sb, loads: 0, carts: 0, missingCounts: 0 };
+          const r = agg.get(k) || { shift: shiftName, hourBucket: hb, statusBucket: sb, loads: 0, carts: 0, packages: 0, missingCounts: 0 };
           r.loads += 1;
           r.carts += (C || 0);
+          r.packages += (P || 0);
           if (missing) r.missingCounts += 1;
           agg.set(k, r);
         }
@@ -8363,11 +8427,36 @@ document.body.appendChild(p);
         const rows = Array.from(agg.values())
           .sort((a,b) => String(a.shift).localeCompare(String(b.shift)) || String(a.hourBucket).localeCompare(String(b.hourBucket)) || String(a.statusBucket).localeCompare(String(b.statusBucket)));
 
-        const headers = ["shift","hourBucket","statusBucket","loads","carts","missingCounts"];
+        // Add explicit per-hour sums so ops can graph expected totals directly.
+        const byHour = new Map(); // shift||hour -> total row
+        for (const r of rows) {
+          const hk = `${r.shift}||${r.hourBucket}`;
+          const t = byHour.get(hk) || { shift: r.shift, hourBucket: r.hourBucket, statusBucket: 'SUM_HOUR', loads: 0, carts: 0, packages: 0, missingCounts: 0 };
+          t.loads += Number(r.loads || 0);
+          t.carts += Number(r.carts || 0);
+          t.packages += Number(r.packages || 0);
+          t.missingCounts += Number(r.missingCounts || 0);
+          byHour.set(hk, t);
+        }
+
+        const opsTotal = { shift: 'OPS', hourBucket: 'ALL', statusBucket: 'SUM_OPS_HOURS', loads: 0, carts: 0, packages: 0, missingCounts: 0 };
+        for (const t of byHour.values()) {
+          opsTotal.loads += Number(t.loads || 0);
+          opsTotal.carts += Number(t.carts || 0);
+          opsTotal.packages += Number(t.packages || 0);
+          opsTotal.missingCounts += Number(t.missingCounts || 0);
+        }
+
+        const exportRows = rows.concat(
+          Array.from(byHour.values()).sort((a,b) => String(a.shift).localeCompare(String(b.shift)) || String(a.hourBucket).localeCompare(String(b.hourBucket))),
+          [opsTotal]
+        );
+
+        const headers = ["shift","hourBucket","statusBucket","loads","carts","packages","missingCounts"];
 
         downloadTextFile(
           `XD_GRAPH_${STATE.nodeId || "NODE"}_${new Date().toISOString().slice(0,10)}.csv`,
-          toCsv(rows, headers),
+          toCsv(exportRows, headers),
           "text/csv;charset=utf-8"
         );
       } catch (e) {
