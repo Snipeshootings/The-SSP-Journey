@@ -397,6 +397,91 @@ function buildLoadGroupEquipSig(loads) {
   return map;
 }
 
+function getOutboundEquipmentTypeRaw(load) {
+  return String(
+    load?.equipmentType ??
+      load?.equip ??
+      load?.equipment ??
+      load?.trailerEquipmentType ??
+      load?.trailerEquipment?.trailer?.equipmentType ??
+      load?.trailer?.equipmentType ??
+      load?.vehicle?.equipmentType ??
+      ""
+  );
+}
+
+function getFilteredOutboundLoadsForMode(modeInput, options = {}) {
+  const mode = normalizeObLoadType(modeInput || "all");
+  const srcLoads = Array.isArray(options.loads)
+    ? options.loads
+    : (Array.isArray(STATE?.outboundLoads) ? STATE.outboundLoads : []);
+
+  const basePredicate =
+    (typeof options.basePredicate === "function")
+      ? options.basePredicate
+      : (() => true);
+
+  const prefilteredLoads = srcLoads.filter((l) => {
+    try { return !!basePredicate(l); } catch (_) { return false; }
+  });
+
+  const lgEquipSig =
+    (mode === "amzl53" || mode === "amzl26")
+      ? buildLoadGroupEquipSig(prefilteredLoads.filter((l) => getOutboundLoadType(l) === "amzl"))
+      : null;
+
+  const modeFiltered = prefilteredLoads.filter((l) => {
+    if (mode === "all") return true;
+
+    const t = getOutboundLoadType(l);
+    if (mode === "ddu") return t === "ddu";
+    if (mode === "amzl_all") return t === "amzl";
+
+    if (mode === "amzl53" || mode === "amzl26") {
+      if (t !== "amzl") return false;
+      const lgid = getLoadGroupId(l);
+      if (!lgid || !lgEquipSig) return false;
+      const sig = lgEquipSig.get(lgid);
+      if (!sig) return false;
+      const only53 = !!sig.has53 && !sig.has26;
+      const only26 = !!sig.has26 && !sig.has53;
+      return mode === "amzl53" ? only53 : only26;
+    }
+
+    return true;
+  });
+
+  const equipmentPredicate = (typeof options.equipmentPredicate === "function") ? options.equipmentPredicate : null;
+  const equipmentFiltered = equipmentPredicate
+    ? modeFiltered.filter((l) => {
+        try {
+          const e = normalizeEquipmentType(getOutboundEquipmentTypeRaw(l));
+          return !!equipmentPredicate(e, l);
+        } catch (_) {
+          return false;
+        }
+      })
+    : modeFiltered;
+
+  try {
+    STATE._modeFilterDebugLogged = STATE._modeFilterDebugLogged || {};
+    const debugModeKey = String(mode || "all");
+    if (!STATE._modeFilterDebugLogged[debugModeKey]) {
+      console.debug("[SSP Util] mode filter parity", {
+        mode,
+        debugKey: String(options.debugKey || "default"),
+        total: srcLoads.length,
+        baseFiltered: prefilteredLoads.length,
+        modeFiltered: modeFiltered.length,
+        equipmentFiltered: equipmentFiltered.length,
+      });
+      STATE._modeFilterDebugLogged[debugModeKey] = true;
+    }
+  } catch (_) {}
+
+  return equipmentFiltered;
+}
+
 // Normalize legacy/label-based load-type filters to internal values.
 /**
  * Normalize outbound lane/load type tokens for matching/grouping (case/spacing-safe).
@@ -1242,6 +1327,9 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
 
     overlayStats: { scanned: 0, matched: 0 },
     mergeStats: { ok: 0, soon: 0, now: 0 },
+
+    relayConnectivity: { state: "unknown", checkedAt: 0, via: "none", message: "" },
+    relayConnectivityInflight: null,
 
     running: false,
     lastError: null,
@@ -4229,27 +4317,9 @@ function scheduleDriverPrefetch(reason = "") {
 
     const mode = normalizeObLoadType(SETTINGS.obLoadType || "all");
     const rawOutbound = Array.isArray(STATE.outboundLoads) ? STATE.outboundLoads : [];
-    const lgEquipSig =
-      (mode === "amzl53" || mode === "amzl26")
-        ? buildLoadGroupEquipSig(rawOutbound.filter((l) => getOutboundLoadType(l) === "amzl"))
-        : null;
-
-    const filteredOutbound = rawOutbound.filter((l) => {
-      if (mode === "all") return true;
-      const t = getOutboundLoadType(l);
-      if (mode === "ddu") return t === "ddu";
-      if (mode === "amzl_all") return t === "amzl";
-      if (mode === "amzl53" || mode === "amzl26") {
-        if (t !== "amzl") return false;
-        const lgid = getLoadGroupId(l);
-        if (!lgid || !lgEquipSig) return false;
-        const sig = lgEquipSig.get(lgid);
-        if (!sig) return false;
-        const only53 = !!sig.has53 && !sig.has26;
-        const only26 = !!sig.has26 && !sig.has53;
-        return mode === "amzl53" ? only53 : only26;
-      }
-      return true;
+    const filteredOutbound = getFilteredOutboundLoadsForMode(mode, {
+      loads: rawOutbound,
+      debugKey: "merge-group-building",
     });
 
     // OB: remaining loads per CPT, capacity per equipment
@@ -6002,6 +6072,17 @@ function renderPanel() {
 
       pushPart(`Selected VRIDs: ${STATE.bulkSelection.size}`, `<span><b>Selected VRIDs:</b> ${STATE.bulkSelection.size}</span>`);
 
+      const relayStatusLabel = (() => {
+        const st = String((STATE.relayConnectivity && STATE.relayConnectivity.state) || "unknown");
+        if (st === "connected") return "Relay connected";
+        if (st === "fallback") return "Relay fallback";
+        if (st === "no_auth") return "Relay not authed";
+        if (st === "auth_only") return "Relay auth ready";
+        if (st === "error") return "Relay error";
+        return "Relay unknown";
+      })();
+      pushPart(relayStatusLabel, getRelayConnectivityBadgeHtml());
+
       const sep = ` <span style="opacity:.35;margin:0 8px;">|</span> `;
       const html = partsHtml.join(sep);
       const plain = partsPlain.join(" | ");
@@ -6112,6 +6193,7 @@ function renderPanel() {
     } catch (_) {}
     b.textContent = `Selected: ${STATE.bulkSelection.size}`;
     ov.textContent = `${STATE.overlayStats.matched}/${STATE.overlayStats.scanned}`;
+    try { void checkRelayConnectivity({ ttlMs: 120000 }); } catch (_) {}
     // Action list (grouped by Lane -> VRIDs)
     if (list) {
       const esc = (s) =>
@@ -6148,37 +6230,10 @@ function renderPanel() {
 
       const mode = normalizeObLoadType(SETTINGS.obLoadType || "all");
 
-      // For strict-only equipment filters, compute a load-group equipment signature map once.
-      // IMPORTANT: AMZL (ALL) is a superset; even 26-only / 53-only lanes still appear in AMZL (ALL).
-      const lgEquipSig =
-        (mode === "amzl53" || mode === "amzl26")
-          ? buildLoadGroupEquipSig(rawOutbound.filter((l) => getOutboundLoadType(l) === "amzl"))
-          : null;
-
-      const loads = rawOutbound
-        .filter((l) => {
-          if (mode === "all") return true;
-
-          const t = getOutboundLoadType(l);
-
-          if (mode === "ddu") return t === "ddu";
-          if (mode === "amzl_all") return t === "amzl";
-
-          // Strict-only AMZL equipment subsets are evaluated by loadGroupId signature.
-          if (mode === "amzl53" || mode === "amzl26") {
-            if (t !== "amzl") return false;
-            const lgid = getLoadGroupId(l);
-            if (!lgid || !lgEquipSig) return false; // cannot prove strict-only
-            const sig = lgEquipSig.get(lgid);
-            if (!sig) return false;
-            const only53 = !!sig.has53 && !sig.has26;
-            const only26 = !!sig.has26 && !sig.has53;
-            return mode === "amzl53" ? only53 : only26;
-          }
-
-          // Unknown mode: do not hide anything unexpectedly.
-          return true;
-        })
+      const loads = getFilteredOutboundLoadsForMode(mode, {
+        loads: rawOutbound,
+        debugKey: "action-panel",
+      })
         .map((l) => {
           const cptMs = toMs(l?.criticalPullTime);
           return {
@@ -7252,6 +7307,89 @@ async function _sspRelayGetDetail(vrid) {
       }
     }
     throw e;
+  }
+}
+
+async function checkRelayConnectivity(opts = {}) {
+  try {
+    const now = Date.now();
+    const force = !!opts.force;
+    const ttlMs = Number(opts.ttlMs || 120000);
+    const cached = STATE.relayConnectivity || { state: "unknown", checkedAt: 0, via: "none", message: "" };
+
+    if (!force && cached.checkedAt && (now - cached.checkedAt) < ttlMs) return cached;
+    if (!force && STATE.relayConnectivityInflight) return await STATE.relayConnectivityInflight;
+
+    const inflight = (async () => {
+      const auth = (typeof _sspGetTrackAuthHeader === "function") ? _sspGetTrackAuthHeader() : null;
+      if (!auth) {
+        const out = { state: "no_auth", checkedAt: Date.now(), via: "none", message: "Relay Track auth missing" };
+        STATE.relayConnectivity = out;
+        return out;
+      }
+
+      const sampleVrid = String(opts.vrid || ((Array.isArray(STATE.outboundLoads) ? STATE.outboundLoads : []).find((l) => String(l?.vrId || l?.vrid || "").trim())?.vrId || "")).trim();
+      if (!sampleVrid) {
+        const out = { state: "auth_only", checkedAt: Date.now(), via: "token", message: "Track auth present; no VRID sample available" };
+        STATE.relayConnectivity = out;
+        return out;
+      }
+
+      try {
+        const detail = await _sspRelayGetDetail(sampleVrid);
+        const src = String(detail?.__sspSource || "").toUpperCase();
+        if (src === "FMC") {
+          const out = { state: "fallback", checkedAt: Date.now(), via: "fmc", message: `Track unavailable; using FMC fallback (${sampleVrid})` };
+          STATE.relayConnectivity = out;
+          return out;
+        }
+        const out = { state: "connected", checkedAt: Date.now(), via: "track", message: `Relay Track connected (${sampleVrid})` };
+        STATE.relayConnectivity = out;
+        return out;
+      } catch (e) {
+        const msg = String((e && e.message) || e || "");
+        const out = /Track auth/i.test(msg)
+          ? { state: "no_auth", checkedAt: Date.now(), via: "none", message: "Relay Track auth missing" }
+          : { state: "error", checkedAt: Date.now(), via: "none", message: msg.slice(0, 220) };
+        STATE.relayConnectivity = out;
+        return out;
+      }
+    })();
+
+    STATE.relayConnectivityInflight = inflight;
+    const out = await inflight;
+    STATE.relayConnectivityInflight = null;
+    return out;
+  } catch (e) {
+    const out = { state: "error", checkedAt: Date.now(), via: "none", message: String((e && e.message) || e || "relay connectivity check failed") };
+    STATE.relayConnectivity = out;
+    STATE.relayConnectivityInflight = null;
+    return out;
+  }
+}
+
+function getRelayConnectivityBadgeHtml() {
+  try {
+    const rc = STATE.relayConnectivity || {};
+    const st = String(rc.state || "unknown");
+    const colors = {
+      connected: ["#16a34a", "#ecfdf5"],
+      fallback: ["#f59e0b", "#fffbeb"],
+      no_auth: ["#6b7280", "#f9fafb"],
+      auth_only: ["#2563eb", "#eff6ff"],
+      error: ["#dc2626", "#fef2f2"],
+      unknown: ["#6b7280", "#f9fafb"],
+    };
+    const pair = colors[st] || colors.unknown;
+    const label = st === "connected" ? "Relay: Connected" :
+      st === "fallback" ? "Relay: FMC fallback" :
+      st === "no_auth" ? "Relay: Not authed" :
+      st === "auth_only" ? "Relay: Auth ready" :
+      st === "error" ? "Relay: Error" : "Relay: Unknown";
+    const title = String(rc.message || label).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    return `<span title="${title}" style="padding:2px 8px;border-radius:999px;border:1px solid ${pair[0]};background:${pair[1]};color:${pair[0]};font-weight:900;">${label}</span>`;
+  } catch (_) {
+    return `<span style="padding:2px 8px;border-radius:999px;border:1px solid #6b7280;background:#f9fafb;color:#6b7280;font-weight:900;">Relay: Unknown</span>`;
   }
 }
 
@@ -9396,6 +9534,7 @@ try {
         <button id="ssp2-h-refresh" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:800;cursor:pointer;">Refresh</button>
         <button id="ssp2-h-settings" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:800;cursor:pointer;">Settings</button>
         <button id="ssp2-h-panel" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:800;cursor:pointer;">Panel</button>
+        <button id="ssp2-h-relay-connect" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:800;cursor:pointer;">Relay Connect</button>
 
         <select id="ssp2-h-loadtype" title="Loads filter" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:800;cursor:pointer;">
           <option value="all">All Loads</option>
@@ -9447,6 +9586,21 @@ try {
       UI_PREFS.panelHidden = !UI_PREFS.panelHidden;
       panel.style.display = UI_PREFS.panelHidden ? "none" : "flex";
       persistPrefs();
+    });
+
+    $("#ssp2-h-relay-connect")?.addEventListener("click", async () => {
+      try {
+        const st = await checkRelayConnectivity({ force: true, ttlMs: 0 });
+        if (st && st.state === "no_auth") {
+          window.open("https://track.relay.amazon.dev/", "_blank", "noopener");
+          alert("Relay auth is not captured yet. A Relay tab was opened; load a VRID in Track, then click Relay Connect again.");
+        } else {
+          renderPanel();
+          alert(`Relay connectivity: ${String(st?.state || "unknown")} — ${String(st?.message || "")}`);
+        }
+      } catch (e) {
+        alert(`Relay connectivity check failed: ${String((e && e.message) || e || "unknown error")}`);
+      }
     });
     // Loads dropdown: classify by route keyword
     const lt = document.getElementById("ssp2-h-loadtype");
@@ -10759,6 +10913,40 @@ function _getActionGroup(laneKey, cptMs) {
   } catch (_) { return null; }
 }
 
+function getFilteredOutboundVridsForLaneCpt(laneKey, cptMs, options = {}) {
+  try {
+    const laneNorm = String(laneKey || "").trim();
+    const cptNum = Number(cptMs || 0);
+    if (!laneNorm || !cptNum) return [];
+
+    const mode = normalizeObLoadType(SETTINGS.obLoadType || "all");
+    const filtered = getFilteredOutboundLoadsForMode(mode, {
+      loads: Array.isArray(STATE.outboundLoads) ? STATE.outboundLoads : [],
+      basePredicate: (l) => {
+        const st = String((l?.loadStatus ?? l?.status ?? "")).toUpperCase();
+        if (st.includes("CANCEL") || st.includes("DEPART")) return false;
+        return true;
+      },
+      equipmentPredicate: options.equipmentPredicate,
+      debugKey: String(options.debugKey || "lane-cpt-vrids"),
+    });
+
+    const out = [];
+    for (const l of filtered) {
+      const vrid = String(l?.vrId || l?.vrid || "").trim();
+      if (!vrid) continue;
+      const lane = String(l?.lane || l?.route || "").trim();
+      const cpt = Number(toMs(l?.criticalPullTime) || 0);
+      if (lane !== laneNorm || cpt !== cptNum) continue;
+      out.push(vrid);
+    }
+
+    return Array.from(new Set(out));
+  } catch (_) {
+    return [];
+  }
+}
+
 function _msFromAny(x) {
   if (x == null) return null;
   if (typeof x === "number" && Number.isFinite(x)) return x;
@@ -10971,12 +11159,14 @@ async function computeOutboundCasesForLaneCpt(laneKey, cptMs) {
 
     const g = _getActionGroup(laneKey, cptMs);
     const vs = (g && g.vrids) ? g.vrids : [];
-    if (!vs.length) return [];
+    const allowedVrids = new Set(getFilteredOutboundVridsForLaneCpt(laneKey, cptMs, { debugKey: "outbound-case-collection" }));
+    const scopedVs = vs.filter((v) => allowedVrids.has(String(v?.vrid || v?.vrId || "").trim()));
+    if (!scopedVs.length) return [];
 
     const out = [];
-    for (const v of vs.slice(0, 80)) {
+    for (const v of scopedVs.slice(0, 80)) {
       const vrid = String(v?.vrid || v?.vrId || "").trim();
-      if (!vrid) continue;
+      if (!vrid || !allowedVrids.has(vrid)) continue;
 
       // Need firstStopArrivalTime. Best source is FMC execution load's first stop scheduled time.
       let fmcLoad = null;
@@ -11253,12 +11443,14 @@ async function computeOutboundDisruptionsForLaneCpt(laneKey, cptMs) {
   try {
     const g = _getActionGroup(laneKey, cptMs);
     const vs = (g && g.vrids) ? g.vrids : [];
-    if (!vs.length) return [];
+    const allowedVrids = new Set(getFilteredOutboundVridsForLaneCpt(laneKey, cptMs, { debugKey: "disruptions-derivation" }));
+    const scopedVs = vs.filter((v) => allowedVrids.has(String(v?.vrid || v?.vrId || "").trim()));
+    if (!scopedVs.length) return [];
 
     const out = [];
-    for (const v of vs.slice(0, 60)) {
+    for (const v of scopedVs.slice(0, 60)) {
       const vrid = String(v?.vrid || v?.vrId || "").trim();
-      if (!vrid) continue;
+      if (!vrid || !allowedVrids.has(vrid)) continue;
 
       let fmcLoad = null;
       try { fmcLoad = await fetchFmcExecutionLoad(vrid); } catch (_) {}
@@ -13176,13 +13368,15 @@ async function openRelayCasesPanel(laneKey, cptMs) {
   let g = null;
   try { g = _getActionGroup(laneKey, cptMs); } catch (_) {}
   const vs = (g && g.vrids) ? g.vrids : [];
-  if (!vs.length) {
+  const allowedVrids = new Set(getFilteredOutboundVridsForLaneCpt(laneKey, cptMs, { debugKey: "relay-bulk-vrid-open" }));
+  const scopedVs = vs.filter((v) => allowedVrids.has(String(v?.vrid || v?.vrId || "").trim()));
+  if (!scopedVs.length) {
     body.innerHTML = `<div style="padding:10px;color:#6b7280;">No VRIDs found for this lane/CPT.</div>`;
     return;
   }
 
   const rows = [];
-  for (const v of vs.slice(0, 80)) {
+  for (const v of scopedVs.slice(0, 80)) {
     const vrid = String(v?.vrid || v?.vrId || "").trim();
     if (!vrid) continue;
     let detail = null;
