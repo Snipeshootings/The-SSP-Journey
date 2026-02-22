@@ -1526,12 +1526,9 @@ function extractContainersMetaFromObTree(nodes) {
   }
 
 
-  // Weighted "Units" definition for physical containers:
-  // CART = 1.0 (baseline)
-  // PALLET = 1.5
-  // GAYLORD = 1.5
-  // BAG = 0.25
-  // (defaults to 1.0 for other physical container types)
+  // Canonical weighted handling-units formula used everywhere in SSP Util
+  // (not package count): CART=1.0, PALLET=1.5, GAYLORD=1.5, BAG=0.25, CAGE=1.0;
+  // non-physical nodes (e.g., PACKAGE/LOAD/TRAILER/areas) are explicitly excluded (0 units).
   const UNIT_WEIGHTS_BY_CONTTYPE = Object.freeze({
     CART: 1.0,
     PALLET: 1.5,
@@ -1565,13 +1562,8 @@ function extractContainersMetaFromObTree(nodes) {
     return (UNIT_WEIGHTS_BY_CONTTYPE[k] != null) ? UNIT_WEIGHTS_BY_CONTTYPE[k] : DEFAULT_UNIT_WEIGHT;
   }
 
-  // Alias used by newer panel logic (some sections still call this name)
+  // Alias used by downstream panel logic.
   function unitsForContainerType(contType) {
-    return getUnitWeight(contType);
-  }
-
-  // Back-compat alias (older UI sections still call unitFor)
-  function unitFor(contType) {
     return getUnitWeight(contType);
   }
 
@@ -1599,12 +1591,6 @@ function extractContainersMetaFromObTree(nodes) {
     };
     if (Array.isArray(nodes)) for (const n of nodes) walk(n);
     return { units, containers, byType };
-  }
-
-  function fmtUnits(u) {
-    const n = Math.round((Number(u) || 0) * 10) / 10;
-    const s = n.toFixed(1);
-    return s.endsWith(".0") ? s.slice(0, -2) : s;
   }
 
   function fmtTypeBreakdown(byType) {
@@ -12821,26 +12807,10 @@ const isLocation = (t) => (
   return out;
 }
 
-function unitsForContainerType(t) {
-  const TT = String(t || '').toUpperCase().trim();
-
-  // Only physical containers should contribute to "units"
-  if (TT === 'CART') return 1.0;
-  if (TT === 'GAYLORD') return 1.5;
-  if (TT === 'PALLET') return 1.5;
-
-  // LOAD / PACKAGE / etc should not inflate units here
-  return 0.0;
-}
-
 function renderContainerBucketsV2(meta) {
   const esc = s => String(s ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
   const rows = Array.isArray(meta) ? meta.slice() : [];
   if (!rows.length) return '<div style="color:#6b7280;">—</div>';
-
-  const unitsFor = (t) => (typeof unitsForContainerType === 'function')
-  ? unitsForContainerType(String(t||'').toUpperCase())
-  : 0.0;
 
 
   const byBucket = rows.reduce((a,m) => {
@@ -12906,7 +12876,7 @@ function renderContainerBucketsV2(meta) {
     // Group by trailerId-like label (locationLabel on TRAILER context)
     const groups = groupByLoc(items);
     return groups.map(([loc, arr]) => {
-      const units = arr.reduce((s,x)=>s+unitsFor(x.contType),0);
+      const units = arr.reduce((s,x)=>s+unitsForContainerType(x.contType),0);
       return `<details open style="margin-top:8px;">
         <summary style="cursor:pointer;font-weight:800;">
           ${esc(loc)} — ${arr.length} ctrs • ${fmtUnits(units)} units
@@ -12994,25 +12964,20 @@ function renderContainerBuckets(meta = {}) {
     Unbucketed: '#9ca3af'
   };
 
-  const unitFor = (contType) => {
-    if (!contType) return 1;
-    return String(contType).toUpperCase().includes('53') ? 2 : 1;
-  };
-
   const renderRawList = (items) =>
     items.map(x => `${x.id || x.containerId || 'Unknown'} (${x.contType || 'UNK'})`).join('\n');
 
   const section = (name, items = []) => {
     if (!items.length) return '';
 
-    const units = items.reduce((sum, x) => sum + unitFor(x.contType), 0);
+    const units = items.reduce((sum, x) => sum + unitsForContainerType(x.contType), 0);
     const color = colors[name] || '#9ca3af';
 
     return `
       <details style="margin-top:10px;" ${name === 'Loaded' || name === 'Staged' ? 'open' : ''}>
         <summary style="cursor:pointer;font-weight:900;display:flex;align-items:center;gap:8px;">
           <span style="width:10px;height:10px;border-radius:3px;background:${color};display:inline-block;"></span>
-          ${name} — ${items.length} containers / ${units} units
+          ${name} — ${items.length} containers / ${fmtUnits(units)} units
         </summary>
         <div style="margin-top:6px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;white-space:pre-wrap;">
           ${renderRawList(items)}
