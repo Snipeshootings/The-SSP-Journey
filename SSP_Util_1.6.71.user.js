@@ -1526,12 +1526,9 @@ function extractContainersMetaFromObTree(nodes) {
   }
 
 
-  // Weighted "Units" definition for physical containers:
-  // CART = 1.0 (baseline)
-  // PALLET = 1.5
-  // GAYLORD = 1.5
-  // BAG = 0.25
-  // (defaults to 1.0 for other physical container types)
+  // Canonical weighted handling-units formula used everywhere in SSP Util
+  // (not package count): CART=1.0, PALLET=1.5, GAYLORD=1.5, BAG=0.25, CAGE=1.0;
+  // non-physical nodes (e.g., PACKAGE/LOAD/TRAILER/areas) are explicitly excluded (0 units).
   const UNIT_WEIGHTS_BY_CONTTYPE = Object.freeze({
     CART: 1.0,
     PALLET: 1.5,
@@ -1565,13 +1562,8 @@ function extractContainersMetaFromObTree(nodes) {
     return (UNIT_WEIGHTS_BY_CONTTYPE[k] != null) ? UNIT_WEIGHTS_BY_CONTTYPE[k] : DEFAULT_UNIT_WEIGHT;
   }
 
-  // Alias used by newer panel logic (some sections still call this name)
+  // Alias used by downstream panel logic.
   function unitsForContainerType(contType) {
-    return getUnitWeight(contType);
-  }
-
-  // Back-compat alias (older UI sections still call unitFor)
-  function unitFor(contType) {
     return getUnitWeight(contType);
   }
 
@@ -1599,12 +1591,6 @@ function extractContainersMetaFromObTree(nodes) {
     };
     if (Array.isArray(nodes)) for (const n of nodes) walk(n);
     return { units, containers, byType };
-  }
-
-  function fmtUnits(u) {
-    const n = Math.round((Number(u) || 0) * 10) / 10;
-    const s = n.toFixed(1);
-    return s.endsWith(".0") ? s.slice(0, -2) : s;
   }
 
   function fmtTypeBreakdown(byType) {
@@ -8294,6 +8280,17 @@ document.body.appendChild(p);
         const loads = Array.isArray(STATE?.inboundLoads) ? STATE.inboundLoads : [];
         if (!loads.length) { alert("No inbound loads loaded yet. Hit Refresh first."); return; }
 
+        // XD Graph is an expected-volume view: prefer scheduled/ETA over actual arrival.
+        const getExpectedTimeForXdGraph = (load) => (
+          parseSspDateTime(load?.scheduledArrivalTime) ||
+          parseSspDateTime(load?.estimatedArrivalTime) ||
+          parseSspDateTime(load?.actualArrivalTime) ||
+          toMs(load?.scheduledArrivalTime) ||
+          toMs(load?.estimatedArrivalTime) ||
+          toMs(load?.actualArrivalTime) ||
+          0
+        );
+
         const normStatus = (st) => String(st || "").toUpperCase();
         const isTransit = (st) => {
           const s = normStatus(st);
@@ -8353,7 +8350,7 @@ document.body.appendChild(p);
 
         const agg = new Map(); // shift||hour||status -> record
         for (const l of loads) {
-          const t = _getLoadTimeForPlanning(l);
+          const t = getExpectedTimeForXdGraph(l);
           if (!t) continue;
           if (t < ops.startMs || t >= ops.endMs) continue;
           if (isCompleted(l?.status || l?.loadStatus)) continue;
@@ -8364,12 +8361,13 @@ document.body.appendChild(p);
 
           const hb = hourBucket(t);
           const sb = statusBucket(l?.status || l?.loadStatus);
-          const { C, missing } = getCounts(l);
+          const { C, P, missing } = getCounts(l);
 
           const k = `${shiftName}||${hb}||${sb}`;
-          const r = agg.get(k) || { shift: shiftName, hourBucket: hb, statusBucket: sb, loads: 0, carts: 0, missingCounts: 0 };
+          const r = agg.get(k) || { shift: shiftName, hourBucket: hb, statusBucket: sb, loads: 0, carts: 0, packages: 0, missingCounts: 0 };
           r.loads += 1;
           r.carts += (C || 0);
+          r.packages += (P || 0);
           if (missing) r.missingCounts += 1;
           agg.set(k, r);
         }
@@ -8377,11 +8375,36 @@ document.body.appendChild(p);
         const rows = Array.from(agg.values())
           .sort((a,b) => String(a.shift).localeCompare(String(b.shift)) || String(a.hourBucket).localeCompare(String(b.hourBucket)) || String(a.statusBucket).localeCompare(String(b.statusBucket)));
 
-        const headers = ["shift","hourBucket","statusBucket","loads","carts","missingCounts"];
+        // Add explicit per-hour sums so ops can graph expected totals directly.
+        const byHour = new Map(); // shift||hour -> total row
+        for (const r of rows) {
+          const hk = `${r.shift}||${r.hourBucket}`;
+          const t = byHour.get(hk) || { shift: r.shift, hourBucket: r.hourBucket, statusBucket: 'SUM_HOUR', loads: 0, carts: 0, packages: 0, missingCounts: 0 };
+          t.loads += Number(r.loads || 0);
+          t.carts += Number(r.carts || 0);
+          t.packages += Number(r.packages || 0);
+          t.missingCounts += Number(r.missingCounts || 0);
+          byHour.set(hk, t);
+        }
+
+        const opsTotal = { shift: 'OPS', hourBucket: 'ALL', statusBucket: 'SUM_OPS_HOURS', loads: 0, carts: 0, packages: 0, missingCounts: 0 };
+        for (const t of byHour.values()) {
+          opsTotal.loads += Number(t.loads || 0);
+          opsTotal.carts += Number(t.carts || 0);
+          opsTotal.packages += Number(t.packages || 0);
+          opsTotal.missingCounts += Number(t.missingCounts || 0);
+        }
+
+        const exportRows = rows.concat(
+          Array.from(byHour.values()).sort((a,b) => String(a.shift).localeCompare(String(b.shift)) || String(a.hourBucket).localeCompare(String(b.hourBucket))),
+          [opsTotal]
+        );
+
+        const headers = ["shift","hourBucket","statusBucket","loads","carts","packages","missingCounts"];
 
         downloadTextFile(
           `XD_GRAPH_${STATE.nodeId || "NODE"}_${new Date().toISOString().slice(0,10)}.csv`,
-          toCsv(rows, headers),
+          toCsv(exportRows, headers),
           "text/csv;charset=utf-8"
         );
       } catch (e) {
@@ -12821,26 +12844,10 @@ const isLocation = (t) => (
   return out;
 }
 
-function unitsForContainerType(t) {
-  const TT = String(t || '').toUpperCase().trim();
-
-  // Only physical containers should contribute to "units"
-  if (TT === 'CART') return 1.0;
-  if (TT === 'GAYLORD') return 1.5;
-  if (TT === 'PALLET') return 1.5;
-
-  // LOAD / PACKAGE / etc should not inflate units here
-  return 0.0;
-}
-
 function renderContainerBucketsV2(meta) {
   const esc = s => String(s ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
   const rows = Array.isArray(meta) ? meta.slice() : [];
   if (!rows.length) return '<div style="color:#6b7280;">—</div>';
-
-  const unitsFor = (t) => (typeof unitsForContainerType === 'function')
-  ? unitsForContainerType(String(t||'').toUpperCase())
-  : 0.0;
 
 
   const byBucket = rows.reduce((a,m) => {
@@ -12906,7 +12913,7 @@ function renderContainerBucketsV2(meta) {
     // Group by trailerId-like label (locationLabel on TRAILER context)
     const groups = groupByLoc(items);
     return groups.map(([loc, arr]) => {
-      const units = arr.reduce((s,x)=>s+unitsFor(x.contType),0);
+      const units = arr.reduce((s,x)=>s+unitsForContainerType(x.contType),0);
       return `<details open style="margin-top:8px;">
         <summary style="cursor:pointer;font-weight:800;">
           ${esc(loc)} — ${arr.length} ctrs • ${fmtUnits(units)} units
@@ -12994,25 +13001,20 @@ function renderContainerBuckets(meta = {}) {
     Unbucketed: '#9ca3af'
   };
 
-  const unitFor = (contType) => {
-    if (!contType) return 1;
-    return String(contType).toUpperCase().includes('53') ? 2 : 1;
-  };
-
   const renderRawList = (items) =>
     items.map(x => `${x.id || x.containerId || 'Unknown'} (${x.contType || 'UNK'})`).join('\n');
 
   const section = (name, items = []) => {
     if (!items.length) return '';
 
-    const units = items.reduce((sum, x) => sum + unitFor(x.contType), 0);
+    const units = items.reduce((sum, x) => sum + unitsForContainerType(x.contType), 0);
     const color = colors[name] || '#9ca3af';
 
     return `
       <details style="margin-top:10px;" ${name === 'Loaded' || name === 'Staged' ? 'open' : ''}>
         <summary style="cursor:pointer;font-weight:900;display:flex;align-items:center;gap:8px;">
           <span style="width:10px;height:10px;border-radius:3px;background:${color};display:inline-block;"></span>
-          ${name} — ${items.length} containers / ${units} units
+          ${name} — ${items.length} containers / ${fmtUnits(units)} units
         </summary>
         <div style="margin-top:6px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;white-space:pre-wrap;">
           ${renderRawList(items)}
