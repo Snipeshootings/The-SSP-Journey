@@ -1638,18 +1638,39 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
         return false;
       }
 
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+      // Attempt 1: Standard fetch with CORS headers
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
 
-      if (!res.ok) {
-        console.error("[SSP Util] Slack message failed:", res.status, res.statusText);
-        return false;
+        if (!res.ok) {
+          console.warn("[SSP Util] Slack message HTTP error:", res.status, res.statusText);
+        } else {
+          console.log("[SSP Util] Slack message sent successfully");
+          return true;
+        }
+      } catch (corsErr) {
+        // CORS preflight failed; try no-cors mode
+        if (String(corsErr).includes("CORS") || String(corsErr).includes("Access-Control")) {
+          console.warn("[SSP Util] CORS preflight blocked, trying no-cors mode...");
+          try {
+            const res2 = await fetch(url, {
+              method: "POST",
+              mode: "no-cors",
+              body: JSON.stringify(payload),
+            });
+            console.log("[SSP Util] no-cors request completed");
+            return true;
+          } catch (noCorsErr) {
+            console.error("[SSP Util] no-cors also failed:", noCorsErr);
+            return false;
+          }
+        }
+        throw corsErr;
       }
-
-      console.log("[SSP Util] Slack message sent successfully");
       return true;
     } catch (e) {
       console.error("[SSP Util] Slack send error:", e);
@@ -1744,8 +1765,19 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
       testBtn.disabled = true; testBtn.textContent = "Sending...";
       try {
         const payload = { text: "🧪 *SSP Util* – Test message from dashboard configuration", mrkdwn: true };
-        const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-        if (res.ok) alert("✅ Test message sent to Slack!"); else alert(`❌ Failed: ${res.status} ${res.statusText}`);
+        try {
+          const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+          if (res.ok) { alert("✅ Test message sent to Slack!"); return; }
+          throw new Error(`HTTP ${res.status} ${res.statusText}`);
+        } catch (corsErr) {
+          if (String(corsErr).includes("CORS") || String(corsErr).includes("Access-Control")) {
+            console.warn("[SSP Util] CORS preflight failed, retrying with no-cors mode");
+            const res2 = await fetch(url, { method: "POST", mode: "no-cors", body: JSON.stringify(payload) });
+            alert("✅ Test message sent (no-cors mode)!");
+            return;
+          }
+          throw corsErr;
+        }
       } catch (e) { alert(`❌ Error: ${String(e && e.message ? e.message : e)}`); }
       finally { testBtn.disabled = false; testBtn.textContent = "Test Message"; }
     });
