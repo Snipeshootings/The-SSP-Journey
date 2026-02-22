@@ -11909,64 +11909,87 @@ async function openDisruptionsPanel(laneKey, cptMs) {
     if (!allBox) return;
     const f = STATE.__disruptFilter || { ob: true, ib: true };
 
-    const combined = [];
-    if (f.ob) for (const r of (outboundRows || [])) combined.push({ ...r, __tab: "ob", __type: "OB" });
-    if (f.ib) for (const r of (inboundRows || [])) combined.push({ ...r, __tab: "ib", __type: "IB" });
-
-    // Sort by Scheduled Arrival Time (primary), then minutes (desc), then vrid
-    combined.sort((a, b) => (Number(a.scheduledMs || 0) - Number(b.scheduledMs || 0)) || (Number(b.minutes || 0) - Number(a.minutes || 0)) || String(a.vrid).localeCompare(String(b.vrid)));
-
     syncFilterButtons((outboundRows || []).length, (inboundRows || []).length);
 
-    const rowsHtml = combined.map((r, i) => {
-      const pk = (r.packages == null || Number.isNaN(Number(r.packages))) ? "—" : String(Number(r.packages));
-      const cn = (r.containers == null || Number.isNaN(Number(r.containers))) ? "—" : String(Number(r.containers));
-      const sched = r.scheduledMs ? fmtTime(r.scheduledMs) : "—";
-      const eta = r.arrivalMs ? fmtTime(r.arrivalMs) : (r.etaMs ? fmtTime(r.etaMs) : "—");
-      const status = (r.kind === "LATE" ? "Driver Late" : "Late");
-      const zebra = i % 2 ? "background:#f3f4f6;" : "background:transparent;";
-      const vr = esc(r.vrid || "");
-      const lane = esc(r.laneKey || laneKey || "");
-      const cpt = Number(r.cptMs || cptMs || 0);
-      const href = (typeof buildRelayUrl === "function") ? buildRelayUrl(r.vrid || "") : "";
-      const vrLink = href ? `<a href="${esc(href)}" target="_blank" rel="noopener" style="color:#2563eb;text-decoration:none;font-weight:900;">${vr}</a>` : `<span style="color:#2563eb;font-weight:900;">${vr}</span>`;
-      const caseBtn = (r.__tab === "ob" && r.fmcCaseSearchUrl) ? `<a href="${esc(r.fmcCaseSearchUrl)}" target="_blank" rel="noopener" style="margin-left:8px;padding:4px 10px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;text-decoration:none;color:#111827;">Cases</a>` : "";
-      const late = lateTxt(r);
-      return `
-        <div class="ssp-disrupt-row" data-lane="${lane}" data-cpt="${cpt}" data-tab="${esc(r.__tab)}" style="display:grid;grid-template-columns:44px 160px 80px 90px 110px 110px 120px;gap:10px;align-items:center;padding:10px 10px;border-radius:12px;${zebra}cursor:pointer;">
-          <div style="font-weight:900;color:#6b7280;">${esc(r.__type)}</div>
-          <div>${vrLink}${caseBtn}</div>
-          <div style="font-weight:900;color:#111827;">C ${cn}</div>
-          <div style="font-weight:900;color:#111827;">P ${pk}</div>
-          <div style="font-weight:800;color:#6b7280;">Sched<br><span style="font-weight:900;color:#111827;">${sched}</span></div>
-          <div style="font-weight:800;color:#6b7280;">ETA/Arr<br><span style="font-weight:900;color:#111827;">${eta}</span></div>
-          <div style="font-weight:800;color:#6b7280;">${esc(status)}<br><span style="font-weight:900;color:#111827;">${esc(late)}</span></div>
-        </div>
-      `;
-    }).join("");
+    // Build inbound column (show all inbound disruptions)
+    const inboundHtml = (f.ib && inboundRows && inboundRows.length)
+      ? (`<div style="font-weight:900;margin-bottom:6px;">Inbound (${inboundRows.length})</div>` + inboundRows.map((r, i) => {
+          const vr = esc(r.vrid || "");
+          const sched = r.scheduledMs ? fmtTime(r.scheduledMs) : "—";
+          const eta = r.arrivalMs ? fmtTime(r.arrivalMs) : (r.etaMs ? fmtTime(r.etaMs) : "—");
+          const pk = (r.packages == null || Number.isNaN(Number(r.packages))) ? "—" : String(Number(r.packages));
+          const cn = (r.containers == null || Number.isNaN(Number(r.containers))) ? "—" : String(Number(r.containers));
+          const late = lateTxt(r);
+          const href = (typeof buildRelayUrl === "function") ? buildRelayUrl(r.vrid || "") : "";
+          const vrLink = href ? `<a href="${esc(href)}" target="_blank" rel="noopener" style="color:#2563eb;text-decoration:none;font-weight:900;">${vr}</a>` : `<span style="color:#2563eb;font-weight:900;">${vr}</span>`;
+          return `
+            <div class="ssp-disrupt-row-ib" data-vrid="${esc(r.vrid||"")}" style="padding:8px;margin-bottom:8px;border-radius:10px;background:#fff;border:1px solid #eef2ff;">
+              <div style="font-size:13px;">${vrLink}</div>
+              <div style="color:#6b7280;font-size:11px;margin-top:4px;">Sched: ${sched} • ETA/Arr: ${eta} • C ${cn} • P ${pk}</div>
+              <div style="font-weight:900;color:#111827;margin-top:6px;">${esc(late)}</div>
+            </div>
+          `;
+        }).join("") )
+      : `<div style="color:#6b7280;padding:10px;border-radius:8px;">No inbound disruptions</div>`;
+
+    // Build outbound grouped-by-lane column
+    let outboundHtml = "";
+    if (f.ob && outboundRows && outboundRows.length) {
+      // Group by laneKey
+      const lm = new Map();
+      for (const r of outboundRows) {
+        const lane = String(r.laneKey || r.lane || "—");
+        if (!lm.has(lane)) lm.set(lane, []);
+        lm.get(lane).push(r);
+      }
+      // Compute lane severity (max minutes) and sort lanes by severity desc
+      const lanes = Array.from(lm.entries()).map(([lane, rows]) => ({ lane, rows }));
+      for (const entry of lanes) entry.maxMin = Math.max(...entry.rows.map(x => Number(x.minutes || 0) || 0));
+      lanes.sort((a,b) => Number(b.maxMin || 0) - Number(a.maxMin || 0));
+
+      // Render lanes as stacked cards (highest severity first)
+      outboundHtml = lanes.map((ln) => {
+        const rows = ln.rows.slice().sort((a,b) => Number(b.minutes||0) - Number(a.minutes||0) || String(a.vrid||"").localeCompare(String(b.vrid||"")));
+        const laneHeader = `<div style="font-weight:900;margin-bottom:6px;">${esc(ln.lane)} — ${rows.length} VRID(s) — worst: ${rows.length?String(rows[0].minutes||0)+"m":"—"}</div>`;
+        const vrs = rows.map((r) => {
+          const vr = esc(r.vrid||"");
+          const mins = Number(r.minutes||0);
+          const cn = (r.containers == null || Number.isNaN(Number(r.containers))) ? "—" : String(Number(r.containers));
+          const href = (typeof buildRelayUrl === "function") ? buildRelayUrl(r.vrid || "") : "";
+          const link = href ? `<a href="${esc(href)}" target="_blank" rel="noopener" style="color:#2563eb;text-decoration:none;font-weight:900;">${vr}</a>` : `<span style="color:#2563eb;font-weight:900;">${vr}</span>`;
+          const caseBtn = r.caseUrl ? `<a href="${esc(r.caseUrl)}" target="_blank" rel="noopener" style="margin-left:8px;padding:4px 8px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;text-decoration:none;color:#111827;">Cases</a>` : "";
+          return `<div class="ssp-disrupt-row-ob" data-lane="${esc(ln.lane)}" data-vrid="${esc(r.vrid||"")}" style="padding:8px;margin-bottom:6px;border-radius:8px;background:#fff;border:1px solid #f3f4f6;display:flex;justify-content:space-between;align-items:center;">
+                    <div>${link}${caseBtn}<div style="font-size:11px;color:#6b7280;margin-top:4px;">C ${cn}</div></div>
+                    <div style="font-weight:900;color:#dc2626;">${String(mins)}m</div>
+                  </div>`;
+        }).join("");
+        return `<div style="margin-bottom:12px;padding:10px;border-radius:10px;background:#f9fafb;border:1px solid #eef2ff;">${laneHeader}${vrs}</div>`;
+      }).join("");
+    } else {
+      outboundHtml = `<div style="color:#6b7280;padding:10px;border-radius:8px;">No outbound disruptions</div>`;
+    }
 
     allBox.innerHTML = `
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
-        <div style="font-weight:900;">All disruptions (${combined.length})</div>
-        <div style="margin-left:auto;color:#6b7280;font-weight:800;font-size:12px;">(click row to jump)</div>
-      </div>
-      <div style="max-height:62vh;overflow:auto;padding-right:8px;">
-        ${rowsHtml || `<div style="padding:10px;color:#6b7280;">No disruptions found for current filter.</div>`}
+      <div style="display:flex;gap:16px;align-items:flex-start;max-height:62vh;overflow:auto;padding-right:8px;">
+        <div style="flex:0 0 46%;min-width:260px;">
+          ${inboundHtml}
+        </div>
+        <div style="flex:1;min-width:320px;">
+          <div style="font-weight:900;margin-bottom:6px;">Outbound — grouped by lane (highest severity first)</div>
+          ${outboundHtml}
+        </div>
       </div>
     `;
 
-    // Jump behavior: scroll to lane card on action panel
-    allBox.querySelectorAll(".ssp-disrupt-row").forEach((el) => {
+    // Jump behavior: clicking outbound/inbound rows will scroll to action panel lane card
+    allBox.querySelectorAll(".ssp-disrupt-row-ob, .ssp-disrupt-row-ib").forEach((el) => {
       el.addEventListener("click", (e) => {
-        // If the user clicked the VRID/Cases link, let the link win.
         try { if (e && e.target && e.target.closest && e.target.closest("a")) return; } catch (_) {}
         try {
-          const lane = el.getAttribute("data-lane") || "";
-          const cpt = el.getAttribute("data-cpt") || "";
-          const target = document.querySelector(`.open-disruptions[data-lane="${CSS.escape(lane)}"][data-cpt="${CSS.escape(String(cpt))}"]`);
-          if (target && target.scrollIntoView) {
-            target.scrollIntoView({ behavior: "smooth", block: "center" });
-          }
+          const lane = el.getAttribute("data-lane") || el.getAttribute("data-lanekey") || laneKey || "";
+          const cpt = el.getAttribute("data-cpt") || cptMs || "";
+          const target = document.querySelector(`.open-disruptions[data-lane="${CSS.escape(String(lane))}"][data-cpt="${CSS.escape(String(cpt))}"]`);
+          if (target && target.scrollIntoView) target.scrollIntoView({ behavior: "smooth", block: "center" });
         } catch (_) {}
       });
     });
