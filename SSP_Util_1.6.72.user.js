@@ -743,7 +743,6 @@ function buildIbByPlanId(inboundLoads) {
   document.head.appendChild(style);
 })();
 
-
 /**
  * Classify a CPT timestamp relative to now (past/soon/future) for coloring and sorting.
  */
@@ -979,11 +978,276 @@ function getOpsWindow(nowMs = Date.now()) {
     }
   }
 
+  // =====================================================
+  // CSV-Based Inbound Estimation (from 2-week historical export)
+  // - Allows importing two-week SSP inbound export CSV for better statistical estimates
+  // - Calculates averages by route, load type, and equipment
+  // - Feeds estimates into planning panel headcount, merge panel, and inbound units
+  // =====================================================
+  const IB_CSV_EST = {
+    storageKey: () => `ssp2_ibCsvEstimates_v1:${String(STATE.nodeId||"").trim() || "UNKNOWN"}`,
+    maxAgeMs: 7 * 24 * 60 * 60 * 1000, // 7 days
+  };
+
+  function _ibCsvEstLoadFromStorage() {
+    try {
+      const raw = localStorage.getItem(IB_CSV_EST.storageKey());
+      if (!raw) return null;
+      const obj = JSON.parse(raw);
+      if (!obj || typeof obj !== "object") return null;
+      if (!obj.ts || (Date.now() - obj.ts) > IB_CSV_EST.maxAgeMs) return null;
+      return obj;
+    } catch { return null; }
+  }
+
+  function _ibCsvEstSaveToStorage(obj) {
+    try {
+      localStorage.setItem(IB_CSV_EST.storageKey(), JSON.stringify(obj));
+    } catch {}
+  }
+
+  /**
+   * Parse CSV data from inbound SSP export.
+   * Expected columns: Priority, Ranking, Load Type, Status, Sort/Route, VR ID, 
+   *   Total Packages, Total Containers, Equipment, Carrier, etc.
+   */
+  function parseInboundCsvData(csvText) {
+    try {
+      const lines = csvText.trim().split(/\r?\n/);
+      if (!lines.length) return [];
+
+      // Parse header line
+      const header = lines[0].split(',').map(h => h.trim().toLowerCase());
+      const rows = [];
+
+      // Parse data rows
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+
+        // Basic CSV parsing (handle quoted fields)
+        const cols = [];
+        let current = '';
+        let inQuotes = false;
+        for (let j = 0; j < line.length; j++) {
+          const ch = line[j];
+          if (ch === '"') {
+            inQuotes = !inQuotes;
+          } else if (ch === ',' && !inQuotes) {
+            cols.push(current.trim().replace(/^"+|"+$/g, ''));
+            current = '';
+          } else {
+            current += ch;
+          }
+        }
+        cols.push(current.trim().replace(/^"+|"+$/g, ''));
+
+        // Map to object using header
+        const row = {};
+        for (let j = 0; j < header.length && j < cols.length; j++) {
+          row[header[j]] = cols[j];
+        }
+        rows.push(row);
+      }
+
+      return rows;
+    } catch (e) {
+      console.error("[SSP Util] CSV parse error:", e);
+      return [];
+    }
+  }
+
+  /**
+   * Process inbound CSV rows and calculate statistics grouped by route, load type, and equipment.
+   * Returns object indexed as: route::loadType::equipment -> { avgC, avgP, n, stdDevC, stdDevP }
+   */
+  function buildCsvEstimates(csvRows) {
+    try {
+      const stats = {}; // route::loadType::equipment -> { samples: [...], n: count }
+      const globalStats = {}; // route -> { samples: [...], n: count }
+
+      for (const row of csvRows) {
+        // Extract key fields with flexible column name matching
+        const totalC = Number(
+          row['total containers'] || 
+          row['totalcontainers'] || 
+          row['total_containers'] || 
+          row['containers'] || 
+          0
+        );
+        const totalP = Number(
+          row['total packages'] || 
+          row['totalpackages'] || 
+          row['total_packages'] || 
+          row['packages'] || 
+          0
+        );
+
+        // Skip unmanifested loads (these will be the ones we need to estimate)
+        // Only include manifested loads (with actual counts) for statistics
+        if (totalC === 0 || totalP === 0) continue;
+
+        const sortRoute = String(
+          row['sort/route'] || 
+          row['sort route'] || 
+          row['sortroute'] || 
+          row['route'] || 
+          ''
+        ).trim();
+
+        const loadType = String(
+          row['load type'] || 
+          row['loadtype'] || 
+          row['type'] || 
+          '__all'
+        ).trim();
+
+        const equipment = String(
+          row['equipment'] || 
+          row['equipment type'] || 
+          row['equipmenttype'] || 
+          '__all'
+        ).trim();
+
+        const equipShort = equipment.match(/\d{2}/) ? equipment.match(/\d{2}/)[0] : '__all';
+
+        if (!sortRoute) continue;
+
+        // Aggregate by route::loadType::equipment
+        const key = `${sortRoute}::${loadType}::${equipShort}`;
+        if (!stats[key]) stats[key] = { samples: [], n: 0 };
+        stats[key].samples.push({ c: totalC, p: totalP });
+        stats[key].n += 1;
+
+        // Also aggregate by route only (fallback)
+        if (!globalStats[sortRoute]) globalStats[sortRoute] = { samples: [], n: 0 };
+        globalStats[sortRoute].samples.push({ c: totalC, p: totalP });
+        globalStats[sortRoute].n += 1;
+      }
+
+      // Calculate averages and standard deviations
+      const result = {};
+      for (const [key, data] of Object.entries(stats)) {
+        if (!data.samples.length) continue;
+        const cs = data.samples.map(s => s.c);
+        const ps = data.samples.map(s => s.p);
+        const avgC = cs.reduce((a, b) => a + b, 0) / cs.length;
+        const avgP = ps.reduce((a, b) => a + b, 0) / ps.length;
+
+        const varC = cs.reduce((sum, c) => sum + Math.pow(c - avgC, 2), 0) / cs.length;
+        const varP = ps.reduce((sum, p) => sum + Math.pow(p - avgP, 2), 0) / ps.length;
+        const stdDevC = Math.sqrt(varC);
+        const stdDevP = Math.sqrt(varP);
+
+        result[key] = { n: data.n, avgC, avgP, stdDevC, stdDevP };
+      }
+
+      // Add global fallbacks
+      for (const [route, data] of Object.entries(globalStats)) {
+        if (!data.samples.length) continue;
+        const cs = data.samples.map(s => s.c);
+        const ps = data.samples.map(s => s.p);
+        const avgC = cs.reduce((a, b) => a + b, 0) / cs.length;
+        const avgP = ps.reduce((a, b) => a + b, 0) / ps.length;
+
+        const varC = cs.reduce((sum, c) => sum + Math.pow(c - avgC, 2), 0) / cs.length;
+        const varP = ps.reduce((sum, p) => sum + Math.pow(p - avgP, 2), 0) / ps.length;
+        const stdDevC = Math.sqrt(varC);
+        const stdDevP = Math.sqrt(varP);
+
+        const globalKey = `${route}::__all::__all`;
+        result[globalKey] = { n: data.n, avgC, avgP, stdDevC, stdDevP };
+      }
+
+      return result;
+    } catch (e) {
+      console.error("[SSP Util] buildCsvEstimates error:", e);
+      return {};
+    }
+  }
+
+  /**
+   * Import CSV data: parse, calculate statistics, and store.
+   */
+  function importInboundCsvEstimates(csvText) {
+    try {
+      const rows = parseInboundCsvData(csvText);
+      if (!rows.length) {
+        console.warn("[SSP Util] No valid rows in CSV");
+        return null;
+      }
+
+      const estimates = buildCsvEstimates(rows);
+      const result = {
+        ts: Date.now(),
+        nodeId: String(STATE.nodeId || '').trim(),
+        estimates: estimates,
+        rowsProcessed: rows.length,
+        uniqueRoutes: new Set(rows.map(r => r['sort/route'] || r['route'] || '').filter(r => r)).size,
+      };
+
+      STATE.ibCsvEstimates = result;
+      _ibCsvEstSaveToStorage(result);
+      console.log("[SSP Util] Inbound CSV estimates imported", {
+        rowsProcessed: rows.length,
+        estimatesBuckets: Object.keys(estimates).length,
+      });
+      return result;
+    } catch (e) {
+      console.error("[SSP Util] importInboundCsvEstimates error:", e);
+      return null;
+    }
+  }
+
+  /**
+   * Get estimate for a load using CSV-based statistics (with fallback to route averages).
+   * Lookup order: route::loadType::equipment -> route::__all::equipment -> route::__all::__all
+   */
+  function _ibCsvEstGet(sortRoute, loadType, equipment) {
+    try {
+      const cache = STATE.ibCsvEstimates || _ibCsvEstLoadFromStorage();
+      if (!cache || !cache.estimates) return null;
+
+      const est = cache.estimates;
+      const equipShort = equipment && equipment.match(/\d{2}/) ? equipment.match(/\d{2}/)[0] : '__all';
+      const lt = (loadType || '__all').trim();
+      const sr = (sortRoute || '').trim();
+
+      if (!sr) return null;
+
+      // Try specific combination first
+      const key1 = `${sr}::${lt}::${equipShort}`;
+      if (est[key1]) return est[key1];
+
+      // Fall back to route::__all::equipment
+      const key2 = `${sr}::__all::${equipShort}`;
+      if (est[key2]) return est[key2];
+
+      // Fall back to route::__all::__all
+      const key3 = `${sr}::__all::__all`;
+      if (est[key3]) return est[key3];
+
+      return null;
+    } catch { return null; }
+  }
+
   // Estimate for an inbound row. Returns { estC, estP, source } or null
-  function estimateInboundIfUnmanifested({ sortRoute, totalContainers, totalPackages, equipmentType }) {
+  function estimateInboundIfUnmanifested({ sortRoute, totalContainers, totalPackages, equipmentType, loadType }) {
     const c = Number(totalContainers) || 0;
     const p = Number(totalPackages) || 0;
     if (c > 0 || p > 0) return null; // already manifested
+
+    // Try CSV-based estimates first (higher priority)
+    const csvEst = _ibCsvEstGet(sortRoute, loadType, equipmentType);
+    if (csvEst && csvEst.n > 0) {
+      return {
+        estC: Math.round((csvEst.avgC || 0) * 10) / 10,
+        estP: Math.round(csvEst.avgP || 0),
+        source: `csv_${csvEst.n}`,
+      };
+    }
+
+    // Fall back to route averages from dock view
     const avg = _ibAvgGet(sortRoute, equipShort(equipmentType));
     if (!avg) return null;
     return {
@@ -1283,6 +1547,10 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
     diagMaxEvents: 250,
     diagMaxChars: 15000,
 
+    // Slack notifications
+    slackWebhookUrl: "",
+    slackEnabled: false,
+
   };
 
   function lsGet(key, fallback) {
@@ -1316,6 +1584,184 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
   }
   function persistPrefs() {
     lsSet(UI_PREFS_KEY, UI_PREFS);
+  }
+
+  /* =====================================================
+     SLACK NOTIFICATIONS MODULE
+  ====================================================== */
+  const SLACK_CONFIG = {
+    storageKey: "ssp2:slack-config",
+  };
+
+  function getSlackConfig() {
+    try {
+      return lsGet(SLACK_CONFIG.storageKey, { webhookUrl: "", enabled: false });
+    } catch {
+      return { webhookUrl: "", enabled: false };
+    }
+  }
+
+  function setSlackConfig(config) {
+    try {
+      lsSet(SLACK_CONFIG.storageKey, config);
+      SETTINGS.slackWebhookUrl = config.webhookUrl || "";
+      SETTINGS.slackEnabled = config.enabled || false;
+      persistSettings();
+    } catch {}
+  }
+
+  async function sendSlackMessage(message) {
+    try {
+      const config = getSlackConfig();
+      if (!config.webhookUrl) {
+        console.warn("[SSP Util] Slack webhook URL not configured");
+        return false;
+      }
+
+      const payload = {
+        text: message,
+        mrkdwn: true,
+        username: "SSP Util Bot",
+        icon_emoji: ":robot_face:",
+      };
+
+      const res = await fetch(config.webhookUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!res.ok) {
+        console.error("[SSP Util] Slack message failed:", res.status, res.statusText);
+        return false;
+      }
+
+      console.log("[SSP Util] Slack message sent successfully");
+      return true;
+    } catch (e) {
+      console.error("[SSP Util] Slack send error:", e);
+      return false;
+    }
+  }
+
+  function showSlackConfigModal() {
+    const config = getSlackConfig();
+    const modalId = "ssp-slack-config-modal-" + Math.random().toString(16).slice(2);
+    const modal = document.createElement("div");
+    modal.id = modalId;
+    modal.style.cssText = `
+      position:fixed;
+      top:50%;
+      left:50%;
+      transform:translate(-50%, -50%);
+      z-index:999999;
+      width:90%;
+      max-width:500px;
+      background:#fff;
+      border:2px solid #333;
+      border-radius:12px;
+      padding:20px;
+      box-shadow:0 10px 40px rgba(0,0,0,0.3);
+      font-family:Arial,sans-serif;
+      font-size:13px;
+    `;
+
+    modal.innerHTML = `
+      <div style="font-weight:900;font-size:16px;margin-bottom:15px">Slack Webhook Configuration</div>
+      <div style="margin-bottom:12px;">
+        <label style="display:block;margin-bottom:6px;font-weight:700">Webhook URL:</label>
+        <input type="password" id="slack-webhook-input" placeholder="https://hooks.slack.com/services/..." 
+          value="${config.webhookUrl}" 
+          style="width:100%;padding:8px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:12px;">
+      </div>
+      <div style="margin-bottom:15px;display:flex;align-items:center;gap:8px;">
+        <input type="checkbox" id="slack-enabled-check" ${config.enabled ? "checked" : ""} style="cursor:pointer;">
+        <label for="slack-enabled-check" style="cursor:pointer;font-weight:700">Enable Slack notifications</label>
+      </div>
+      <div style="color:#666;margin-bottom:15px;font-size:12px;">
+        <div style="margin-bottom:8px;"><strong>How to get a webhook URL:</strong></div>
+        <ol style="margin:0;padding-left:20px;">
+          <li>Go to <a href="https://api.slack.com/apps" target="_blank" style="color:#0066cc;text-decoration:underline;">api.slack.com/apps</a></li>
+          <li>Create a new app for your workspace</li>
+          <li>Enable "Incoming Webhooks"</li>
+          <li>Click "Add New Webhook to Workspace"</li>
+          <li>Copy the webhook URL and paste it above</li>
+        </ol>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:15px;">
+        <button id="slack-test-btn" style="padding:8px 14px;border-radius:6px;border:1px solid #d1d5db;background:#fff;cursor:pointer;font-weight:700;">
+          Test Message
+        </button>
+        <button id="slack-save-btn" style="padding:8px 14px;border-radius:6px;border:1px solid #333;background:#333;color:#fff;cursor:pointer;font-weight:700;">
+          Save
+        </button>
+        <button id="slack-cancel-btn" style="padding:8px 14px;border-radius:6px;border:1px solid #d1d5db;background:#f3f4f6;cursor:pointer;font-weight:700;">
+          Cancel
+        </button>
+      </div>
+    `;
+
+    document.body.appendChild(modal);
+
+    const closeModal = () => {
+      try { modal.remove(); } catch {}
+    };
+
+    const input = document.getElementById("slack-webhook-input");
+    const checkbox = document.getElementById("slack-enabled-check");
+    const testBtn = document.getElementById("slack-test-btn");
+    const saveBtn = document.getElementById("slack-save-btn");
+    const cancelBtn = document.getElementById("slack-cancel-btn");
+
+    testBtn.addEventListener("click", async () => {
+      const url = input.value.trim();
+      if (!url) {
+        alert("Please enter a webhook URL first");
+        return;
+      }
+      testBtn.disabled = true;
+      testBtn.textContent = "Sending...";
+      try {
+        const payload = {
+          text: "🧪 *SSP Util* – Test message from dashboard configuration",
+          mrkdwn: true,
+          username: "SSP Util Bot",
+          icon_emoji: ":robot_face:",
+        };
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (res.ok) {
+          alert("✅ Test message sent to Slack!");
+        } else {
+          alert(`❌ Failed: ${res.status} ${res.statusText}`);
+        }
+      } catch (e) {
+        alert(`❌ Error: ${String(e && e.message ? e.message : e)}`);
+      } finally {
+        testBtn.disabled = false;
+        testBtn.textContent = "Test Message";
+      }
+    });
+
+    saveBtn.addEventListener("click", () => {
+      const url = input.value.trim();
+      const enabled = checkbox.checked;
+      setSlackConfig({ webhookUrl: url, enabled });
+      alert("✅ Slack configuration saved!");
+      closeModal();
+    });
+
+    cancelBtn.addEventListener("click", closeModal);
+
+    // Close on background click
+    modal.addEventListener("click", (e) => {
+      if (e.target === modal) closeModal();
+    });
   }
 
   /* =====================================================
@@ -5421,10 +5867,21 @@ function ensurePanel() {
           <button id="show-error">Last Error</button>
           <button id="csv-ib">CSV XD Graph</button>
           <button id="csv-ib4">CSV IB4CPT</button>
+          <button id="csv-import-est">📊 Import 2wk CSV</button>
+          <button id="slack-config-btn" style="margin-left:auto;">📤 Slack</button>
+        </div>
+
+        <div id="csv-import-container" style="margin-top:8px;display:none;flex-direction:column;gap:8px;padding:8px;background:#f9f9f9;border:1px solid #e5e7eb;border-radius:6px">
+          <textarea id="csv-import-textarea" placeholder="Paste CSV data here (2-week SSP inbound export)" style="width:100%;height:120px;padding:6px;font-family:monospace;font-size:11px;border:1px solid #ccc;border-radius:4px;resize:vertical"></textarea>
+          <div style="display:flex;gap:6px">
+            <button id="csv-import-paste" style="flex:1">Import CSV</button>
+            <button id="csv-import-cancel" style="flex:1">Cancel</button>
+          </div>
+          <div id="csv-import-status" style="font-size:11px;color:#666;white-space:nowrap"></div>
         </div>
 
         <div style="margin-top:8px;color:#555">
-          Overlay: <span id="ov-stat"></span> | Last: <span id="last-stat">—</span>
+          Overlay: <span id="ov-stat"></span> | Last: <span id="last-stat">—</span> | Est: <span id="csv-est-stat">—</span>
         </div>
       </div>
     `;
@@ -5475,6 +5932,81 @@ function ensurePanel() {
     // CSV buttons are moved into the Planning Panel. Keep logic here (for reuse) but hide from Action Panel UI.
     if (csvIb4) csvIb4.style.display = "none";
 
+    // Slack notifications button
+    const slackConfigBtn = document.getElementById("slack-config-btn");
+    if (slackConfigBtn) {
+      slackConfigBtn.onclick = () => {
+        showSlackConfigModal();
+      };
+    }
+
+    // CSV Import Estimation Handler
+    const csvImportBtn = document.getElementById("csv-import-est");
+    const csvImportContainer = document.getElementById("csv-import-container");
+    const csvImportTextarea = document.getElementById("csv-import-textarea");
+    const csvImportPaste = document.getElementById("csv-import-paste");
+    const csvImportCancel = document.getElementById("csv-import-cancel");
+    const csvImportStatus = document.getElementById("csv-import-status");
+    const csvEstStat = document.getElementById("csv-est-stat");
+
+    if (csvImportBtn) {
+      csvImportBtn.onclick = () => {
+        if (csvImportContainer.style.display === "none") {
+          csvImportContainer.style.display = "flex";
+          csvImportTextarea.focus();
+        } else {
+          csvImportContainer.style.display = "none";
+        }
+      };
+    }
+
+    if (csvImportCancel) {
+      csvImportCancel.onclick = () => {
+        csvImportContainer.style.display = "none";
+        csvImportTextarea.value = "";
+        csvImportStatus.textContent = "";
+      };
+    }
+
+    if (csvImportPaste) {
+      csvImportPaste.onclick = () => {
+        try {
+          const csvText = csvImportTextarea.value.trim();
+          if (!csvText) {
+            csvImportStatus.textContent = "❌ Paste CSV data first";
+            return;
+          }
+
+          csvImportStatus.textContent = "⏳ Processing...";
+          
+          // Call the import function (defined in IB_CSV_EST section)
+          const result = importInboundCsvEstimates(csvText);
+          
+          if (result) {
+            csvImportStatus.textContent = `✅ Imported ${result.rowsProcessed} rows, ${result.estimatesBuckets || Object.keys(result.estimates || {}).length} estimate buckets`;
+            csvEstStat.textContent = `CSV loaded`;
+            setTimeout(() => {
+              csvImportContainer.style.display = "none";
+              csvImportTextarea.value = "";
+              csvImportStatus.textContent = "";
+            }, 2000);
+          } else {
+            csvImportStatus.textContent = "❌ Import failed. Check console.";
+          }
+        } catch (e) {
+          csvImportStatus.textContent = `❌ Error: ${String(e).substring(0, 40)}`;
+          console.error("[SSP Util] CSV import error:", e);
+        }
+      };
+    }
+
+    // Display current CSV estimate status on load
+    try {
+      const existing = STATE.ibCsvEstimates || _ibCsvEstLoadFromStorage();
+      if (existing && existing.estimates && Object.keys(existing.estimates).length > 0) {
+        csvEstStat.textContent = `CSV loaded (${Object.keys(existing.estimates).length} buckets)`;
+      }
+    } catch (_) {}
 
     // Drag
     const hdr = p.querySelector("#ssp2-panelhdr");
@@ -7272,18 +7804,24 @@ function _sspRelayCache() {
   return window.__SSP_RELAY_CACHE__;
 }
 
-async function _sspRelayGetDetail(vrid) {
+async function _sspRelayGetDetail(vrid, opts = {}) {
   const v = String(vrid||"").trim();
   if (!v) return null;
+  const allowFmcFallback = opts && opts.allowFmcFallback === false ? false : true;
   const key = `NA:VR:${v}`;
   const cache = _sspRelayCache();
   const now = Date.now();
   const hit = cache[v] && cache[v].detail && (now - (cache[v].tDetail||0) < 60_000);
-  if (hit) return cache[v].detail;
+  if (hit) {
+    const src = String(cache[v]?.detail?.__sspSource || "").toUpperCase();
+    if (!allowFmcFallback && src === "FMC") throw new Error("Relay detail unavailable (cached FMC fallback).");
+    return cache[v].detail;
+  }
 
   // Prefer track.relay.amazon.dev when accessible; fallback to FMC if unauthorized.
   // If we ever see 401/403 from track.relay, permanently disable it for the session.
   if (window.__SSP_DISABLE_TRACK_RELAY__ === true) {
+    if (!allowFmcFallback) throw new Error("Relay detail unavailable (Track blocked).");
     const obj = await _sspFmcGetExecutionById(v);
     cache[v] = cache[v] || {};
     cache[v].detail = obj;
@@ -7315,6 +7853,7 @@ async function _sspRelayGetDetail(vrid) {
       // If we have an auth token and still get 401/403, assume Track is blocked for this session.
       // (If no token exists, we should have hit NO_TRACK_AUTH above.)
       window.__SSP_DISABLE_TRACK_RELAY__ = true;
+      if (!allowFmcFallback) throw new Error("Relay detail blocked (track HTTP 401/403).");
       try {
         const obj = await _sspFmcGetExecutionById(v);
         cache[v] = cache[v] || {};
@@ -8874,11 +9413,22 @@ document.body.appendChild(p);
           const { C, P, missing } = getCounts(l);
 
           const k = `${shiftName}||${hb}||${sb}`;
-          const r = agg.get(k) || { shift: shiftName, hourBucket: hb, statusBucket: sb, loads: 0, carts: 0, packages: 0, missingCounts: 0 };
+          const r = agg.get(k) || { shift: shiftName, hourBucket: hb, statusBucket: sb, loads: 0, carts: 0, packages: 0, missingCounts: 0, disruptedVrids: [] };
           r.loads += 1;
           r.carts += (C || 0);
           r.packages += (P || 0);
           if (missing) r.missingCounts += 1;
+
+          // Check for disruptions for this load
+          const lane = String(l?.route || l?.lane || "");
+          const cptMs = t - (t % (60 * 60 * 1000)); // Start of hour
+          const disruptionsList = (typeof computeDisruptionsForLaneCpt === "function") ? computeDisruptionsForLaneCpt(lane, cptMs) : [];
+          const vrid = String(l?.vrId || l?.vrid || "");
+          const hasDisruption = disruptionsList.some(d => String(d?.vrid || "") === vrid);
+          if (hasDisruption && !r.disruptedVrids.includes(vrid)) {
+            r.disruptedVrids.push(vrid);
+          }
+
           agg.set(k, r);
         }
 
@@ -8889,19 +9439,40 @@ document.body.appendChild(p);
         const byHour = new Map(); // shift||hour -> total row
         for (const r of rows) {
           const hk = `${r.shift}||${r.hourBucket}`;
-          const t = byHour.get(hk) || { shift: r.shift, hourBucket: r.hourBucket, statusBucket: 'SUM_HOUR', loads: 0, carts: 0, packages: 0, missingCounts: 0 };
+          const t = byHour.get(hk) || { shift: r.shift, hourBucket: r.hourBucket, statusBucket: 'SUM_HOUR', loads: 0, carts: 0, packages: 0, missingCounts: 0, disruptedVrids: [] };
           t.loads += Number(r.loads || 0);
           t.carts += Number(r.carts || 0);
           t.packages += Number(r.packages || 0);
           t.missingCounts += Number(r.missingCounts || 0);
+          // Aggregate disrupted VRIDs across status buckets for this hour
+          for (const vrid of (r.disruptedVrids || [])) {
+            if (!t.disruptedVrids.includes(vrid)) {
+              t.disruptedVrids.push(vrid);
+            }
+          }
           byHour.set(hk, t);
         }
 
+        // Format disruptions column for each row
+        const formatDisruptions = (vrids) => {
+          if (!vrids || vrids.length === 0) return "";
+          return `${vrids.length} (${vrids.join(", ")})`;
+        };
+
         const exportRows = rows.concat(
           Array.from(byHour.values()).sort((a,b) => String(a.shift).localeCompare(String(b.shift)) || String(a.hourBucket).localeCompare(String(b.hourBucket)))
-        );
+        ).map(r => ({
+          shift: r.shift,
+          hourBucket: r.hourBucket,
+          statusBucket: r.statusBucket,
+          loads: r.loads,
+          carts: r.carts,
+          packages: r.packages,
+          missingCounts: r.missingCounts,
+          disruptions: formatDisruptions(r.disruptedVrids)
+        }));
 
-        const headers = ["shift","hourBucket","statusBucket","loads","carts","packages","missingCounts"];
+        const headers = ["shift","hourBucket","statusBucket","loads","carts","packages","missingCounts","disruptions"];
 
         downloadTextFile(
           `XD_GRAPH_${STATE.nodeId || "NODE"}_${new Date().toISOString().slice(0,10)}.csv`,
@@ -10979,8 +11550,8 @@ function ensureMergePanel() {
 
 // --- Disruptions (Inbound + Outbound) ---
 // Inbound disruptions: derived from inbound VRIDs that contribute to a given lane+CPT (STATE.ibContribByLaneCpt).
-// Outbound disruptions: derived from outbound VRIDs visible in the Action Panel grouping (STATE.actionGroups),
-// with driver timing hydrated via FMC (execution load API) and case presence via FMC case search.
+// Outbound disruptions for panel rendering are Relay-only (transport-view search + detail disruptions).
+// Legacy FMC outbound helpers remain below for non-panel tooling.
 const OUTBOUND_LATE_THRESHOLD_MIN = 15;
 
 function computeDisruptionsForLaneCpt(laneKey, cptMs) {
@@ -11149,8 +11720,216 @@ function computeDisruptionsAll() {
   }
 }
 
+function _sspRelaySeverityScore(v) {
+  const s = String(v || "").trim().toUpperCase();
+  if (s === "HIGH" || s === "CRITICAL" || s === "SEV1") return 3;
+  if (s === "MEDIUM" || s === "SEV2") return 2;
+  if (s === "LOW" || s === "SEV3") return 1;
+  return 0;
+}
+
+function _sspRelayPanelErrorText(err) {
+  const msg = String((err && err.message) || err || "").trim();
+  if (/NO_TRACK_AUTH|Track auth|needs Track auth/i.test(msg)) {
+    return "Relay unavailable: authentication required. Open Relay Track, open a VRID, then retry.";
+  }
+  if (/401|403|forbidden|unauthor/i.test(msg)) {
+    return "Relay unavailable: access expired or blocked. Open Relay Track, reconnect, then retry.";
+  }
+  return "Relay unavailable right now. Open Relay Track, reconnect, and retry.";
+}
+
+function _sspRelayPanelUnavailableHtml(err, panelLabel) {
+  const safe = (s) => String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const label = String(panelLabel || "Relay panel");
+  const msg = _sspRelayPanelErrorText(err);
+  const raw = String((err && err.message) || err || "").trim();
+  return `
+    <div style="padding:12px;border:1px solid #fecaca;border-radius:12px;background:#fef2f2;color:#7f1d1d;">
+      <div style="font-weight:900;">${safe(label)}: Relay unavailable</div>
+      <div style="margin-top:6px;font-weight:700;">${safe(msg)}</div>
+      <div style="margin-top:6px;color:#991b1b;font-size:12px;">Retry steps: open Relay Track, refresh auth/session, then reopen this panel.</div>
+      ${raw ? `<div style="margin-top:6px;color:#b91c1c;font-size:11px;">Details: ${safe(raw.slice(0, 240))}</div>` : ""}
+    </div>
+  `;
+}
+
+async function _sspRelayBuildOutboundDisruptionsForPanel(laneKey, cptMs) {
+  const contexts = [];
+  if (String(laneKey || "") === "__ALL__") {
+    const groups = (STATE.actionGroups && STATE.actionGroups.values) ? Array.from(STATE.actionGroups.values()) : [];
+    for (const g of groups) {
+      const lane = String(g?.lane || "").trim();
+      const cpt = Number(g?.cptMs || 0);
+      if (!lane) continue;
+      contexts.push({ laneKey: lane, cptMs: cpt });
+    }
+  } else {
+    contexts.push({ laneKey: String(laneKey || "").trim(), cptMs: Number(cptMs || 0) });
+  }
+
+  const uniqCtx = [];
+  const seenCtx = new Set();
+  for (const c of contexts) {
+    const k = `${c.laneKey}::${String(c.cptMs || 0)}`;
+    if (!c.laneKey || seenCtx.has(k)) continue;
+    seenCtx.add(k);
+    uniqCtx.push(c);
+  }
+
+  const byVrid = new Map();
+  let firstErr = null;
+  let relayHitCount = 0;
+
+  const vridFrom = (o) => String(o?.vrid || o?.vrId || o?.vehicleRunId || o?.id || o?.qualifiedVrid || o?.qualifiedId || "").trim();
+  const laneFrom = (o, fallbackLane) => {
+    const lane = String(
+      o?.lane ||
+      o?.laneKey ||
+      o?.route ||
+      o?.laneRoute ||
+      (Array.isArray(o?.lanes) && o.lanes.length ? o.lanes[o.lanes.length - 1] : "") ||
+      ""
+    ).trim();
+    return lane || String(fallbackLane || "Unknown");
+  };
+  const scheduledFrom = (o, cptValue) =>
+    _msFromAny(
+      o?.scheduledArrivalTime ??
+      o?.scheduledTime ??
+      o?.scheduledEnd ??
+      o?.scheduledStart ??
+      o?.criticalPullTime ??
+      o?.effectiveEnd ??
+      o?.effectiveStart ??
+      cptValue
+    );
+  const minutesFromDisruption = (d) => {
+    const n = Number(
+      d?.minutes ??
+      d?.minutesLate ??
+      d?.delayMinutes ??
+      d?.etaSlipMinutes ??
+      d?.impactMinutes ??
+      d?.impact?.minutes ??
+      d?.latenessMinutes ??
+      0
+    );
+    return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+  };
+  const pickTopDisruption = (arr) => {
+    const rows = Array.isArray(arr) ? arr.filter((x) => x && typeof x === "object") : [];
+    if (!rows.length) return null;
+    rows.sort((a, b) =>
+      (_sspRelaySeverityScore(b?.severity) - _sspRelaySeverityScore(a?.severity)) ||
+      (minutesFromDisruption(b) - minutesFromDisruption(a))
+    );
+    return rows[0] || null;
+  };
+
+  for (const ctx of uniqCtx) {
+    const lane = String(ctx.laneKey || "").trim();
+    const cpt = Number(ctx.cptMs || 0);
+    const laneToken = (lane.split("-")[0] || lane).trim();
+    const anchor = cpt || Date.now();
+    const startMs = anchor - 12 * 60 * 60 * 1000;
+    const endMs = anchor + 6 * 60 * 60 * 1000;
+    const restrictVrids = (String(laneKey || "") === "__ALL__")
+      ? null
+      : new Set(getFilteredOutboundVridsForLaneCpt(lane, cpt, { debugKey: "relay-disruptions-panel" }));
+
+    let items = [];
+    try {
+      items = await _sspRelaySearchTransportViews(laneToken, startMs, endMs);
+      relayHitCount += 1;
+    } catch (e) {
+      if (!firstErr) firstErr = e;
+      continue;
+    }
+    if (!Array.isArray(items) || !items.length) continue;
+
+    const metaByVrid = new Map();
+    const needDetails = [];
+    for (const it of items.slice(0, 260)) {
+      const vrid = vridFrom(it);
+      if (!vrid) continue;
+      if (restrictVrids && restrictVrids.size && !restrictVrids.has(vrid)) continue;
+      const entry = {
+        vrid,
+        laneKey: laneFrom(it, lane),
+        cptMs: cpt || 0,
+        scheduledMs: scheduledFrom(it, cpt) || null,
+        containers: Number(it?.containers || it?.cntrsLeft || 0) || null,
+        packages: Number(it?.packages || it?.pkgCount || 0) || null,
+        disruptions: Array.isArray(it?.disruptions) ? it.disruptions : null,
+      };
+      metaByVrid.set(vrid, entry);
+      if (entry.disruptions === null) needDetails.push(vrid);
+    }
+
+    for (const vrid of needDetails.slice(0, 80)) {
+      try {
+        const detail = await _sspRelayGetDetail(vrid, { allowFmcFallback: false });
+        const rec = metaByVrid.get(vrid);
+        if (rec) rec.disruptions = _sspRelayExtractDisruptions(detail) || [];
+      } catch (e) {
+        if (!firstErr) firstErr = e;
+        const rec = metaByVrid.get(vrid);
+        if (rec) rec.disruptions = [];
+      }
+    }
+
+    for (const rec of metaByVrid.values()) {
+      const disruptions = Array.isArray(rec.disruptions) ? rec.disruptions : [];
+      if (!disruptions.length) continue;
+      const top = pickTopDisruption(disruptions);
+      const candidate = {
+        vrid: rec.vrid,
+        laneKey: rec.laneKey || lane,
+        cptMs: rec.cptMs || cpt || 0,
+        scheduledMs: rec.scheduledMs || null,
+        containers: rec.containers,
+        packages: rec.packages,
+        kind: String(top?.type || top?.disruptionType || top?.id || "Disruption"),
+        severity: String(top?.severity || "UNKNOWN"),
+        status: String(top?.status || top?.state || top?.disposition || ""),
+        minutes: minutesFromDisruption(top),
+        disruptionCount: disruptions.length,
+      };
+      const cur = byVrid.get(candidate.vrid);
+      if (!cur) {
+        byVrid.set(candidate.vrid, candidate);
+        continue;
+      }
+      const curScore = _sspRelaySeverityScore(cur.severity);
+      const nextScore = _sspRelaySeverityScore(candidate.severity);
+      if (
+        nextScore > curScore ||
+        (nextScore === curScore && Number(candidate.minutes || 0) > Number(cur.minutes || 0))
+      ) {
+        byVrid.set(candidate.vrid, { ...cur, ...candidate });
+      } else {
+        // Keep max disruption count and earliest schedule while preserving stronger severity row.
+        cur.disruptionCount = Math.max(Number(cur.disruptionCount || 0), Number(candidate.disruptionCount || 0));
+        if (!cur.scheduledMs || (candidate.scheduledMs && candidate.scheduledMs < cur.scheduledMs)) cur.scheduledMs = candidate.scheduledMs;
+      }
+    }
+  }
+
+  const rows = Array.from(byVrid.values());
+  rows.sort((a, b) =>
+    (_sspRelaySeverityScore(b.severity) - _sspRelaySeverityScore(a.severity)) ||
+    (Number(b.minutes || 0) - Number(a.minutes || 0)) ||
+    (Number(a.scheduledMs || 0) - Number(b.scheduledMs || 0)) ||
+    String(a.vrid || "").localeCompare(String(b.vrid || ""))
+  );
+
+  return { rows, error: firstErr, relayHitCount };
+}
+
 // Aggregate outbound disruptions for all lanes currently in the Action Panel.
 // NOTE: This may trigger FMC calls for unique VRIDs; we cap to avoid runaway requests.
+// TODO(relay-cutover-panels-only): retained for non-panel workflows. Remove when broader FMC deprecation is approved.
 async function computeOutboundDisruptionsAll() {
   try {
     const groups = (STATE.actionGroups && STATE.actionGroups.values) ? Array.from(STATE.actionGroups.values()) : [];
@@ -11463,6 +12242,7 @@ function _fmcCaseUiUrls(caseId) {
 }
 
 async function computeOutboundCasesForLaneCpt(laneKey, cptMs) {
+  // TODO(relay-cutover-panels-only): legacy FMC case aggregation kept for non-panel tooling; outside current scope.
   try {
     const cacheKey = `obCases:${String(laneKey || "")}:${Number(cptMs || 0)}`;
     STATE.__obCasesCache = STATE.__obCasesCache || {};
@@ -11648,6 +12428,7 @@ function ensureCasesPanel() {
 }
 
 async function openCasesPanel(laneKey, cptMs) {
+  // TODO(relay-cutover-panels-only): legacy FMC-oriented panel retained for compatibility; lane UI routes to openRelayCasesPanel.
   try { ensureCasesPanel(); } catch (_) {}
   const overlay = document.getElementById("ssp-cases-overlay");
   const subEl = document.getElementById("ssp-cases-subtitle");
@@ -11664,7 +12445,7 @@ async function openCasesPanel(laneKey, cptMs) {
   const rows = await computeOutboundCasesForLaneCpt(laneKey, cptMs);
 
   if (!rows || !rows.length) {
-    body.innerHTML = `<div style="padding:10px;color:#6b7280;">No cases found for this lane/CPT (based on FMC case search).</div>`;
+    body.innerHTML = `<div style="padding:10px;color:#6b7280;">No cases found for this lane/CPT.</div>`;
     return;
   }
 
@@ -11751,6 +12532,7 @@ async function openCasesPanel(laneKey, cptMs) {
 
 
 async function computeOutboundDisruptionsForLaneCpt(laneKey, cptMs) {
+  // TODO(relay-cutover-panels-only): retained for non-panel workflows. Remove when broader FMC deprecation is approved.
   try {
     const g = _getActionGroup(laneKey, cptMs);
     const vs = (g && g.vrids) ? g.vrids : [];
@@ -11832,40 +12614,17 @@ async function openDisruptionsPanel(laneKey, cptMs) {
   // initial shell
   body.innerHTML = `
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
-      <div style="font-weight:800;color:#6b7280;font-size:12px;">Filter:</div>
-      <button id="ssp-disrupt-filter-ob" style="padding:6px 10px;border-radius:999px;border:1px solid #d1d5db;background:#111827;color:#fff;cursor:pointer;font-weight:900;">OB</button>
-      <button id="ssp-disrupt-filter-ib" style="padding:6px 10px;border-radius:999px;border:1px solid #d1d5db;background:#111827;color:#fff;cursor:pointer;font-weight:900;">IB</button>
+      <div style="font-weight:900;color:#111827;">Inbound + Outbound disruptions</div>
       <div style="flex:1"></div>
       <div style="color:#6b7280;font-weight:800;font-size:12px;">Threshold: &gt;${OUTBOUND_LATE_THRESHOLD_MIN}m late (Outbound)</div>
     </div>
     <div id="ssp-disrupt-all"></div>
     <div style="margin-top:8px;color:#6b7280;font-size:11px;">
-      Outbound: FMC execution load + case search. Inbound: SSP inbound contrib (IB4CPT) + arrival/ETA slip.
+      Outbound: Relay transport-view search + detail disruptions. Inbound: SSP inbound contrib (IB4CPT) + arrival/ETA slip.
     </div>
   `;
 
   const allBox = body.querySelector("#ssp-disrupt-all");
-  const btnFob = body.querySelector("#ssp-disrupt-filter-ob");
-  const btnFib = body.querySelector("#ssp-disrupt-filter-ib");
-
-  // Filters: both on by default.
-  STATE.__disruptFilter = STATE.__disruptFilter || { ob: true, ib: true };
-
-  const syncFilterButtons = (obCount, ibCount) => {
-    const f = STATE.__disruptFilter || { ob: true, ib: true };
-    const onBg = "#111827", offBg = "#fff";
-    const onFg = "#fff", offFg = "#111827";
-    if (btnFob) {
-      btnFob.textContent = `OB (${Number(obCount || 0)})`;
-      btnFob.style.background = f.ob ? onBg : offBg;
-      btnFob.style.color = f.ob ? onFg : offFg;
-    }
-    if (btnFib) {
-      btnFib.textContent = `IB (${Number(ibCount || 0)})`;
-      btnFib.style.background = f.ib ? onBg : offBg;
-      btnFib.style.color = f.ib ? onFg : offFg;
-    }
-  };
 
   const esc = (s) =>
     String(s ?? "")
@@ -11897,22 +12656,21 @@ async function openDisruptionsPanel(laneKey, cptMs) {
     inboundRows = [];
   }
 
+  let outboundErr = null;
   try {
-    outboundRows = __all
-      ? (await computeOutboundDisruptionsAll())
-      : (await computeOutboundDisruptionsForLaneCpt(laneKey, cptMs));
-  } catch (_) {
+    const relayOut = await _sspRelayBuildOutboundDisruptionsForPanel(laneKey, cptMs);
+    outboundRows = relayOut?.rows || [];
+    outboundErr = relayOut?.error || null;
+  } catch (e) {
     outboundRows = [];
+    outboundErr = e || new Error("Relay outbound disruptions unavailable");
   }
 
   const renderAll = () => {
     if (!allBox) return;
-    const f = STATE.__disruptFilter || { ob: true, ib: true };
-
-    syncFilterButtons((outboundRows || []).length, (inboundRows || []).length);
 
     // Build inbound column (show all inbound disruptions)
-    const inboundHtml = (f.ib && inboundRows && inboundRows.length)
+    const inboundHtml = (inboundRows && inboundRows.length)
       ? (`<div style="font-weight:900;margin-bottom:6px;">Inbound (${inboundRows.length})</div>` + inboundRows.map((r, i) => {
           const vr = esc(r.vrid || "");
           const sched = r.scheduledMs ? fmtTime(r.scheduledMs) : "—";
@@ -11934,7 +12692,7 @@ async function openDisruptionsPanel(laneKey, cptMs) {
 
     // Build outbound grouped-by-lane column
     let outboundHtml = "";
-    if (f.ob && outboundRows && outboundRows.length) {
+    if (outboundRows && outboundRows.length) {
       // Group by laneKey
       const lm = new Map();
       for (const r of outboundRows) {
@@ -11965,6 +12723,8 @@ async function openDisruptionsPanel(laneKey, cptMs) {
         }).join("");
         return `<div style="margin-bottom:12px;padding:10px;border-radius:10px;background:#f9fafb;border:1px solid #eef2ff;">${laneHeader}${vrs}</div>`;
       }).join("");
+    } else if ((typeof _sspGetTrackAuthHeader === "function" && !_sspGetTrackAuthHeader()) || outboundErr) {
+      outboundHtml = _sspRelayPanelUnavailableHtml(outboundErr || new Error("NO_TRACK_AUTH"), "Outbound disruptions");
     } else {
       outboundHtml = `<div style="color:#6b7280;padding:10px;border-radius:8px;">No outbound disruptions</div>`;
     }
@@ -11995,22 +12755,6 @@ async function openDisruptionsPanel(laneKey, cptMs) {
     });
   };
 
-  // Filter button wiring
-  if (btnFob) btnFob.addEventListener("click", () => {
-    const f = STATE.__disruptFilter || { ob: true, ib: true };
-    f.ob = !f.ob;
-    if (!f.ob && !f.ib) f.ib = true;
-    STATE.__disruptFilter = f;
-    renderAll();
-  });
-  if (btnFib) btnFib.addEventListener("click", () => {
-    const f = STATE.__disruptFilter || { ob: true, ib: true };
-    f.ib = !f.ib;
-    if (!f.ob && !f.ib) f.ob = true;
-    STATE.__disruptFilter = f;
-    renderAll();
-  });
-
   renderAll();
 }
 
@@ -12023,7 +12767,7 @@ function ensureDisruptionsPanel() {
 
   const panel = document.createElement("div");
   panel.id = "ssp-disrupt-panel";
-  panel.style.cssText = "width:min(980px,94vw);max-height:90vh;background:#fff;border-radius:14px;border:1px solid #e5e7eb;box-shadow:0 20px 70px rgba(0,0,0,.25);overflow:hidden;";
+  panel.style.cssText = "width:min(1280px,96vw);max-height:90vh;background:#fff;border-radius:14px;border:1px solid #e5e7eb;box-shadow:0 20px 70px rgba(0,0,0,.25);overflow:hidden;";
 
   panel.innerHTML = `
     <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid #e5e7eb;">
@@ -13724,7 +14468,7 @@ async function openRelayCasesPanel(laneKey, cptMs) {
   for (let i = 0; i < max; i++) {
     const vrid = vrids[i];
     let detail = null;
-    try { detail = await _sspRelayGetDetail(vrid); } catch (_) { detail = null; }
+    try { detail = await _sspRelayGetDetail(vrid, { allowFmcFallback: false }); } catch (_) { detail = null; }
     if (!detail) continue;
     let cases = [];
     try { cases = _sspRelayExtractCases(detail) || []; } catch (_) { cases = []; }
@@ -13880,7 +14624,7 @@ async function openRelayCasesPanel(laneKey, cptMs) {
       body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Loading case details…</div>`;
 
       let detail = null;
-      try { detail = (typeof _sspRelayGetDetail === "function") ? await _sspRelayGetDetail(v) : null; } catch (_) { detail = null; }
+      try { detail = (typeof _sspRelayGetDetail === "function") ? await _sspRelayGetDetail(v, { allowFmcFallback: false }) : null; } catch (_) { detail = null; }
       if (!detail) {
         body.innerHTML = `<div style="padding:10px;color:#6b7280;">Unable to load Relay detail for ${_esc(v)}.</div>`;
         return;
@@ -14184,7 +14928,7 @@ async function openRelayCasesPanel(laneKey, cptMs) {
         const vs=(group&&group.vrids)?group.vrids:[];
         const vrids=vs.map(v=>String(v?.vrid||v?.vrId||'').trim()).filter(Boolean).slice(0,80);
         await mapLimit(vrids, 6, async (vrid)=>{
-          const d=await _sspRelayGetDetail(vrid);
+          const d=await _sspRelayGetDetail(vrid, { allowFmcFallback: false });
           const stubs=extractCaseStubs(d);
           if (!stubs.length) return;
           vridToCaseIds.set(vrid, stubs.map(s=>String(s.caseId)));
@@ -14287,6 +15031,317 @@ async function openRelayCasesPanel(laneKey, cptMs) {
         });
       });
     };
+
+    // Final override: render lane cases as a sortable kanban board.
+	    window.openRelayCasesPanel = async function(laneKey, cptMs){
+	      try { if (typeof ensureCasesPanel === "function") ensureCasesPanel(); } catch (_) {}
+	      const overlay = document.getElementById("ssp-cases-overlay");
+	      const subEl = document.getElementById("ssp-cases-subtitle");
+	      const body = document.getElementById("ssp-cases-body");
+      if (!overlay || !body) return;
+
+	      const laneLabel = String(laneKey || "-");
+	      const cptLabel = cptMs ? (typeof fmtTime === "function" ? fmtTime(Number(cptMs || 0)) : "") : "";
+	      if (subEl) subEl.textContent = cptLabel ? `${laneLabel} (CPT ${cptLabel})` : laneLabel;
+	      overlay.style.display = "flex";
+	      body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Loading lane cases from Relay...</div>`;
+	      const showRelayUnavailable = (err) => {
+	        try { STATE.__relayPanelLastError = String((err && err.message) || err || ""); } catch (_) {}
+	        body.innerHTML = _sspRelayPanelUnavailableHtml(err, "Cases");
+	      };
+	      if (typeof _sspGetTrackAuthHeader === "function" && !_sspGetTrackAuthHeader()) {
+	        showRelayUnavailable(new Error("NO_TRACK_AUTH"));
+	        return;
+	      }
+
+	      let rows = [];
+	      let rowsErr = null;
+	      try { rows = await searchLaneViews(laneKey, cptMs); } catch (e) { rows = []; rowsErr = e; }
+
+      const laneFallback = laneBase(laneKey) || String(laneKey || "").trim() || "Unknown";
+      const vridToCaseIds = new Map();
+      const caseIdToVrids = new Map();
+      const vridToLane = new Map();
+
+      const laneFromRow = (r) => {
+        const lane = String(
+          r?.lane ||
+          r?.laneKey ||
+          r?.route ||
+          r?.laneRoute ||
+          (Array.isArray(r?.lanes) && r.lanes.length ? r.lanes[r.lanes.length - 1] : "") ||
+          ""
+        ).trim();
+        return lane || laneFallback;
+      };
+
+      const registerCase = (vrid, caseId, laneLabelValue) => {
+        const v = String(vrid || "").trim();
+        const id = String(caseId || "").replace(/^NA:CASE:/, "").trim();
+        if (!v || !id) return;
+
+        if (!vridToCaseIds.has(v)) vridToCaseIds.set(v, []);
+        const ids = vridToCaseIds.get(v);
+        if (!ids.includes(id)) ids.push(id);
+
+        if (!caseIdToVrids.has(id)) caseIdToVrids.set(id, []);
+        const list = caseIdToVrids.get(id);
+        if (!list.includes(v)) list.push(v);
+
+        if (!vridToLane.has(v)) vridToLane.set(v, String(laneLabelValue || laneFallback || "Unknown").trim() || "Unknown");
+      };
+
+      for (const r of rows) {
+        const vrid = vridFromRow(r);
+        if (!vrid) continue;
+        const stubs = extractCaseStubs(r);
+        if (!stubs.length) continue;
+        const lane = laneFromRow(r);
+        stubs.forEach((s) => registerCase(vrid, s.caseId, lane));
+      }
+
+	      let detailErr = null;
+	      if (caseIdToVrids.size === 0 && typeof _getActionGroup === "function" && typeof _sspRelayGetDetail === "function") {
+	        let group = null;
+	        try { group = _getActionGroup(laneKey, cptMs); } catch (_) { group = null; }
+	        const vrids = ((group && group.vrids) ? group.vrids : [])
+	          .map(v => String(v?.vrid || v?.vrId || "").trim())
+	          .filter(Boolean)
+	          .slice(0, 80);
+	        await mapLimit(vrids, 6, async (vrid) => {
+	          if (!vridToLane.has(vrid)) vridToLane.set(vrid, laneFallback);
+	          let d = null;
+	          try {
+	            d = await _sspRelayGetDetail(vrid, { allowFmcFallback: false });
+	          } catch (e) {
+	            if (!detailErr) detailErr = e;
+	            return;
+	          }
+	          const stubs = extractCaseStubs(d);
+	          if (!stubs.length) return;
+	          stubs.forEach((s) => registerCase(vrid, s.caseId, laneFallback));
+	        });
+	      }
+	      if (caseIdToVrids.size === 0 && (rowsErr || detailErr)) {
+	        showRelayUnavailable(detailErr || rowsErr);
+	        return;
+	      }
+
+	      const vrids = Array.from(vridToCaseIds.keys());
+	      if (!vrids.length) {
+	        if (rowsErr || detailErr) {
+	          showRelayUnavailable(detailErr || rowsErr);
+	        } else {
+	          body.innerHTML = `<div style="padding:10px;color:#6b7280;">No cases found for this lane.</div>`;
+	        }
+	        return;
+	      }
+
+      const uniq = Array.from(caseIdToVrids.keys());
+      body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Fetching ${uniq.length} case(s)...</div>`;
+
+      const issueRows = await mapLimit(uniq, 6, fetchIssueCase);
+      const byId = new Map();
+      issueRows.forEach((ir) => { if (!ir) return; const s = sumIssue(ir); if (s.id) byId.set(String(s.id), s); });
+
+      const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+      const sortChoices = [
+        { id: "status_type_lane", label: "Status -> Type -> Lane", keys: ["status", "type", "lane"] },
+        { id: "type_status_lane", label: "Type -> Status -> Lane", keys: ["type", "status", "lane"] },
+        { id: "lane_type_status", label: "Lane -> Type -> Status", keys: ["lane", "type", "status"] },
+      ];
+      const sortById = new Map(sortChoices.map((x) => [x.id, x]));
+      if (!sortById.has(STATE.__relayCasesSortOrder)) STATE.__relayCasesSortOrder = "status_type_lane";
+
+      const pickType = (summary) => {
+        const raw = summary?.raw || {};
+        const c = raw?.case || raw?.issue || raw || {};
+        return String(c?.type || c?.caseType || c?.topic || c?.category || c?.reason || c?.topicKey || summary?.queue || "").trim() || "Unknown";
+      };
+      const norm = (v, fallback = "Unknown") => {
+        const s = String(v || "").trim();
+        return s || fallback;
+      };
+      const readKey = (item, key) => {
+        if (key === "status") return norm(item.status);
+        if (key === "type") return norm(item.type);
+        return norm(item.lane);
+      };
+
+      const caseItems = uniq.map((cid) => {
+        const c = byId.get(String(cid)) || {};
+        const vrList = Array.from(new Set((caseIdToVrids.get(String(cid)) || []).map((v) => String(v || "").trim()).filter(Boolean)));
+        vrList.sort((a, b) => collator.compare(a, b));
+        const laneList = Array.from(new Set(vrList.map((v) => String(vridToLane.get(v) || laneFallback || "Unknown").trim()).filter(Boolean)));
+        laneList.sort((a, b) => collator.compare(a, b));
+        return {
+          caseId: String(cid || "").trim(),
+          status: norm(c.status),
+          type: norm(pickType(c)),
+          lane: norm(laneList[0] || laneFallback),
+          lanes: laneList,
+          subject: String(c.subject || "").trim(),
+          severity: (c.severity !== undefined && c.severity !== null && String(c.severity) !== "") ? String(c.severity) : "",
+          vrids: vrList,
+          raw: c.raw || {},
+        };
+      }).filter((x) => x.caseId);
+
+      const renderCaseCard = (item, tertiaryKey) => {
+        const lanePills = (item.lanes || []).slice(0, 3).map((ln) =>
+          `<span style="padding:1px 8px;border-radius:999px;border:1px solid #374151;background:#111827;color:#e5e7eb;font-weight:800;font-size:11px;">${_esc(ln)}</span>`
+        ).join("");
+        const laneMore = (item.lanes || []).length > 3
+          ? `<span style="padding:1px 8px;border-radius:999px;border:1px solid #374151;background:#111827;color:#9ca3af;font-weight:800;font-size:11px;">+${(item.lanes || []).length - 3}</span>`
+          : "";
+        const vridLinks = (item.vrids || []).slice(0, 3).map((vrid) => {
+          const relayUrl = (typeof _sspRelayTrackMapUrlForVrid === "function") ? _sspRelayTrackMapUrlForVrid(vrid) : "";
+          return relayUrl
+            ? `<a href="${_esc(relayUrl)}" target="_blank" rel="noopener" style="padding:1px 8px;border-radius:999px;border:1px solid #374151;background:#111827;color:#e5e7eb;font-weight:800;font-size:11px;text-decoration:none;">${_esc(vrid)}</a>`
+            : `<span style="padding:1px 8px;border-radius:999px;border:1px solid #374151;background:#111827;color:#e5e7eb;font-weight:800;font-size:11px;">${_esc(vrid)}</span>`;
+        }).join("");
+        const vridMore = (item.vrids || []).length > 3
+          ? `<span style="padding:1px 8px;border-radius:999px;border:1px solid #374151;background:#111827;color:#9ca3af;font-weight:800;font-size:11px;">+${(item.vrids || []).length - 3}</span>`
+          : "";
+        const top = [item.status, item.type].filter(Boolean).join(" | ");
+        const tertiaryValue = _esc(readKey(item, tertiaryKey));
+        return `<div style="padding:10px;border:1px solid #1f2937;border-radius:12px;background:#000;">
+          <div style="display:flex;gap:8px;align-items:center;">
+            <div style="font-weight:900;color:#e5e7eb;">#${_esc(item.caseId)}</div>
+            ${item.severity ? `<div style="padding:2px 8px;border-radius:999px;border:1px solid #374151;background:#111827;color:#e5e7eb;font-weight:900;font-size:11px;">sev ${_esc(item.severity)}</div>` : ""}
+            <div style="margin-left:auto;display:flex;gap:8px;">
+              <button class="ssp-case-thread-btn" data-cid="${_esc(item.caseId)}" style="cursor:pointer;padding:4px 10px;border-radius:999px;border:1px solid #374151;background:#111827;color:#e5e7eb;font-weight:900;">Thread</button>
+              <button class="ssp-case-raw-btn" data-cid="${_esc(item.caseId)}" style="cursor:pointer;padding:4px 10px;border-radius:999px;border:1px solid #374151;background:#111827;color:#e5e7eb;font-weight:900;">Raw</button>
+            </div>
+          </div>
+          ${top ? `<div style="margin-top:6px;color:#e5e7eb;font-weight:800;font-size:12px;">${_esc(top)}</div>` : ""}
+          ${item.subject ? `<div style="margin-top:4px;color:#9ca3af;font-weight:800;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${_esc(item.subject)}</div>` : ""}
+          <div style="margin-top:6px;color:#9ca3af;font-weight:800;font-size:11px;">${_esc(tertiaryKey.toUpperCase())}: ${tertiaryValue}</div>
+          <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;">${lanePills}${laneMore}</div>
+          <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;">${vridLinks}${vridMore}</div>
+          <div class="ssp-case-thread" data-cid="${_esc(item.caseId)}" data-loaded="0" style="display:none;margin-top:10px;"></div>
+          <div class="ssp-case-raw" data-cid="${_esc(item.caseId)}" style="display:none;margin-top:10px;">
+            <pre style="margin:0;white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;max-height:260px;overflow:auto;background:#0b1020;color:#e5e7eb;padding:10px;border-radius:12px;">${_esc(JSON.stringify(item.raw || {}, null, 2))}</pre>
+          </div>
+        </div>`;
+      };
+
+      const wireCaseButtons = () => {
+        body.querySelectorAll("button.ssp-case-raw-btn").forEach((btn) => {
+          btn.addEventListener("click", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const cid = btn.getAttribute("data-cid") || "";
+            const box = body.querySelector(`.ssp-case-raw[data-cid="${CSS.escape(cid)}"]`);
+            if (!box) return;
+            box.style.display = (box.style.display === "none") ? "block" : "none";
+          });
+        });
+
+        body.querySelectorAll("button.ssp-case-thread-btn").forEach((btn) => {
+          btn.addEventListener("click", async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const cid = btn.getAttribute("data-cid") || "";
+            const box = body.querySelector(`.ssp-case-thread[data-cid="${CSS.escape(cid)}"]`);
+            if (!box) return;
+            const open = (box.style.display === "none");
+            box.style.display = open ? "block" : "none";
+            if (!open) return;
+            if (box.getAttribute("data-loaded") === "1") return;
+            box.setAttribute("data-loaded", "1");
+            box.innerHTML = `<div style="color:#9ca3af;font-weight:800;">Loading correspondence...</div>`;
+            const msgs = await fetchCorr(cid);
+            if (!msgs.length) { box.innerHTML = `<div style="color:#9ca3af;font-weight:800;">No correspondence found.</div>`; return; }
+            box.innerHTML = msgs.map((m) => {
+              const from = m?.fromAddress || m?.from || m?.sender || "";
+              const created = m?.createdAt || m?.sentAt || m?.time || "";
+              const desc = m?.description || m?.body || m?.text || "";
+              return `<div style="padding:10px;border:1px solid #1f2937;border-radius:12px;background:#0b1020;margin-top:8px;">
+                <div style="display:flex;gap:10px;align-items:center;">
+                  <div style="font-weight:900;color:#e5e7eb;">${_esc(from)}</div>
+                  <div style="margin-left:auto;color:#9ca3af;font-weight:800;font-size:12px;">${_esc(created)}</div>
+                </div>
+                <div style="margin-top:6px;white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;color:#e5e7eb;">${_esc(desc)}</div>
+              </div>`;
+            }).join("");
+          });
+        });
+      };
+
+      const renderBoard = () => {
+        const active = sortById.get(STATE.__relayCasesSortOrder) || sortChoices[0];
+        const firstKey = active.keys[0];
+        const secondKey = active.keys[1];
+        const thirdKey = active.keys[2];
+
+        const firstGroups = new Map();
+        for (const item of caseItems) {
+          const k = readKey(item, firstKey);
+          if (!firstGroups.has(k)) firstGroups.set(k, []);
+          firstGroups.get(k).push(item);
+        }
+        const firstVals = Array.from(firstGroups.keys()).sort((a, b) => collator.compare(a, b));
+
+        const columnsHtml = firstVals.map((firstVal) => {
+          const items = firstGroups.get(firstVal) || [];
+          const secondGroups = new Map();
+          for (const item of items) {
+            const k = readKey(item, secondKey);
+            if (!secondGroups.has(k)) secondGroups.set(k, []);
+            secondGroups.get(k).push(item);
+          }
+          const secondVals = Array.from(secondGroups.keys()).sort((a, b) => collator.compare(a, b));
+          const sectionsHtml = secondVals.map((secondVal) => {
+            const cards = (secondGroups.get(secondVal) || [])
+              .slice()
+              .sort((a, b) => collator.compare(readKey(a, thirdKey), readKey(b, thirdKey)) || collator.compare(a.caseId, b.caseId))
+              .map((item) => renderCaseCard(item, thirdKey))
+              .join("");
+            return `<div style="margin-bottom:10px;">
+              <div style="font-weight:900;color:#cbd5e1;font-size:12px;margin-bottom:6px;">${_esc(secondVal)} (${(secondGroups.get(secondVal) || []).length})</div>
+              <div style="display:flex;flex-direction:column;gap:8px;">${cards}</div>
+            </div>`;
+          }).join("");
+          return `<div style="flex:0 0 360px;max-width:420px;padding:10px;border:1px solid #1f2937;border-radius:14px;background:#020617;">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+              <div style="font-weight:900;color:#e5e7eb;">${_esc(firstVal)}</div>
+              <div style="margin-left:auto;color:#9ca3af;font-weight:800;font-size:12px;">${items.length}</div>
+            </div>
+            ${sectionsHtml || `<div style="color:#9ca3af;font-size:12px;">No cases</div>`}
+          </div>`;
+        }).join("");
+
+        body.innerHTML = `<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+          <div style="font-weight:900;">Lane Cases (Relay)</div>
+          <div style="color:#9ca3af;font-weight:800;font-size:12px;">${_esc(laneBase(laneKey))} | ${vrids.length} VRIDs | ${caseItems.length} cases</div>
+          <div style="margin-left:auto;display:flex;align-items:center;gap:8px;">
+            <label for="ssp-cases-sort-order" style="color:#9ca3af;font-weight:800;font-size:12px;">Sort</label>
+            <select id="ssp-cases-sort-order" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:900;cursor:pointer;">
+              ${sortChoices.map((o) => `<option value="${_esc(o.id)}">${_esc(o.label)}</option>`).join("")}
+            </select>
+          </div>
+        </div>
+        <div style="max-height:70vh;overflow:auto;padding-right:6px;">
+          <div style="display:flex;gap:10px;align-items:flex-start;min-width:min-content;">${columnsHtml || `<div style="color:#6b7280;">No cases found.</div>`}</div>
+        </div>`;
+
+        const select = body.querySelector("#ssp-cases-sort-order");
+        if (select) {
+          select.value = active.id;
+          select.addEventListener("change", () => {
+            const next = String(select.value || "");
+            if (!sortById.has(next)) return;
+            STATE.__relayCasesSortOrder = next;
+            renderBoard();
+          });
+        }
+        wireCaseButtons();
+      };
+
+      renderBoard();
+    };
+    try { openRelayCasesPanel = window.openRelayCasesPanel; } catch (_) {}
 
   } catch (_) {}
 })();
