@@ -397,6 +397,91 @@ function buildLoadGroupEquipSig(loads) {
   return map;
 }
 
+function getOutboundEquipmentTypeRaw(load) {
+  return String(
+    load?.equipmentType ??
+      load?.equip ??
+      load?.equipment ??
+      load?.trailerEquipmentType ??
+      load?.trailerEquipment?.trailer?.equipmentType ??
+      load?.trailer?.equipmentType ??
+      load?.vehicle?.equipmentType ??
+      ""
+  );
+}
+
+function getFilteredOutboundLoadsForMode(modeInput, options = {}) {
+  const mode = normalizeObLoadType(modeInput || "all");
+  const srcLoads = Array.isArray(options.loads)
+    ? options.loads
+    : (Array.isArray(STATE?.outboundLoads) ? STATE.outboundLoads : []);
+
+  const basePredicate =
+    (typeof options.basePredicate === "function")
+      ? options.basePredicate
+      : (() => true);
+
+  const prefilteredLoads = srcLoads.filter((l) => {
+    try { return !!basePredicate(l); } catch (_) { return false; }
+  });
+
+  const lgEquipSig =
+    (mode === "amzl53" || mode === "amzl26")
+      ? buildLoadGroupEquipSig(prefilteredLoads.filter((l) => getOutboundLoadType(l) === "amzl"))
+      : null;
+
+  const modeFiltered = prefilteredLoads.filter((l) => {
+    if (mode === "all") return true;
+
+    const t = getOutboundLoadType(l);
+    if (mode === "ddu") return t === "ddu";
+    if (mode === "amzl_all") return t === "amzl";
+
+    if (mode === "amzl53" || mode === "amzl26") {
+      if (t !== "amzl") return false;
+      const lgid = getLoadGroupId(l);
+      if (!lgid || !lgEquipSig) return false;
+      const sig = lgEquipSig.get(lgid);
+      if (!sig) return false;
+      const only53 = !!sig.has53 && !sig.has26;
+      const only26 = !!sig.has26 && !sig.has53;
+      return mode === "amzl53" ? only53 : only26;
+    }
+
+    return true;
+  });
+
+  const equipmentPredicate = (typeof options.equipmentPredicate === "function") ? options.equipmentPredicate : null;
+  const equipmentFiltered = equipmentPredicate
+    ? modeFiltered.filter((l) => {
+        try {
+          const e = normalizeEquipmentType(getOutboundEquipmentTypeRaw(l));
+          return !!equipmentPredicate(e, l);
+        } catch (_) {
+          return false;
+        }
+      })
+    : modeFiltered;
+
+  try {
+    STATE._modeFilterDebugLogged = STATE._modeFilterDebugLogged || {};
+    const debugModeKey = String(mode || "all");
+    if (!STATE._modeFilterDebugLogged[debugModeKey]) {
+      console.debug("[SSP Util] mode filter parity", {
+        mode,
+        debugKey: String(options.debugKey || "default"),
+        total: srcLoads.length,
+        baseFiltered: prefilteredLoads.length,
+        modeFiltered: modeFiltered.length,
+        equipmentFiltered: equipmentFiltered.length,
+      });
+      STATE._modeFilterDebugLogged[debugModeKey] = true;
+    }
+  } catch (_) {}
+
+  return equipmentFiltered;
+}
+
 // Normalize legacy/label-based load-type filters to internal values.
 /**
  * Normalize outbound lane/load type tokens for matching/grouping (case/spacing-safe).
@@ -4229,27 +4314,9 @@ function scheduleDriverPrefetch(reason = "") {
 
     const mode = normalizeObLoadType(SETTINGS.obLoadType || "all");
     const rawOutbound = Array.isArray(STATE.outboundLoads) ? STATE.outboundLoads : [];
-    const lgEquipSig =
-      (mode === "amzl53" || mode === "amzl26")
-        ? buildLoadGroupEquipSig(rawOutbound.filter((l) => getOutboundLoadType(l) === "amzl"))
-        : null;
-
-    const filteredOutbound = rawOutbound.filter((l) => {
-      if (mode === "all") return true;
-      const t = getOutboundLoadType(l);
-      if (mode === "ddu") return t === "ddu";
-      if (mode === "amzl_all") return t === "amzl";
-      if (mode === "amzl53" || mode === "amzl26") {
-        if (t !== "amzl") return false;
-        const lgid = getLoadGroupId(l);
-        if (!lgid || !lgEquipSig) return false;
-        const sig = lgEquipSig.get(lgid);
-        if (!sig) return false;
-        const only53 = !!sig.has53 && !sig.has26;
-        const only26 = !!sig.has26 && !sig.has53;
-        return mode === "amzl53" ? only53 : only26;
-      }
-      return true;
+    const filteredOutbound = getFilteredOutboundLoadsForMode(mode, {
+      loads: rawOutbound,
+      debugKey: "merge-group-building",
     });
 
     // OB: remaining loads per CPT, capacity per equipment
@@ -6148,37 +6215,10 @@ function renderPanel() {
 
       const mode = normalizeObLoadType(SETTINGS.obLoadType || "all");
 
-      // For strict-only equipment filters, compute a load-group equipment signature map once.
-      // IMPORTANT: AMZL (ALL) is a superset; even 26-only / 53-only lanes still appear in AMZL (ALL).
-      const lgEquipSig =
-        (mode === "amzl53" || mode === "amzl26")
-          ? buildLoadGroupEquipSig(rawOutbound.filter((l) => getOutboundLoadType(l) === "amzl"))
-          : null;
-
-      const loads = rawOutbound
-        .filter((l) => {
-          if (mode === "all") return true;
-
-          const t = getOutboundLoadType(l);
-
-          if (mode === "ddu") return t === "ddu";
-          if (mode === "amzl_all") return t === "amzl";
-
-          // Strict-only AMZL equipment subsets are evaluated by loadGroupId signature.
-          if (mode === "amzl53" || mode === "amzl26") {
-            if (t !== "amzl") return false;
-            const lgid = getLoadGroupId(l);
-            if (!lgid || !lgEquipSig) return false; // cannot prove strict-only
-            const sig = lgEquipSig.get(lgid);
-            if (!sig) return false;
-            const only53 = !!sig.has53 && !sig.has26;
-            const only26 = !!sig.has26 && !sig.has53;
-            return mode === "amzl53" ? only53 : only26;
-          }
-
-          // Unknown mode: do not hide anything unexpectedly.
-          return true;
-        })
+      const loads = getFilteredOutboundLoadsForMode(mode, {
+        loads: rawOutbound,
+        debugKey: "action-panel",
+      })
         .map((l) => {
           const cptMs = toMs(l?.criticalPullTime);
           return {
@@ -10759,6 +10799,40 @@ function _getActionGroup(laneKey, cptMs) {
   } catch (_) { return null; }
 }
 
+function getFilteredOutboundVridsForLaneCpt(laneKey, cptMs, options = {}) {
+  try {
+    const laneNorm = String(laneKey || "").trim();
+    const cptNum = Number(cptMs || 0);
+    if (!laneNorm || !cptNum) return [];
+
+    const mode = normalizeObLoadType(SETTINGS.obLoadType || "all");
+    const filtered = getFilteredOutboundLoadsForMode(mode, {
+      loads: Array.isArray(STATE.outboundLoads) ? STATE.outboundLoads : [],
+      basePredicate: (l) => {
+        const st = String((l?.loadStatus ?? l?.status ?? "")).toUpperCase();
+        if (st.includes("CANCEL") || st.includes("DEPART")) return false;
+        return true;
+      },
+      equipmentPredicate: options.equipmentPredicate,
+      debugKey: String(options.debugKey || "lane-cpt-vrids"),
+    });
+
+    const out = [];
+    for (const l of filtered) {
+      const vrid = String(l?.vrId || l?.vrid || "").trim();
+      if (!vrid) continue;
+      const lane = String(l?.lane || l?.route || "").trim();
+      const cpt = Number(toMs(l?.criticalPullTime) || 0);
+      if (lane !== laneNorm || cpt !== cptNum) continue;
+      out.push(vrid);
+    }
+
+    return Array.from(new Set(out));
+  } catch (_) {
+    return [];
+  }
+}
+
 function _msFromAny(x) {
   if (x == null) return null;
   if (typeof x === "number" && Number.isFinite(x)) return x;
@@ -10971,12 +11045,14 @@ async function computeOutboundCasesForLaneCpt(laneKey, cptMs) {
 
     const g = _getActionGroup(laneKey, cptMs);
     const vs = (g && g.vrids) ? g.vrids : [];
-    if (!vs.length) return [];
+    const allowedVrids = new Set(getFilteredOutboundVridsForLaneCpt(laneKey, cptMs, { debugKey: "outbound-case-collection" }));
+    const scopedVs = vs.filter((v) => allowedVrids.has(String(v?.vrid || v?.vrId || "").trim()));
+    if (!scopedVs.length) return [];
 
     const out = [];
-    for (const v of vs.slice(0, 80)) {
+    for (const v of scopedVs.slice(0, 80)) {
       const vrid = String(v?.vrid || v?.vrId || "").trim();
-      if (!vrid) continue;
+      if (!vrid || !allowedVrids.has(vrid)) continue;
 
       // Need firstStopArrivalTime. Best source is FMC execution load's first stop scheduled time.
       let fmcLoad = null;
@@ -11253,12 +11329,14 @@ async function computeOutboundDisruptionsForLaneCpt(laneKey, cptMs) {
   try {
     const g = _getActionGroup(laneKey, cptMs);
     const vs = (g && g.vrids) ? g.vrids : [];
-    if (!vs.length) return [];
+    const allowedVrids = new Set(getFilteredOutboundVridsForLaneCpt(laneKey, cptMs, { debugKey: "disruptions-derivation" }));
+    const scopedVs = vs.filter((v) => allowedVrids.has(String(v?.vrid || v?.vrId || "").trim()));
+    if (!scopedVs.length) return [];
 
     const out = [];
-    for (const v of vs.slice(0, 60)) {
+    for (const v of scopedVs.slice(0, 60)) {
       const vrid = String(v?.vrid || v?.vrId || "").trim();
-      if (!vrid) continue;
+      if (!vrid || !allowedVrids.has(vrid)) continue;
 
       let fmcLoad = null;
       try { fmcLoad = await fetchFmcExecutionLoad(vrid); } catch (_) {}
@@ -13176,13 +13254,15 @@ async function openRelayCasesPanel(laneKey, cptMs) {
   let g = null;
   try { g = _getActionGroup(laneKey, cptMs); } catch (_) {}
   const vs = (g && g.vrids) ? g.vrids : [];
-  if (!vs.length) {
+  const allowedVrids = new Set(getFilteredOutboundVridsForLaneCpt(laneKey, cptMs, { debugKey: "relay-bulk-vrid-open" }));
+  const scopedVs = vs.filter((v) => allowedVrids.has(String(v?.vrid || v?.vrId || "").trim()));
+  if (!scopedVs.length) {
     body.innerHTML = `<div style="padding:10px;color:#6b7280;">No VRIDs found for this lane/CPT.</div>`;
     return;
   }
 
   const rows = [];
-  for (const v of vs.slice(0, 80)) {
+  for (const v of scopedVs.slice(0, 80)) {
     const vrid = String(v?.vrid || v?.vrId || "").trim();
     if (!vrid) continue;
     let detail = null;
@@ -13746,10 +13826,14 @@ async function openRelayCasesPanel(laneKey, cptMs) {
       // Search lane VRIDs (Relay)
       let rows=[]; try{ rows = await searchLaneViews(laneKey, cptMs); }catch(_){ rows=[]; }
 
+      const allowedVrids = new Set((typeof getFilteredOutboundVridsForLaneCpt==='function')
+        ? getFilteredOutboundVridsForLaneCpt(laneKey, cptMs, { debugKey: 'relay-bulk-vrid-open' })
+        : []);
+
       const vridToCaseIds = new Map();
       for (const r of rows){
         const vrid = vridFromRow(r);
-        if (!vrid) continue;
+        if (!vrid || (allowedVrids.size && !allowedVrids.has(vrid))) continue;
         const stubs = extractCaseStubs(r);
         if (!stubs.length) continue;
         const cur = vridToCaseIds.get(vrid) || [];
@@ -13761,7 +13845,11 @@ async function openRelayCasesPanel(laneKey, cptMs) {
       if (vridToCaseIds.size===0 && typeof _getActionGroup==='function' && typeof _sspRelayGetDetail==='function'){
         let group=null; try{ group=_getActionGroup(laneKey, cptMs); }catch(_){ group=null; }
         const vs=(group&&group.vrids)?group.vrids:[];
-        const vrids=vs.map(v=>String(v?.vrid||v?.vrId||'').trim()).filter(Boolean).slice(0,80);
+        const vrids=vs
+          .map(v=>String(v?.vrid||v?.vrId||'').trim())
+          .filter(Boolean)
+          .filter(vrid => !allowedVrids.size || allowedVrids.has(vrid))
+          .slice(0,80);
         await mapLimit(vrids, 6, async (vrid)=>{
           const d=await _sspRelayGetDetail(vrid);
           const stubs=extractCaseStubs(d);
@@ -13786,6 +13874,14 @@ async function openRelayCasesPanel(laneKey, cptMs) {
       const issueRows = await mapLimit(uniq, 6, fetchIssueCase);
       const byId = new Map();
       issueRows.forEach((ir)=>{ if(!ir) return; const s=sumIssue(ir); if(s.id) byId.set(String(s.id), s); });
+
+      const isClosedStatus = (st) => /CLOSE|CLOSED|RESOLVED|COMPLETE|COMPLETED|DONE/i.test(String(st||''));
+      let openCases = 0, closedCases = 0;
+      for (const c of byId.values()) {
+        if (isClosedStatus(c?.status)) closedCases++;
+        else openCases++;
+      }
+      const backupVrids = Math.max(0, Number(allowedVrids.size || 0) - Number(vrids.length || 0));
 
       const vrSection = (vrid)=>{
         const ids = Array.from(new Set((vridToCaseIds.get(vrid)||[]).map(x=>String(x||'').replace(/^NA:CASE:/,'').trim()).filter(Boolean)));
@@ -13825,6 +13921,7 @@ async function openRelayCasesPanel(laneKey, cptMs) {
         <div style="font-weight:900;">Lane Cases (Relay)</div>
         <div style="margin-left:auto;color:#9ca3af;font-weight:800;font-size:12px;">${_esc(laneBase(laneKey))} • ${vrids.length} VRIDs</div>
       </div>
+      <div style="color:#9ca3af;font-weight:800;font-size:12px;margin-bottom:8px;">Open: <b>${openCases}</b> • Closed: <b>${closedCases}</b>${backupVrids ? ` • Backup VRIDs: <b>${backupVrids}</b>` : ''}</div>
       <div style="max-height:70vh;overflow:auto;padding-right:6px;">${vrids.slice(0,120).map(vrSection).join('')}</div>`;
 
       body.querySelectorAll('button.ssp-case-raw-btn').forEach((btn)=>{
