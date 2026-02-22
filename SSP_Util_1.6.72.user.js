@@ -8582,6 +8582,7 @@ document.body.appendChild(p);
           return `${yyyy}-${mm}-${dd} ${hh}:00`;
         };
 
+        const FALLBACK_SHIFT = "OPS_UNMAPPED";
         const agg = new Map(); // shift||hour||status -> record
         for (const l of loads) {
           const t = getExpectedTimeForXdGraph(l);
@@ -8591,7 +8592,8 @@ document.body.appendChild(p);
 
           let shiftName = null;
           for (const b of buckets) { if (t >= b.a && t < b.b) { shiftName = b.shift; break; } }
-          if (!shiftName) continue;
+          // Keep ops-window loads in totals even when enabled shift windows are partial/incomplete.
+          if (!shiftName) shiftName = FALLBACK_SHIFT;
 
           const hb = hourBucket(t);
           const sb = statusBucket(l?.status || l?.loadStatus);
@@ -8621,17 +8623,8 @@ document.body.appendChild(p);
           byHour.set(hk, t);
         }
 
-        const opsTotal = { shift: 'OPS', hourBucket: 'ALL', statusBucket: 'SUM_OPS_HOURS', loads: 0, carts: 0, packages: 0, missingCounts: 0 };
-        for (const t of byHour.values()) {
-          opsTotal.loads += Number(t.loads || 0);
-          opsTotal.carts += Number(t.carts || 0);
-          opsTotal.packages += Number(t.packages || 0);
-          opsTotal.missingCounts += Number(t.missingCounts || 0);
-        }
-
         const exportRows = rows.concat(
-          Array.from(byHour.values()).sort((a,b) => String(a.shift).localeCompare(String(b.shift)) || String(a.hourBucket).localeCompare(String(b.hourBucket))),
-          [opsTotal]
+          Array.from(byHour.values()).sort((a,b) => String(a.shift).localeCompare(String(b.shift)) || String(a.hourBucket).localeCompare(String(b.hourBucket)))
         );
 
         const headers = ["shift","hourBucket","statusBucket","loads","carts","packages","missingCounts"];
