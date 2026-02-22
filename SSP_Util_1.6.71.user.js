@@ -4227,8 +4227,33 @@ function scheduleDriverPrefetch(reason = "") {
 
     STATE.mergeStats = { load: 0, soon: 0, now: 0, risk: 0, adhoc: 0, cancel: 0, ok: 0 };
 
+    const mode = normalizeObLoadType(SETTINGS.obLoadType || "all");
+    const rawOutbound = Array.isArray(STATE.outboundLoads) ? STATE.outboundLoads : [];
+    const lgEquipSig =
+      (mode === "amzl53" || mode === "amzl26")
+        ? buildLoadGroupEquipSig(rawOutbound.filter((l) => getOutboundLoadType(l) === "amzl"))
+        : null;
+
+    const filteredOutbound = rawOutbound.filter((l) => {
+      if (mode === "all") return true;
+      const t = getOutboundLoadType(l);
+      if (mode === "ddu") return t === "ddu";
+      if (mode === "amzl_all") return t === "amzl";
+      if (mode === "amzl53" || mode === "amzl26") {
+        if (t !== "amzl") return false;
+        const lgid = getLoadGroupId(l);
+        if (!lgid || !lgEquipSig) return false;
+        const sig = lgEquipSig.get(lgid);
+        if (!sig) return false;
+        const only53 = !!sig.has53 && !sig.has26;
+        const only26 = !!sig.has26 && !sig.has53;
+        return mode === "amzl53" ? only53 : only26;
+      }
+      return true;
+    });
+
     // OB: remaining loads per CPT, capacity per equipment
-    for (const load of STATE.outboundLoads) {
+    for (const load of filteredOutbound) {
       const cptMs = toMs(load?.criticalPullTime);
       if (!cptMs) continue;
 
@@ -4308,11 +4333,26 @@ function scheduleDriverPrefetch(reason = "") {
     }
 
     // IB4CPT: counts only (no container list by design)
-    Object.values(STATE.ib4cpt).forEach(groups => {
+    // Include only inbound loads expected by/before CPT for the lane+CPT group.
+    Object.entries(STATE.ib4cpt || {}).forEach(([inboundLoadId, groups]) => {
       if (!Array.isArray(groups)) return;
+
+      const ibLoad = (STATE.ibByPlanId && typeof STATE.ibByPlanId.get === "function")
+        ? STATE.ibByPlanId.get(String(inboundLoadId || "").trim())
+        : null;
+      const ibExpectedMs = ibLoad
+        ? (
+            parseSspDateTime(ibLoad?.scheduledArrivalTime) ||
+            parseSspDateTime(ibLoad?.estimatedArrivalTime) ||
+            parseSspDateTime(ibLoad?.actualArrivalTime) ||
+            0
+          )
+        : 0;
+
       groups.forEach(g => {
         const cptMs = toMs(g?.criticalPullTime);
         if (!cptMs) return;
+        if (ibExpectedMs && ibExpectedMs > cptMs) return;
 
         if (!map[cptMs]) {
           // if IB has CPT not present in OB yet, still track it with 53' default capacity
@@ -4353,7 +4393,14 @@ try {
     if (!cpt) return;
     let loaded = 0;
     const vrids = cpt.vrids && cpt.vrids.size ? Array.from(cpt.vrids) : [];
-    for (const vrid of vrids) loaded += Number((STATE.vridLoadedUnits && STATE.vridLoadedUnits[vrid]) || 0);
+    for (const vrid of vrids) {
+      const vinfo = STATE.vridIndex?.[vrid] || null;
+      const status = String(vinfo?.status || "").toUpperCase();
+      const sdtMs = Number(vinfo?.sdtMs || 0);
+      if (status.includes("DEPART")) continue;
+      if (sdtMs && Date.now() > sdtMs) continue;
+      loaded += Number((STATE.vridLoadedUnits && STATE.vridLoadedUnits[vrid]) || 0);
+    }
     cpt.loadedCarts = loaded;
   });
 } catch (_) {}
@@ -4390,6 +4437,11 @@ for (const cpt of Object.values(map)) {
     let sumLoaded = 0;
     const vs = cpt?.vrids ? Array.from(cpt.vrids) : [];
     for (const vrid of vs) {
+      const vinfo = STATE.vridIndex?.[vrid] || null;
+      const status = String(vinfo?.status || "").toUpperCase();
+      const sdtMs = Number(vinfo?.sdtMs || 0);
+      if (status.includes("DEPART")) continue;
+      if (sdtMs && Date.now() > sdtMs) continue;
       const n = Number(STATE.vridLoadedUnits?.[vrid] || 0);
       if (Number.isFinite(n)) sumLoaded += n;
     }
