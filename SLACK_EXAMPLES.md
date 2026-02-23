@@ -8,6 +8,103 @@ Paste in browser DevTools console to test your Slack connection:
 await sendSlackMessage("✅ SSP Util Slack integration working!");
 ```
 
+
+## Canonical Workflow Payload (Stable Schema)
+Use `buildSlackPayload(eventType, context)` to produce a stable, snake_case payload for both Slack Incoming Webhooks and Workflow Builder triggers.
+
+```javascript
+const payload = buildSlackPayload('capacity_breach', {
+  severity: 'critical',
+  site: 'LDJ5',
+  lane: 'LDJ5->DAB8-CYC1',
+  vrid: 'AB1234567890CD',
+  container_id: 'CART-2024-001',
+  disruption_type: 'linehaul_delay',
+  adhoc_needed: false,
+  late_package_count: 18,
+  cpt: '14:30',
+  utilization_pct: 94,
+  timestamp_iso: new Date().toISOString(),
+  message: '[CRITICAL] capacity_breach for LDJ5->DAB8-CYC1'
+});
+
+// Send through SSP Util helper
+await sendSlackMessage(payload.message, payload);
+```
+
+### Workflow Builder variable mapping
+Map these variables in your workflow steps exactly as named:
+- `alert_type`, `severity`
+- `site`, `lane`, `vrid`, `container_id`
+- `disruption_type`, `adhoc_needed`, `late_package_count`
+- `cpt`, `utilization_pct`, `timestamp_iso`
+- `message` (human-readable fallback) and `text` (webhook compatibility)
+
+## Standardized Template Examples (buildSlackPayload)
+
+### 1) Capacity Breach
+```javascript
+await sendSlackMessage('Capacity breach detected', buildSlackPayload('capacity_breach', {
+  severity: 'critical',
+  site: 'LDJ5',
+  lane: 'LDJ5->DAB8-CYC1',
+  vrid: 'AB1234567890CD',
+  cpt: '14:30',
+  utilization_pct: 96,
+  message: '[CRITICAL] capacity_breach for LDJ5->DAB8-CYC1'
+}));
+```
+
+### 2) ADHOC Needed
+```javascript
+await sendSlackMessage('ADHOC required', buildSlackPayload('adhoc_needed', {
+  severity: 'warning',
+  site: 'PHX2',
+  lane: 'AMZ7->PHX2',
+  adhoc_needed: true,
+  cpt: '16:00',
+  utilization_pct: 102,
+  message: '[WARNING] adhoc_needed for AMZ7->PHX2'
+}));
+```
+
+### 3) Disruption
+```javascript
+await sendSlackMessage('Disruption detected', buildSlackPayload('disruption', {
+  severity: 'warning',
+  site: 'HTL8',
+  lane: 'LDJ5->HTL8',
+  vrid: 'AB1234567890CD',
+  disruption_type: 'dock_congestion',
+  message: '[WARNING] disruption for LDJ5->HTL8'
+}));
+```
+
+### 4) Late Packages
+```javascript
+await sendSlackMessage('Late package risk', buildSlackPayload('late_packages', {
+  severity: 'critical',
+  site: 'DAB8',
+  lane: 'LDJ5->DAB8-CYC1',
+  late_package_count: 27,
+  cpt: '14:30',
+  message: '[CRITICAL] late_packages for LDJ5->DAB8-CYC1'
+}));
+```
+
+### 5) Container Exception
+```javascript
+await sendSlackMessage('Container exception', buildSlackPayload('container_exception', {
+  severity: 'warning',
+  site: 'LDJ5',
+  lane: 'LDJ5->PHX2-CYC2',
+  vrid: 'ZX9876543210AA',
+  container_id: 'CART-2024-778',
+  disruption_type: 'damaged_container',
+  message: '[WARNING] container_exception for CART-2024-778'
+}));
+```
+
 ## Capacity & Merge Alerts
 
 ### Critical Capacity Warning
