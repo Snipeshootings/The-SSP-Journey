@@ -1496,6 +1496,54 @@ function getOpsWindow(nowMs = Date.now()) {
   /* =====================================================
      DEFAULT CONFIG + SETTINGS (persisted)
   ====================================================== */
+  function makeDefaultAlertSettings() {
+    return {
+      enabled: false,
+      timingMode: "state_change_only",
+      messageScope: "group_by_type",
+      disruptionSeverity: "high_critical",
+      types: {
+        mergeAlert: false,
+        lateLoad: false,
+        lateAdhoc: false,
+        capacityAlert: false,
+        stagingAlert: false,
+        tdrLateAlert: false,
+        buDriverArrivedAlert: false,
+      },
+      thresholds: {
+        lateMinutes: 15,
+        maxRowsPerMessage: 10,
+      },
+    };
+  }
+
+  function normalizeAlertSettings(raw) {
+    const d = makeDefaultAlertSettings();
+    const src = (raw && typeof raw === "object") ? raw : {};
+    const srcTypes = (src.types && typeof src.types === "object") ? src.types : {};
+    const srcThresholds = (src.thresholds && typeof src.thresholds === "object") ? src.thresholds : {};
+    return {
+      enabled: !!src.enabled,
+      timingMode: String(src.timingMode || d.timingMode),
+      messageScope: String(src.messageScope || d.messageScope),
+      disruptionSeverity: String(src.disruptionSeverity || d.disruptionSeverity),
+      types: {
+        mergeAlert: !!srcTypes.mergeAlert,
+        lateLoad: !!srcTypes.lateLoad,
+        lateAdhoc: !!srcTypes.lateAdhoc,
+        capacityAlert: !!srcTypes.capacityAlert,
+        stagingAlert: !!srcTypes.stagingAlert,
+        tdrLateAlert: !!srcTypes.tdrLateAlert,
+        buDriverArrivedAlert: !!srcTypes.buDriverArrivedAlert,
+      },
+      thresholds: {
+        lateMinutes: Math.max(1, Number(srcThresholds.lateMinutes || d.thresholds.lateMinutes)),
+        maxRowsPerMessage: Math.max(1, Number(srcThresholds.maxRowsPerMessage || d.thresholds.maxRowsPerMessage)),
+      },
+    };
+  }
+
   const DEFAULT_SETTINGS = {
     refreshSeconds: 30,
 
@@ -1562,7 +1610,9 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
 
     // Slack notifications
     slackWebhookUrl: "",
+    slackWorkflowUrl: "",
     slackEnabled: false,
+    alerts: makeDefaultAlertSettings(),
 
   };
 
@@ -1584,6 +1634,7 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
   const UI_PREFS_KEY = "ssp2:prefs";
 
   let SETTINGS = { ...DEFAULT_SETTINGS, ...(lsGet(SETTINGS_KEY, {}) || {}) };
+  SETTINGS.alerts = normalizeAlertSettings(SETTINGS.alerts);
   const CONFIG = SETTINGS; // alias for backward compatibility
   // UI prefs (header/panel hide state)
   const UI_PREFS = {
@@ -1629,6 +1680,33 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
     } catch {}
   }
 
+  function buildSlackPayload(eventType, context) {
+    const ctx = (context && typeof context === "object") ? context : {};
+    const alertType = String(eventType || ctx.alert_type || "general_alert").trim().toLowerCase();
+    const severity = String(ctx.severity || "info").trim().toLowerCase();
+    const lane = String(ctx.lane || "").trim();
+    const site = String(ctx.site || STATE?.nodeId || "").trim();
+    const message =
+      String(ctx.message || "").trim() ||
+      `[${String(severity || "info").toUpperCase()}] ${alertType}${lane ? ` for ${lane}` : ""}`;
+    return {
+      alert_type: alertType,
+      severity,
+      site,
+      lane,
+      vrid: String(ctx.vrid || "").trim(),
+      container_id: String(ctx.container_id || "").trim(),
+      disruption_type: String(ctx.disruption_type || "").trim(),
+      adhoc_needed: !!ctx.adhoc_needed,
+      late_package_count: Number(ctx.late_package_count || 0) || 0,
+      cpt: String(ctx.cpt || "").trim(),
+      utilization_pct: Number(ctx.utilization_pct || 0) || 0,
+      timestamp_iso: String(ctx.timestamp_iso || new Date().toISOString()),
+      message,
+      text: String(ctx.text || message),
+    };
+  }
+
   async function postSlack(url, payload) {
     const body = JSON.stringify(payload || {});
 
@@ -1671,6 +1749,10 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
   async function sendSlackMessage(message, extras) {
     try {
       const config = getSlackConfig();
+      if (!config.enabled) {
+        console.warn("[SSP Util] Slack is disabled in configuration");
+        return false;
+      }
       const payload = Object.assign(
         buildSlackPayload("general_alert", { message }),
         { mrkdwn: true, username: "SSP Util Bot", icon_emoji: ":robot_face:" },
@@ -1813,6 +1895,371 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
     });
   }
 
+  const ALERT_TYPE_INFO = {
+    mergeAlert: { label: "MERGE ALERT", payloadType: "merge_alert" },
+    lateLoad: { label: "LATE LOAD", payloadType: "late_load" },
+    lateAdhoc: { label: "LATE ADHOC", payloadType: "late_adhoc" },
+    capacityAlert: { label: "CAPACITY ALERT", payloadType: "capacity_alert" },
+    stagingAlert: { label: "STAGING ALERT", payloadType: "staging_alert" },
+    tdrLateAlert: { label: "TDR LATE ALERT", payloadType: "tdr_late_alert" },
+    buDriverArrivedAlert: { label: "BU DRIVER ARRIVED ALERT", payloadType: "bu_driver_arrived_alert" },
+  };
+
+  function _getAlertRuntime() {
+    if (!STATE.alertRuntime || typeof STATE.alertRuntime !== "object") {
+      STATE.alertRuntime = {
+        activeByKey: {},
+        evalInFlight: false,
+        relayRows: [],
+        lastRelayScanMs: 0,
+      };
+    }
+    return STATE.alertRuntime;
+  }
+
+  function _alertSeverityRank(sev) {
+    const s = String(sev || "").trim().toLowerCase();
+    if (s === "critical") return 3;
+    if (s === "warning") return 2;
+    return 1;
+  }
+
+  function _fmtAlertTime(ms) {
+    try { return ms ? fmtTime(ms) : "-"; } catch (_) { return "-"; }
+  }
+
+  function _fmtAlertPct(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return "-";
+    return `${Math.round(n * 100)}%`;
+  }
+
+  function _alertCptMs(load) {
+    return Number(toMs(load?.criticalPullTime) || 0);
+  }
+
+  function _alertLane(load) {
+    return String(load?.lane || load?.route || "").trim() || "-";
+  }
+
+  function _isUpcomingCpt(cptMs, maxAheadMin = 360, maxPastMin = 30) {
+    const ms = Number(cptMs || 0);
+    if (!ms) return false;
+    const dtMin = Math.round((ms - Date.now()) / 60000);
+    return dtMin <= maxAheadMin && dtMin >= -maxPastMin;
+  }
+
+  function _severityAllowedForOutbound(severity, mode) {
+    const s = String(severity || "").trim().toUpperCase();
+    if (mode === "all") return true;
+    if (mode === "medium_plus") return (s === "HIGH" || s === "CRITICAL" || s === "SEV1" || s === "MEDIUM" || s === "SEV2");
+    return (s === "HIGH" || s === "CRITICAL" || s === "SEV1");
+  }
+
+  async function _getOutboundDisruptionRowsForAlerts(alertsCfg) {
+    const rt = _getAlertRuntime();
+    const now = Date.now();
+    if (Array.isArray(rt.relayRows) && now - Number(rt.lastRelayScanMs || 0) < 120000) {
+      return rt.relayRows;
+    }
+    if (typeof _sspRelayBuildOutboundDisruptionsForPanel !== "function") return [];
+    try {
+      if (typeof _sspGetTrackAuthHeader === "function" && !_sspGetTrackAuthHeader()) return [];
+    } catch (_) {}
+    try {
+      const relay = await _sspRelayBuildOutboundDisruptionsForPanel("__ALL__", 0);
+      const rows = Array.isArray(relay?.rows) ? relay.rows : [];
+      rt.relayRows = rows.filter((r) => _severityAllowedForOutbound(r?.severity, alertsCfg.disruptionSeverity));
+      rt.lastRelayScanMs = now;
+      return rt.relayRows;
+    } catch (e) {
+      console.warn("[SSP Util] outbound disruption scan skipped:", e);
+      rt.lastRelayScanMs = now;
+      return Array.isArray(rt.relayRows) ? rt.relayRows : [];
+    }
+  }
+
+  function _collectMergeAlertRows(groups) {
+    const out = [];
+    for (const g of groups) {
+      const st = String(g?.mergeState || "").toLowerCase();
+      if (st !== "soon" && st !== "now") continue;
+      const lane = String(g?.lane || "").trim() || "-";
+      const cptMs = Number(g?.cptMs || 0);
+      const util = Number(g?.mergeMeta?.projPct || 0);
+      out.push({
+        type: "mergeAlert",
+        key: `merge:${lane}::${cptMs}`,
+        signature: `${st}|${Math.round(util * 100)}`,
+        severity: "warning",
+        lane,
+        cptMs,
+        vrid: "",
+        line: `${lane} | CPT ${_fmtAlertTime(cptMs)} | state ${String(st).toUpperCase()} | projected ${_fmtAlertPct(util)}`,
+      });
+    }
+    return out;
+  }
+
+  function _collectCapacityAlertRows(groups) {
+    const out = [];
+    for (const g of groups) {
+      const st = String(g?.mergeState || "").toLowerCase();
+      const util = Number(g?.mergeMeta?.projPct || 0);
+      if (!(st === "risk" || st === "cancel" || util >= 1)) continue;
+      const lane = String(g?.lane || "").trim() || "-";
+      const cptMs = Number(g?.cptMs || 0);
+      out.push({
+        type: "capacityAlert",
+        key: `capacity:${lane}::${cptMs}`,
+        signature: `${st}|${Math.round(util * 100)}|${Number(g?.mergeMeta?.overage || 0)}`,
+        severity: "critical",
+        lane,
+        cptMs,
+        vrid: "",
+        line: `${lane} | CPT ${_fmtAlertTime(cptMs)} | state ${String(st || "risk").toUpperCase()} | projected ${_fmtAlertPct(util)}`,
+      });
+    }
+    return out;
+  }
+
+  function _collectLateAdhocRows(groups) {
+    const out = [];
+    for (const g of groups) {
+      const st = String(g?.mergeState || "").toLowerCase();
+      if (st !== "adhoc") continue;
+      const cptMs = Number(g?.cptMs || 0);
+      const lane = String(g?.lane || "").trim() || "-";
+      const lateVrids = [];
+      for (const v of (Array.isArray(g?.vrids) ? g.vrids : [])) {
+        const vrid = String(v?.vrid || v?.vrId || "").trim();
+        const sdtMs = Number(v?.sdtMs || STATE?.vridIndex?.[vrid]?.sdtMs || 0);
+        if (!vrid || !sdtMs || !cptMs) continue;
+        if (sdtMs > cptMs) lateVrids.push(vrid);
+      }
+      if (!lateVrids.length) continue;
+      out.push({
+        type: "lateAdhoc",
+        key: `late-adhoc:${lane}::${cptMs}`,
+        signature: `adhoc|${lateVrids.slice(0, 8).join(",")}|${lateVrids.length}`,
+        severity: "warning",
+        lane,
+        cptMs,
+        vrid: lateVrids[0] || "",
+        line: `${lane} | CPT ${_fmtAlertTime(cptMs)} | ${lateVrids.length} adhoc VRID(s) with SDT after CPT`,
+      });
+    }
+    return out;
+  }
+
+  function _collectStagingRows(outboundLoads) {
+    const out = [];
+    for (const l of outboundLoads) {
+      const vrid = String(l?.vrId || l?.vrid || "").trim();
+      if (!vrid) continue;
+      const st = String(l?.loadStatus || l?.status || "").toUpperCase();
+      if (isObFinalStatus(st)) continue;
+      const cptMs = _alertCptMs(l);
+      if (!_isUpcomingCpt(cptMs)) continue;
+      const loc = String(l?.stagingLocation || l?.location || "").trim();
+      if (!/STAG/i.test(loc)) continue;
+      const lane = _alertLane(l);
+      out.push({
+        type: "stagingAlert",
+        key: `staging:${vrid}`,
+        signature: `${loc}|${cptMs}`,
+        severity: "warning",
+        lane,
+        cptMs,
+        vrid,
+        line: `${lane} | VRID ${vrid} | ${loc} | CPT ${_fmtAlertTime(cptMs)}`,
+      });
+    }
+    return out;
+  }
+
+  function _collectTdrLateRows(vridIndex) {
+    const out = [];
+    for (const [vrid, idx] of Object.entries(vridIndex || {})) {
+      const tdr = String(idx?.dockTdrStatus || "").trim();
+      if (!tdr) continue;
+      if (!/LATE|DELAY|OVERDUE/i.test(tdr)) continue;
+      const lane = String(idx?.lane || "").trim() || "-";
+      const cptMs = Number(idx?.cptMs || 0);
+      out.push({
+        type: "tdrLateAlert",
+        key: `tdr:${vrid}`,
+        signature: `${tdr}|${cptMs}`,
+        severity: "warning",
+        lane,
+        cptMs,
+        vrid: String(vrid),
+        line: `${lane} | VRID ${vrid} | TDR ${tdr} | CPT ${_fmtAlertTime(cptMs)}`,
+      });
+    }
+    return out;
+  }
+
+  function _collectBuDriverArrivedRows(outboundLoads) {
+    const out = [];
+    for (const l of outboundLoads) {
+      const vrid = String(l?.vrId || l?.vrid || "").trim();
+      if (!vrid) continue;
+      const st = String(l?.loadStatus || l?.status || "").toUpperCase();
+      if (!/ARRIVED|READY_FOR_UNLOAD|AT_DOCK/.test(st)) continue;
+      const lane = _alertLane(l);
+      const cptMs = _alertCptMs(l);
+      const driver = String(STATE?.driverNameByVrid?.get?.(vrid) || "").trim();
+      out.push({
+        type: "buDriverArrivedAlert",
+        key: `bu-arrived:${vrid}`,
+        signature: `${st}|${driver}`,
+        severity: "info",
+        lane,
+        cptMs,
+        vrid,
+        line: `${lane} | VRID ${vrid} | status ${st}${driver ? ` | driver ${driver}` : ""}`,
+      });
+    }
+    return out;
+  }
+
+  async function _collectLateLoadRows(alertsCfg) {
+    const out = [];
+    const lateThreshold = Math.max(1, Number(alertsCfg?.thresholds?.lateMinutes || 15));
+    try {
+      const inbound = (typeof computeDisruptionsAll === "function") ? (computeDisruptionsAll() || []) : [];
+      for (const r of inbound) {
+        const mins = Number(r?.minutes || 0);
+        if (mins < lateThreshold) continue;
+        const lane = String(r?.laneKey || "").trim() || "-";
+        const cptMs = Number(r?.cptMs || 0);
+        const kind = String(r?.kind || "LATE").toUpperCase();
+        const vrid = String(r?.vrid || "").trim();
+        out.push({
+          type: "lateLoad",
+          key: `late-load-ib:${vrid}:${lane}:${cptMs}`,
+          signature: `${kind}|${mins}`,
+          severity: mins >= 60 ? "critical" : "warning",
+          lane,
+          cptMs,
+          vrid,
+          line: `${lane} | VRID ${vrid || "-"} | ${kind} ${mins}m | CPT ${_fmtAlertTime(cptMs)}`,
+        });
+      }
+    } catch (_) {}
+
+    const outbound = await _getOutboundDisruptionRowsForAlerts(alertsCfg);
+    for (const r of (outbound || [])) {
+      const lane = String(r?.laneKey || r?.lane || "").trim() || "-";
+      const cptMs = Number(r?.cptMs || 0);
+      const vrid = String(r?.vrid || "").trim();
+      const sev = String(r?.severity || "").toUpperCase();
+      const mins = Number(r?.minutes || 0);
+      out.push({
+        type: "lateLoad",
+        key: `late-load-ob:${vrid}:${lane}:${cptMs}`,
+        signature: `${sev}|${mins}|${String(r?.kind || "")}`,
+        severity: "critical",
+        lane,
+        cptMs,
+        vrid,
+        line: `${lane} | VRID ${vrid || "-"} | outbound ${sev || "HIGH"}${mins ? ` ${mins}m` : ""} | CPT ${_fmtAlertTime(cptMs)}`,
+      });
+    }
+    return out;
+  }
+
+  function _buildAlertMessage(typeKey, rows, alertsCfg) {
+    const info = ALERT_TYPE_INFO[typeKey] || { label: String(typeKey || "ALERT").toUpperCase(), payloadType: "general_alert" };
+    const limit = Math.max(1, Number(alertsCfg?.thresholds?.maxRowsPerMessage || 10));
+    const shown = rows.slice(0, limit);
+    const hidden = Math.max(0, rows.length - shown.length);
+    const lines = [
+      `*${info.label}*`,
+      "------------------------------",
+      ...shown.map((r) => `- ${r.line}`),
+    ];
+    if (hidden > 0) lines.push(`- +${hidden} more`);
+    lines.push(`Node: ${String(STATE?.nodeId || "-")}`);
+    lines.push(`Detected: ${new Date().toISOString()}`);
+    return lines.join("\n");
+  }
+
+  async function evaluateAndDispatchAlerts() {
+    const rt = _getAlertRuntime();
+    if (rt.evalInFlight) return;
+    rt.evalInFlight = true;
+    try {
+      const alertsCfg = normalizeAlertSettings(SETTINGS.alerts);
+      SETTINGS.alerts = alertsCfg;
+      const slackCfg = getSlackConfig();
+      if (!alertsCfg.enabled || !slackCfg.enabled) {
+        rt.activeByKey = {};
+        return;
+      }
+      const endpoint = slackCfg.useWorkflow ? slackCfg.workflowUrl : slackCfg.webhookUrl;
+      if (!endpoint) return;
+
+      const enabledTypes = alertsCfg.types || {};
+      const groups = (STATE.actionGroups && STATE.actionGroups.values) ? Array.from(STATE.actionGroups.values()) : [];
+      const outboundLoads = Array.isArray(STATE.outboundLoads) ? STATE.outboundLoads : [];
+      let allRows = [];
+
+      if (enabledTypes.mergeAlert) allRows = allRows.concat(_collectMergeAlertRows(groups));
+      if (enabledTypes.capacityAlert) allRows = allRows.concat(_collectCapacityAlertRows(groups));
+      if (enabledTypes.lateAdhoc) allRows = allRows.concat(_collectLateAdhocRows(groups));
+      if (enabledTypes.stagingAlert) allRows = allRows.concat(_collectStagingRows(outboundLoads));
+      if (enabledTypes.tdrLateAlert) allRows = allRows.concat(_collectTdrLateRows(STATE.vridIndex || {}));
+      if (enabledTypes.buDriverArrivedAlert) allRows = allRows.concat(_collectBuDriverArrivedRows(outboundLoads));
+      if (enabledTypes.lateLoad) allRows = allRows.concat(await _collectLateLoadRows(alertsCfg));
+
+      const nextActive = {};
+      const pendingByType = new Map();
+      for (const r of allRows) {
+        nextActive[r.key] = r.signature;
+        if (alertsCfg.timingMode === "state_change_only" && rt.activeByKey[r.key] === r.signature) continue;
+        if (!pendingByType.has(r.type)) pendingByType.set(r.type, []);
+        pendingByType.get(r.type).push(r);
+      }
+      rt.activeByKey = nextActive;
+
+      const sendOrder = [
+        "mergeAlert",
+        "lateLoad",
+        "lateAdhoc",
+        "capacityAlert",
+        "stagingAlert",
+        "tdrLateAlert",
+        "buDriverArrivedAlert",
+      ];
+
+      for (const t of sendOrder) {
+        const rows = pendingByType.get(t) || [];
+        if (!rows.length) continue;
+        const text = _buildAlertMessage(t, rows, alertsCfg);
+        const maxSev = rows.reduce((acc, r) => (_alertSeverityRank(r.severity) > _alertSeverityRank(acc) ? r.severity : acc), "info");
+        const info = ALERT_TYPE_INFO[t] || { payloadType: "general_alert" };
+        const first = rows[0] || {};
+        const payload = buildSlackPayload(info.payloadType, {
+          severity: maxSev,
+          site: STATE?.nodeId || "",
+          lane: first.lane || "",
+          vrid: first.vrid || "",
+          cpt: _fmtAlertTime(first.cptMs),
+          message: text,
+          text,
+        });
+        payload.mrkdwn = true;
+        await sendSlackMessage(text, payload);
+      }
+    } catch (e) {
+      console.warn("[SSP Util] alert evaluation error:", e);
+    } finally {
+      rt.evalInFlight = false;
+    }
+  }
+
   /* =====================================================
      STATE
   ====================================================== */
@@ -1842,6 +2289,7 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
 
     relayConnectivity: { state: "unknown", checkedAt: 0, via: "none", message: "" },
     relayConnectivityInflight: null,
+    alertRuntime: { activeByKey: {}, evalInFlight: false, relayRows: [], lastRelayScanMs: 0 },
 
     running: false,
     lastError: null,
@@ -1866,6 +2314,18 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
   };
   try { window._step = _step; window.mpStep = _step; } catch (e) {}
   try { if (typeof unsafeWindow !== 'undefined') { unsafeWindow._step = _step; unsafeWindow.mpStep = _step; } } catch (e) {}
+  try {
+    window.sendSlackMessage = sendSlackMessage;
+    window.buildSlackPayload = buildSlackPayload;
+    window.getSlackConfig = getSlackConfig;
+  } catch (_) {}
+  try {
+    if (typeof unsafeWindow !== "undefined") {
+      unsafeWindow.sendSlackMessage = sendSlackMessage;
+      unsafeWindow.buildSlackPayload = buildSlackPayload;
+      unsafeWindow.getSlackConfig = getSlackConfig;
+    }
+  } catch (_) {}
   window.STATE = STATE;
   // Extra aliases so STATE is reachable from DevTools even if other scripts shadow globals.
   window.SSP_STATE = STATE;
@@ -5917,7 +6377,6 @@ function ensurePanel() {
           <button id="csv-ib">CSV XD Graph</button>
           <button id="csv-ib4">CSV IB4CPT</button>
           <button id="csv-import-est">📊 Import 2wk CSV</button>
-          <button id="slack-config-btn" style="margin-left:auto;">📤 Slack</button>
         </div>
 
         <div id="csv-import-container" style="margin-top:8px;display:none;flex-direction:column;gap:8px;padding:8px;background:#f9f9f9;border:1px solid #e5e7eb;border-radius:6px">
@@ -5980,14 +6439,6 @@ function ensurePanel() {
 
     // CSV buttons are moved into the Planning Panel. Keep logic here (for reuse) but hide from Action Panel UI.
     if (csvIb4) csvIb4.style.display = "none";
-
-    // Slack notifications button
-    const slackConfigBtn = document.getElementById("slack-config-btn");
-    if (slackConfigBtn) {
-      slackConfigBtn.onclick = () => {
-        showSlackConfigModal();
-      };
-    }
 
     // CSV Import Estimation Handler
     const csvImportBtn = document.getElementById("csv-import-est");
@@ -10616,7 +11067,7 @@ try {
 
 
   // =====================================================
-  // Settings Tabs: Tool Settings + Shift Settings
+  // Settings Tabs: Tool + Alerts + Shift
   // =====================================================
   let __SSP2_SETTINGS_ACTIVE_TAB__ = "tool";
 
@@ -10665,9 +11116,16 @@ try {
 
       tabbar.innerHTML = `
         <button id="ssp2-tab-tool" style="padding:6px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#111827;color:#fff;font-weight:900;cursor:pointer;">Tool</button>
+        <button id="ssp2-tab-alerts" style="padding:6px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;color:#111827;font-weight:900;cursor:pointer;">Alerts</button>
         <button id="ssp2-tab-shift" style="padding:6px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;color:#111827;font-weight:900;cursor:pointer;">Shift</button>
-        <div style="margin-left:auto;opacity:.7;font-weight:800;">Shift planning</div>
+        <div style="margin-left:auto;opacity:.7;font-weight:800;">Operations + alerts</div>
       `;
+
+      // Alerts panel
+      const alertsPanel = document.createElement("div");
+      alertsPanel.id = "ssp2-settings-tab-alerts-panel";
+      alertsPanel.style.cssText = "padding:14px;display:none;";
+      alertsPanel.innerHTML = _renderAlertsSettingsHtml();
 
       // Shift panel
       const shiftPanel = document.createElement("div");
@@ -10676,14 +11134,18 @@ try {
 
       shiftPanel.innerHTML = _renderShiftSettingsHtml();
 
-      // Insert tabbar + shift panel
+      // Insert tabbar + alerts panel + shift panel
       header.insertAdjacentElement("afterend", tabbar);
-      tabbar.insertAdjacentElement("afterend", shiftPanel);
+      tabbar.insertAdjacentElement("afterend", alertsPanel);
+      alertsPanel.insertAdjacentElement("afterend", shiftPanel);
 
       // Wire tab clicks
       tabbar.querySelector("#ssp2-tab-tool")?.addEventListener("click", () => _setSettingsTab(modal, "tool"));
+      tabbar.querySelector("#ssp2-tab-alerts")?.addEventListener("click", () => _setSettingsTab(modal, "alerts"));
       tabbar.querySelector("#ssp2-tab-shift")?.addEventListener("click", () => _setSettingsTab(modal, "shift"));
 
+      // Wire alerts + shift handlers
+      _wireAlertsSettingsHandlers(modal);
       // Wire shift editor handlers
       _wireShiftSettingsHandlers(modal);
 
@@ -10698,21 +11160,127 @@ try {
   function _setSettingsTab(modal, tab) {
     __SSP2_SETTINGS_ACTIVE_TAB__ = tab || "tool";
     const tool = modal.querySelector("#ssp2-settings-tab-tool");
+    const alerts = modal.querySelector("#ssp2-settings-tab-alerts-panel");
     const shift = modal.querySelector("#ssp2-settings-tab-shift-panel");
     const bTool = modal.querySelector("#ssp2-tab-tool");
+    const bAlerts = modal.querySelector("#ssp2-tab-alerts");
     const bShift = modal.querySelector("#ssp2-tab-shift");
 
     if (tool) tool.style.display = (__SSP2_SETTINGS_ACTIVE_TAB__ === "tool") ? "grid" : "none";
+    if (alerts) alerts.style.display = (__SSP2_SETTINGS_ACTIVE_TAB__ === "alerts") ? "block" : "none";
     if (shift) shift.style.display = (__SSP2_SETTINGS_ACTIVE_TAB__ === "shift") ? "block" : "none";
 
     if (bTool) {
       bTool.style.background = (__SSP2_SETTINGS_ACTIVE_TAB__ === "tool") ? "#111827" : "#fff";
       bTool.style.color = (__SSP2_SETTINGS_ACTIVE_TAB__ === "tool") ? "#fff" : "#111827";
     }
+    if (bAlerts) {
+      bAlerts.style.background = (__SSP2_SETTINGS_ACTIVE_TAB__ === "alerts") ? "#111827" : "#fff";
+      bAlerts.style.color = (__SSP2_SETTINGS_ACTIVE_TAB__ === "alerts") ? "#fff" : "#111827";
+    }
     if (bShift) {
       bShift.style.background = (__SSP2_SETTINGS_ACTIVE_TAB__ === "shift") ? "#111827" : "#fff";
       bShift.style.color = (__SSP2_SETTINGS_ACTIVE_TAB__ === "shift") ? "#fff" : "#111827";
     }
+  }
+
+  function _renderAlertsSettingsHtml() {
+    const cfg = getSlackConfig();
+    const alerts = normalizeAlertSettings(SETTINGS.alerts);
+    return `
+      <div style="display:grid;grid-template-columns:1fr;gap:12px;">
+        <div style="border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fff;">
+          <div style="font-weight:900;margin-bottom:8px;">Slack Delivery</div>
+          <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px;">
+            <label style="display:inline-flex;align-items:center;gap:8px;">
+              <input id="s-alerts-slack-method-webhook" type="radio" name="s-alerts-slack-method" value="webhook" ${!cfg.useWorkflow ? "checked" : ""} />
+              <span style="font-weight:800;">Incoming Webhook</span>
+            </label>
+            <label style="display:inline-flex;align-items:center;gap:8px;">
+              <input id="s-alerts-slack-method-workflow" type="radio" name="s-alerts-slack-method" value="workflow" ${cfg.useWorkflow ? "checked" : ""} />
+              <span style="font-weight:800;">Workflow Trigger</span>
+            </label>
+          </div>
+
+          <label style="display:block;margin-bottom:8px;">
+            <div style="font-weight:800;margin-bottom:4px;">Incoming Webhook URL</div>
+            <input id="s-alerts-slack-webhook" type="password" value="${escapeHtml(cfg.webhookUrl || "")}" placeholder="https://hooks.slack.com/services/..."
+              style="width:100%;padding:8px;border:1px solid #d1d5db;border-radius:10px;box-sizing:border-box;" />
+          </label>
+          <label style="display:block;margin-bottom:8px;">
+            <div style="font-weight:800;margin-bottom:4px;">Workflow Trigger URL</div>
+            <input id="s-alerts-slack-workflow" type="password" value="${escapeHtml(cfg.workflowUrl || "")}" placeholder="https://hooks.slack.com/triggers/..."
+              style="width:100%;padding:8px;border:1px solid #d1d5db;border-radius:10px;box-sizing:border-box;" />
+          </label>
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+            <label style="display:inline-flex;align-items:center;gap:8px;">
+              <input id="s-alerts-slack-enabled" type="checkbox" ${cfg.enabled ? "checked" : ""} />
+              <span style="font-weight:800;">Enable Slack notifications</span>
+            </label>
+            <button id="s-alerts-slack-test" style="padding:8px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:900;cursor:pointer;">Test Message</button>
+          </div>
+        </div>
+
+        <div style="border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fff;">
+          <div style="font-weight:900;margin-bottom:8px;">Alert Engine</div>
+          <label style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px;">
+            <span style="font-weight:800;">Enable alerts dispatch</span>
+            <input id="s-alerts-enabled" type="checkbox" ${alerts.enabled ? "checked" : ""} />
+          </label>
+
+          <div style="font-weight:900;margin-bottom:8px;">Alert Types</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+            <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>Merge Alert</span><input id="s-alert-merge" type="checkbox" ${alerts.types.mergeAlert ? "checked" : ""} /></label>
+            <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>Late Load</span><input id="s-alert-lateload" type="checkbox" ${alerts.types.lateLoad ? "checked" : ""} /></label>
+            <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>Late Adhoc</span><input id="s-alert-lateadhoc" type="checkbox" ${alerts.types.lateAdhoc ? "checked" : ""} /></label>
+            <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>Capacity Alert</span><input id="s-alert-capacity" type="checkbox" ${alerts.types.capacityAlert ? "checked" : ""} /></label>
+            <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>Staging Alert</span><input id="s-alert-staging" type="checkbox" ${alerts.types.stagingAlert ? "checked" : ""} /></label>
+            <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>TDR Late Alert</span><input id="s-alert-tdr" type="checkbox" ${alerts.types.tdrLateAlert ? "checked" : ""} /></label>
+            <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>BU Driver Arrived Alert</span><input id="s-alert-buarrived" type="checkbox" ${alerts.types.buDriverArrivedAlert ? "checked" : ""} /></label>
+          </div>
+          <div style="margin-top:10px;color:#6b7280;font-size:11px;">
+            Alerts post only on state changes and group rows by alert type.
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function _wireAlertsSettingsHandlers(modal) {
+    const alertsPanel = modal.querySelector("#ssp2-settings-tab-alerts-panel");
+    if (!alertsPanel) return;
+    const btnTest = alertsPanel.querySelector("#s-alerts-slack-test");
+    if (!btnTest) return;
+
+    btnTest.addEventListener("click", async () => {
+      const method = alertsPanel.querySelector('input[name="s-alerts-slack-method"]:checked')?.value || "webhook";
+      const webhook = String(alertsPanel.querySelector("#s-alerts-slack-webhook")?.value || "").trim();
+      const workflow = String(alertsPanel.querySelector("#s-alerts-slack-workflow")?.value || "").trim();
+      const url = method === "workflow" ? workflow : webhook;
+      if (!url) {
+        alert("Please enter a URL for the selected delivery method");
+        return;
+      }
+      btnTest.disabled = true;
+      const prevText = btnTest.textContent;
+      btnTest.textContent = "Sending...";
+      try {
+        const payload = buildSlackPayload("general_alert", {
+          severity: "info",
+          site: STATE?.nodeId || "",
+          message: "*SSP Util Alerts*\\n------------------------------\\nSettings tab test message",
+        });
+        payload.mrkdwn = true;
+        const res = await postSlack(url, payload);
+        if (res.ok) alert(`Slack test message sent (HTTP ${res.status})`);
+        else alert(`Slack test failed (HTTP ${res.status || "n/a"})${res.responseText ? `\n${res.responseText}` : ""}`);
+      } catch (e) {
+        alert(`Slack test error: ${String(e && e.message ? e.message : e)}`);
+      } finally {
+        btnTest.disabled = false;
+        btnTest.textContent = prevText || "Test Message";
+      }
+    });
   }
 
   function _renderShiftSettingsHtml() {
@@ -11245,7 +11813,7 @@ function openSettingsModal(defaultTab) {
     backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(); });
 
     document.getElementById("ssp2-settings-reset").onclick = () => {
-      SETTINGS = { ...DEFAULT_SETTINGS };
+      SETTINGS = { ...DEFAULT_SETTINGS, alerts: makeDefaultAlertSettings() };
       persistSettings();
       close();
       // re-open with defaults
@@ -11322,6 +11890,37 @@ function openSettingsModal(defaultTab) {
       next.diagFailuresOnly = readChk("s-diag-failonly");
       next.diagMaxEvents = Math.max(50, readNum("s-diag-max") || DEFAULT_SETTINGS.diagMaxEvents);
       next.diagMaxChars = Math.max(1000, readNum("s-diag-chars") || DEFAULT_SETTINGS.diagMaxChars);
+
+      // Alerts + Slack config
+      const currentAlerts = normalizeAlertSettings(SETTINGS.alerts);
+      next.alerts = normalizeAlertSettings({
+        ...currentAlerts,
+        enabled: readChk("s-alerts-enabled"),
+        types: {
+          ...currentAlerts.types,
+          mergeAlert: readChk("s-alert-merge"),
+          lateLoad: readChk("s-alert-lateload"),
+          lateAdhoc: readChk("s-alert-lateadhoc"),
+          capacityAlert: readChk("s-alert-capacity"),
+          stagingAlert: readChk("s-alert-staging"),
+          tdrLateAlert: readChk("s-alert-tdr"),
+          buDriverArrivedAlert: readChk("s-alert-buarrived"),
+        },
+      });
+
+      const slackMethod = modal.querySelector('input[name="s-alerts-slack-method"]:checked')?.value || "webhook";
+      const slackWebhook = String(readStr("s-alerts-slack-webhook") || "").trim();
+      const slackWorkflow = String(readStr("s-alerts-slack-workflow") || "").trim();
+      const slackEnabled = readChk("s-alerts-slack-enabled");
+      setSlackConfig({
+        webhookUrl: slackWebhook,
+        workflowUrl: slackWorkflow,
+        enabled: slackEnabled,
+        useWorkflow: slackMethod === "workflow",
+      });
+      next.slackWebhookUrl = slackWebhook;
+      next.slackWorkflowUrl = slackWorkflow;
+      next.slackEnabled = slackEnabled;
 
       SETTINGS = next;
       persistSettings();
@@ -11491,6 +12090,7 @@ function detectNodeId() {
 
       STATE.lastRun = new Date();
       renderPanel();
+      void evaluateAndDispatchAlerts();
     } catch (e) {
       setLastError("run(): Unhandled", e, null);
       renderPanel();
