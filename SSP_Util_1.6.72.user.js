@@ -45,6 +45,8 @@
 // @require      https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js
 // @connect      track.relay.amazon.dev
 // @connect      trans-logistics.amazon.com
+// @connect      hooks.slack.com
+// @connect      hooks.workflow.slack.com
 // @run-at       document-end
 // ==/UserScript==
 
@@ -1625,6 +1627,45 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
     } catch {}
   }
 
+  async function postSlack(url, payload) {
+    const body = JSON.stringify(payload || {});
+
+    if (typeof GM_xmlhttpRequest === "function") {
+      return new Promise((resolve) => {
+        GM_xmlhttpRequest({
+          method: "POST",
+          url,
+          data: body,
+          headers: { "Content-Type": "application/json;charset=utf-8" },
+          onload: (res) => {
+            const status = Number(res && res.status) || 0;
+            resolve({ ok: status >= 200 && status < 300, status, responseText: String((res && res.responseText) || "") });
+          },
+          onerror: (err) => {
+            const status = Number(err && err.status) || 0;
+            resolve({ ok: false, status, responseText: String((err && err.responseText) || "") });
+          },
+          ontimeout: () => {
+            resolve({ ok: false, status: 0, responseText: "Request timed out" });
+          },
+        });
+      });
+    }
+
+    // Fallback when GM API is unavailable in the running userscript engine.
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json;charset=utf-8" },
+        body,
+      });
+      const responseText = await res.text().catch(() => "");
+      return { ok: !!res.ok, status: Number(res.status) || 0, responseText };
+    } catch (e) {
+      return { ok: false, status: 0, responseText: String(e && e.message ? e.message : e) };
+    }
+  }
+
   async function sendSlackMessage(message, extras) {
     try {
       const config = getSlackConfig();
@@ -1638,39 +1679,13 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
         return false;
       }
 
-      // Attempt 1: Standard fetch with CORS headers
-      try {
-        const res = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-
-        if (!res.ok) {
-          console.warn("[SSP Util] Slack message HTTP error:", res.status, res.statusText);
-        } else {
-          console.log("[SSP Util] Slack message sent successfully");
-          return true;
-        }
-      } catch (corsErr) {
-        // CORS preflight failed; try no-cors mode
-        if (String(corsErr).includes("CORS") || String(corsErr).includes("Access-Control")) {
-          console.warn("[SSP Util] CORS preflight blocked, trying no-cors mode...");
-          try {
-            const res2 = await fetch(url, {
-              method: "POST",
-              mode: "no-cors",
-              body: JSON.stringify(payload),
-            });
-            console.log("[SSP Util] no-cors request completed");
-            return true;
-          } catch (noCorsErr) {
-            console.error("[SSP Util] no-cors also failed:", noCorsErr);
-            return false;
-          }
-        }
-        throw corsErr;
+      const result = await postSlack(url, payload);
+      if (!result.ok) {
+        console.warn("[SSP Util] Slack message HTTP error:", result.status, result.responseText || "(empty body)");
+        return false;
       }
+
+      console.log("[SSP Util] Slack message sent successfully", result.status);
       return true;
     } catch (e) {
       console.error("[SSP Util] Slack send error:", e);
@@ -1765,19 +1780,12 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
       testBtn.disabled = true; testBtn.textContent = "Sending...";
       try {
         const payload = { text: "🧪 *SSP Util* – Test message from dashboard configuration", mrkdwn: true };
-        try {
-          const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-          if (res.ok) { alert("✅ Test message sent to Slack!"); return; }
-          throw new Error(`HTTP ${res.status} ${res.statusText}`);
-        } catch (corsErr) {
-          if (String(corsErr).includes("CORS") || String(corsErr).includes("Access-Control")) {
-            console.warn("[SSP Util] CORS preflight failed, retrying with no-cors mode");
-            const res2 = await fetch(url, { method: "POST", mode: "no-cors", body: JSON.stringify(payload) });
-            alert("✅ Test message sent (no-cors mode)!");
-            return;
-          }
-          throw corsErr;
+        const result = await postSlack(url, payload);
+        if (result.ok) {
+          alert(`✅ Test message sent to Slack! (HTTP ${result.status})`);
+          return;
         }
+        alert(`❌ Slack request failed (HTTP ${result.status || "n/a"})${result.responseText ? `\n${result.responseText}` : ""}`);
       } catch (e) { alert(`❌ Error: ${String(e && e.message ? e.message : e)}`); }
       finally { testBtn.disabled = false; testBtn.textContent = "Test Message"; }
     });
