@@ -47,6 +47,8 @@
 // @connect      trans-logistics.amazon.com
 // @connect      hooks.slack.com
 // @connect      hooks.workflow.slack.com
+// @connect      hooks.slack-gov.com
+// @connect      hooks.workflow.slack-gov.com
 // @run-at       document-end
 // ==/UserScript==
 
@@ -1734,7 +1736,7 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
       </div>
       <div style="margin-bottom:12px;">
         <label style="display:block;margin-bottom:6px;font-weight:700">Workflow Trigger URL:</label>
-        <input type="password" id="slack-workflow-input" placeholder="https://hooks.workflow.slack.com/..." 
+        <input type="password" id="slack-workflow-input" placeholder="https://hooks.slack.com/triggers/... (or hooks.workflow.slack.com/...)" 
           value="${config.workflowUrl || ''}"
           style="width:100%;padding:8px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:12px;">
       </div>
@@ -1748,7 +1750,7 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
           <li>Go to <a href="https://api.slack.com/apps" target="_blank" style="color:#0066cc;text-decoration:underline;">api.slack.com/apps</a></li>
           <li>Create a new app for your workspace (or use an existing app)</li>
           <li>For simple posting: enable "Incoming Webhooks" and create a webhook URL</li>
-          <li>For Workflow trigger: open Workflow Builder → Create workflow → Add "Webhook" trigger and copy the trigger URL</li>
+          <li>For Workflow trigger: open Workflow Builder → Create workflow → Add "Webhook" trigger and copy the trigger URL (often hooks.slack.com/triggers/...)</li>
           <li>Paste the appropriate URL into the matching field above</li>
         </ol>
       </div>
