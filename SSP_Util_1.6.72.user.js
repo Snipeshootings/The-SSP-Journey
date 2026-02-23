@@ -1671,7 +1671,13 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
   async function sendSlackMessage(message, extras) {
     try {
       const config = getSlackConfig();
-      const payload = Object.assign({ text: message, mrkdwn: true, username: "SSP Util Bot", icon_emoji: ":robot_face:" }, (extras || {}));
+      const payload = Object.assign(
+        buildSlackPayload("general_alert", { message }),
+        { mrkdwn: true, username: "SSP Util Bot", icon_emoji: ":robot_face:" },
+        (extras || {})
+      );
+      if (!payload.message && payload.text) payload.message = String(payload.text);
+      if (!payload.text && payload.message) payload.text = String(payload.message);
 
       // Choose destination: workflow trigger vs incoming webhook
       const useWorkflow = !!config.useWorkflow;
