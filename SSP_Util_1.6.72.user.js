@@ -45,6 +45,10 @@
 // @require      https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js
 // @connect      track.relay.amazon.dev
 // @connect      trans-logistics.amazon.com
+// @connect      hooks.slack.com
+// @connect      hooks.workflow.slack.com
+// @connect      hooks.slack-gov.com
+// @connect      hooks.workflow.slack-gov.com
 // @run-at       document-end
 // ==/UserScript==
 
@@ -1625,53 +1629,43 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
     } catch {}
   }
 
-  function buildSlackPayload(eventType, context) {
-    const ctx = context || {};
-    const normalizedEventType = String(eventType || ctx.alert_type || "general_alert").trim() || "general_alert";
-    const rawSeverity = String(ctx.severity || "info").toLowerCase();
-    const severity = ["info", "warning", "critical"].includes(rawSeverity) ? rawSeverity : "info";
-    const nowIso = new Date().toISOString();
-    const toOptString = (value) => {
-      if (value == null) return "";
-      return String(value).trim();
-    };
-    const toOptNumber = (value) => {
-      if (value == null || value === "") return null;
-      const num = Number(value);
-      return Number.isFinite(num) ? num : null;
-    };
-    const toOptBoolean = (value) => {
-      if (value == null || value === "") return false;
-      if (typeof value === "boolean") return value;
-      if (typeof value === "number") return value !== 0;
-      const str = String(value).toLowerCase().trim();
-      return ["1", "true", "yes", "y"].includes(str);
-    };
+  async function postSlack(url, payload) {
+    const body = JSON.stringify(payload || {});
 
-    const payload = {
-      alert_type: normalizedEventType,
-      severity,
-      site: toOptString(ctx.site || STATE.nodeId),
-      lane: toOptString(ctx.lane),
-      vrid: toOptString(ctx.vrid),
-      container_id: toOptString(ctx.container_id),
-      disruption_type: toOptString(ctx.disruption_type),
-      adhoc_needed: toOptBoolean(ctx.adhoc_needed),
-      late_package_count: toOptNumber(ctx.late_package_count),
-      cpt: toOptString(ctx.cpt),
-      utilization_pct: toOptNumber(ctx.utilization_pct),
-      timestamp_iso: toOptString(ctx.timestamp_iso) || nowIso,
-      message: toOptString(ctx.message),
-    };
-
-    if (!payload.message) {
-      const focus = payload.lane || payload.vrid || payload.container_id || payload.site || "unknown";
-      payload.message = `[${payload.severity.toUpperCase()}] ${payload.alert_type} for ${focus}`;
+    if (typeof GM_xmlhttpRequest === "function") {
+      return new Promise((resolve) => {
+        GM_xmlhttpRequest({
+          method: "POST",
+          url,
+          data: body,
+          headers: { "Content-Type": "application/json;charset=utf-8" },
+          onload: (res) => {
+            const status = Number(res && res.status) || 0;
+            resolve({ ok: status >= 200 && status < 300, status, responseText: String((res && res.responseText) || "") });
+          },
+          onerror: (err) => {
+            const status = Number(err && err.status) || 0;
+            resolve({ ok: false, status, responseText: String((err && err.responseText) || "") });
+          },
+          ontimeout: () => {
+            resolve({ ok: false, status: 0, responseText: "Request timed out" });
+          },
+        });
+      });
     }
 
-    // Keep incoming webhook compatibility while exposing a stable workflow schema.
-    payload.text = payload.message;
-    return payload;
+    // Fallback when GM API is unavailable in the running userscript engine.
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json;charset=utf-8" },
+        body,
+      });
+      const responseText = await res.text().catch(() => "");
+      return { ok: !!res.ok, status: Number(res.status) || 0, responseText };
+    } catch (e) {
+      return { ok: false, status: 0, responseText: String(e && e.message ? e.message : e) };
+    }
   }
 
   async function sendSlackMessage(message, extras) {
@@ -1693,39 +1687,13 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
         return false;
       }
 
-      // Attempt 1: Standard fetch with CORS headers
-      try {
-        const res = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-
-        if (!res.ok) {
-          console.warn("[SSP Util] Slack message HTTP error:", res.status, res.statusText);
-        } else {
-          console.log("[SSP Util] Slack message sent successfully");
-          return true;
-        }
-      } catch (corsErr) {
-        // CORS preflight failed; try no-cors mode
-        if (String(corsErr).includes("CORS") || String(corsErr).includes("Access-Control")) {
-          console.warn("[SSP Util] CORS preflight blocked, trying no-cors mode...");
-          try {
-            const res2 = await fetch(url, {
-              method: "POST",
-              mode: "no-cors",
-              body: JSON.stringify(payload),
-            });
-            console.log("[SSP Util] no-cors request completed");
-            return true;
-          } catch (noCorsErr) {
-            console.error("[SSP Util] no-cors also failed:", noCorsErr);
-            return false;
-          }
-        }
-        throw corsErr;
+      const result = await postSlack(url, payload);
+      if (!result.ok) {
+        console.warn("[SSP Util] Slack message HTTP error:", result.status, result.responseText || "(empty body)");
+        return false;
       }
+
+      console.log("[SSP Util] Slack message sent successfully", result.status);
       return true;
     } catch (e) {
       console.error("[SSP Util] Slack send error:", e);
@@ -1774,7 +1742,7 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
       </div>
       <div style="margin-bottom:12px;">
         <label style="display:block;margin-bottom:6px;font-weight:700">Workflow Trigger URL:</label>
-        <input type="password" id="slack-workflow-input" placeholder="https://hooks.workflow.slack.com/..." 
+        <input type="password" id="slack-workflow-input" placeholder="https://hooks.slack.com/triggers/... (or hooks.workflow.slack.com/...)" 
           value="${config.workflowUrl || ''}"
           style="width:100%;padding:8px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:12px;">
       </div>
@@ -1788,7 +1756,7 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
           <li>Go to <a href="https://api.slack.com/apps" target="_blank" style="color:#0066cc;text-decoration:underline;">api.slack.com/apps</a></li>
           <li>Create a new app for your workspace (or use an existing app)</li>
           <li>For simple posting: enable "Incoming Webhooks" and create a webhook URL</li>
-          <li>For Workflow trigger: open Workflow Builder → Create workflow → Add "Webhook" trigger and copy the trigger URL</li>
+          <li>For Workflow trigger: open Workflow Builder → Create workflow → Add "Webhook" trigger and copy the trigger URL (often hooks.slack.com/triggers/...)</li>
           <li>Paste the appropriate URL into the matching field above</li>
         </ol>
       </div>
@@ -1819,26 +1787,13 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
       if (!url) { alert("Please enter a URL for the selected delivery method"); return; }
       testBtn.disabled = true; testBtn.textContent = "Sending...";
       try {
-        const payload = Object.assign(
-          buildSlackPayload("test_notification", {
-            severity: "info",
-            message: "🧪 *SSP Util* – Test message from dashboard configuration"
-          }),
-          { mrkdwn: true }
-        );
-        try {
-          const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-          if (res.ok) { alert("✅ Test message sent to Slack!"); return; }
-          throw new Error(`HTTP ${res.status} ${res.statusText}`);
-        } catch (corsErr) {
-          if (String(corsErr).includes("CORS") || String(corsErr).includes("Access-Control")) {
-            console.warn("[SSP Util] CORS preflight failed, retrying with no-cors mode");
-            const res2 = await fetch(url, { method: "POST", mode: "no-cors", body: JSON.stringify(payload) });
-            alert("✅ Test message sent (no-cors mode)!");
-            return;
-          }
-          throw corsErr;
+        const payload = { text: "🧪 *SSP Util* – Test message from dashboard configuration", mrkdwn: true };
+        const result = await postSlack(url, payload);
+        if (result.ok) {
+          alert(`✅ Test message sent to Slack! (HTTP ${result.status})`);
+          return;
         }
+        alert(`❌ Slack request failed (HTTP ${result.status || "n/a"})${result.responseText ? `\n${result.responseText}` : ""}`);
       } catch (e) { alert(`❌ Error: ${String(e && e.message ? e.message : e)}`); }
       finally { testBtn.disabled = false; testBtn.textContent = "Test Message"; }
     });
