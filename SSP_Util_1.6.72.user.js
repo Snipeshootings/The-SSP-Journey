@@ -1601,6 +1601,21 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
   const SLACK_CONFIG = {
     storageKey: "ssp2:slack-config",
   };
+  const SLACK_ALERT_DEDUPE_TTL_MS = 5 * 60 * 1000;
+  const __slackAlertDedupe = new Map();
+
+  function pruneSlackAlertDedupe(nowMs = Date.now()) {
+    for (const [k, ts] of __slackAlertDedupe.entries()) {
+      if ((nowMs - Number(ts || 0)) > SLACK_ALERT_DEDUPE_TTL_MS) __slackAlertDedupe.delete(k);
+    }
+  }
+
+  function buildSlackAlertDedupeKey(eventType, context) {
+    const ctx = context || {};
+    const lane = String(ctx.lane || ctx.laneKey || "").trim();
+    const vrid = String(ctx.vrid || ctx.vehicleRunId || ctx.cpt || "").trim();
+    return `${String(eventType || "EVENT").toUpperCase()}::${lane}::${vrid}`;
+  }
   function getSlackConfig() {
     try {
       return lsGet(SLACK_CONFIG.storageKey, { webhookUrl: "", workflowUrl: "", enabled: false, useWorkflow: false });
@@ -1625,14 +1640,15 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
     } catch {}
   }
 
-  async function sendSlackMessage(message, extras) {
+  async function sendSlackMessage(message, extras, options) {
     try {
       const config = getSlackConfig();
       const payload = Object.assign({ text: message, mrkdwn: true, username: "SSP Util Bot", icon_emoji: ":robot_face:" }, (extras || {}));
+      const opts = options || {};
 
       // Choose destination: workflow trigger vs incoming webhook
       const useWorkflow = !!config.useWorkflow;
-      const url = useWorkflow ? config.workflowUrl : config.webhookUrl;
+      const url = String(opts.endpointUrl || (useWorkflow ? config.workflowUrl : config.webhookUrl) || "").trim();
       if (!url) {
         console.warn("[SSP Util] Slack endpoint not configured");
         return false;
@@ -1674,6 +1690,65 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
       return true;
     } catch (e) {
       console.error("[SSP Util] Slack send error:", e);
+      return false;
+    }
+  }
+
+  async function emitSlackAlert(eventType, context) {
+    try {
+      const config = getSlackConfig();
+      const ctx = context || {};
+      const allowWhenDisabled = !!ctx.force;
+      if (!allowWhenDisabled && !config.enabled) return false;
+
+      const nowMs = Date.now();
+      pruneSlackAlertDedupe(nowMs);
+
+      const dedupeDisabled = !!ctx.disableDedupe;
+      const dedupeKey = buildSlackAlertDedupeKey(eventType, ctx);
+      const prevTs = Number(__slackAlertDedupe.get(dedupeKey) || 0);
+      if (!dedupeDisabled && prevTs && (nowMs - prevTs) < SLACK_ALERT_DEDUPE_TTL_MS) {
+        return false;
+      }
+
+      const lane = String(ctx.lane || ctx.laneKey || "—");
+      const vrid = String(ctx.vrid || ctx.vehicleRunId || "—");
+      const cpt = String(ctx.cpt || "—");
+      const summary = String(ctx.summary || "").trim();
+      const label = String(eventType || "EVENT").toUpperCase();
+      const text = summary
+        ? `🚨 *SSP Util Alert* • *${label}*\n${summary}\nLane: *${lane}* • VRID: *${vrid}* • CPT: *${cpt}*`
+        : `🚨 *SSP Util Alert* • *${label}*\nLane: *${lane}* • VRID: *${vrid}* • CPT: *${cpt}*`;
+
+      const payload = {
+        eventType: label,
+        lane,
+        vrid,
+        cpt,
+        timestamp: new Date(nowMs).toISOString(),
+        context: Object.assign({}, ctx),
+      };
+
+      const sent = await sendSlackMessage(text, {
+        blocks: [
+          { type: "section", text: { type: "mrkdwn", text } },
+          {
+            type: "context",
+            elements: [{ type: "mrkdwn", text: `lane=${lane} • vrid=${vrid} • cpt=${cpt}` }],
+          },
+        ],
+        metadata: {
+          event_type: "ssp_util_alert",
+          event_payload: payload,
+        },
+      }, {
+        endpointUrl: ctx.endpointUrl,
+      });
+
+      if (sent && !dedupeDisabled) __slackAlertDedupe.set(dedupeKey, nowMs);
+      return !!sent;
+    } catch (e) {
+      console.warn("[SSP Util] emitSlackAlert error:", e);
       return false;
     }
   }
@@ -1764,20 +1839,17 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
       if (!url) { alert("Please enter a URL for the selected delivery method"); return; }
       testBtn.disabled = true; testBtn.textContent = "Sending...";
       try {
-        const payload = { text: "🧪 *SSP Util* – Test message from dashboard configuration", mrkdwn: true };
-        try {
-          const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-          if (res.ok) { alert("✅ Test message sent to Slack!"); return; }
-          throw new Error(`HTTP ${res.status} ${res.statusText}`);
-        } catch (corsErr) {
-          if (String(corsErr).includes("CORS") || String(corsErr).includes("Access-Control")) {
-            console.warn("[SSP Util] CORS preflight failed, retrying with no-cors mode");
-            const res2 = await fetch(url, { method: "POST", mode: "no-cors", body: JSON.stringify(payload) });
-            alert("✅ Test message sent (no-cors mode)!");
-            return;
-          }
-          throw corsErr;
-        }
+        const sent = await emitSlackAlert("MANUAL_TEST", {
+          lane: "UI",
+          vrid: "MANUAL",
+          cpt: "N/A",
+          summary: "🧪 Test message from dashboard configuration",
+          force: true,
+          disableDedupe: true,
+          endpointUrl: url,
+        });
+        if (sent) { alert("✅ Test message sent to Slack!"); return; }
+        throw new Error("Slack send failed (check URL/config)");
       } catch (e) { alert(`❌ Error: ${String(e && e.message ? e.message : e)}`); }
       finally { testBtn.disabled = false; testBtn.textContent = "Test Message"; }
     });
@@ -5093,6 +5165,30 @@ Object.values(map).forEach(cpt => {
   }
 
   cpt.mergeState = st;
+
+  try {
+    const primaryLane = (cpt && cpt.lanes && cpt.lanes.size) ? Array.from(cpt.lanes)[0] : "";
+    if (st === "adhoc") {
+      void emitSlackAlert("ADHOC_OVERAGE", {
+        lane: primaryLane,
+        cpt: fmtTime(cpt.cptMs),
+        summary: `Projected overage ${Number(overage.toFixed(1))}u (cap ${fmtUnits(capTotal)}u).`,
+        overage: Number(overage.toFixed(1)),
+        capTotal: Number(capTotal.toFixed(1)),
+        projectedUnits: Number(projUnits.toFixed(1)),
+        mergeState: st,
+      });
+    } else if (st === "now" || st === "soon") {
+      void emitSlackAlert("MERGE_CAPACITY", {
+        lane: primaryLane,
+        cpt: fmtTime(cpt.cptMs),
+        summary: `Merge state ${st.toUpperCase()} (${(projPct * 100).toFixed(1)}% projected).`,
+        projectedPct: Number((projPct * 100).toFixed(1)),
+        hardPct: Number((hardPct * 100).toFixed(1)),
+        mergeState: st,
+      });
+    }
+  } catch (_) {}
 
   STATE.mergeStats[cpt.mergeState] = (STATE.mergeStats[cpt.mergeState] || 0) + 1;
 
@@ -12701,6 +12797,35 @@ async function openDisruptionsPanel(laneKey, cptMs) {
 
   const renderAll = () => {
     if (!allBox) return;
+
+    try {
+      for (const r of (inboundRows || [])) {
+        const mins = Number(r?.minutes || 0);
+        if (mins <= 0) continue;
+        void emitSlackAlert("DISRUPTION_LATE", {
+          lane: laneKey,
+          vrid: r?.vrid || "",
+          cpt: r?.scheduledMs ? fmtTime(r.scheduledMs) : "",
+          summary: `Inbound ${String(r?.kind || "LATE")} ${mins}m late.`,
+          minutesLate: mins,
+          kind: r?.kind || "LATE",
+          disruptionType: "inbound",
+        });
+      }
+      for (const r of (outboundRows || [])) {
+        const mins = Number(r?.minutes || 0);
+        if (mins < Number(OUTBOUND_LATE_THRESHOLD_MIN || 0)) continue;
+        void emitSlackAlert("DISRUPTION_LATE", {
+          lane: r?.lane || laneKey,
+          vrid: r?.vrid || "",
+          cpt: r?.scheduledMs ? fmtTime(r.scheduledMs) : "",
+          summary: `Outbound late by ${mins}m (threshold ${OUTBOUND_LATE_THRESHOLD_MIN}m).`,
+          minutesLate: mins,
+          caseCount: Number(r?.caseCount || 0),
+          disruptionType: "outbound",
+        });
+      }
+    } catch (_) {}
 
     // Build inbound column (show all inbound disruptions)
     const inboundHtml = (inboundRows && inboundRows.length)
