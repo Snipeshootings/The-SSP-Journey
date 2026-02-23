@@ -1625,10 +1625,65 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
     } catch {}
   }
 
+  function buildSlackPayload(eventType, context) {
+    const ctx = context || {};
+    const normalizedEventType = String(eventType || ctx.alert_type || "general_alert").trim() || "general_alert";
+    const rawSeverity = String(ctx.severity || "info").toLowerCase();
+    const severity = ["info", "warning", "critical"].includes(rawSeverity) ? rawSeverity : "info";
+    const nowIso = new Date().toISOString();
+    const toOptString = (value) => {
+      if (value == null) return "";
+      return String(value).trim();
+    };
+    const toOptNumber = (value) => {
+      if (value == null || value === "") return null;
+      const num = Number(value);
+      return Number.isFinite(num) ? num : null;
+    };
+    const toOptBoolean = (value) => {
+      if (value == null || value === "") return false;
+      if (typeof value === "boolean") return value;
+      if (typeof value === "number") return value !== 0;
+      const str = String(value).toLowerCase().trim();
+      return ["1", "true", "yes", "y"].includes(str);
+    };
+
+    const payload = {
+      alert_type: normalizedEventType,
+      severity,
+      site: toOptString(ctx.site || STATE.nodeId),
+      lane: toOptString(ctx.lane),
+      vrid: toOptString(ctx.vrid),
+      container_id: toOptString(ctx.container_id),
+      disruption_type: toOptString(ctx.disruption_type),
+      adhoc_needed: toOptBoolean(ctx.adhoc_needed),
+      late_package_count: toOptNumber(ctx.late_package_count),
+      cpt: toOptString(ctx.cpt),
+      utilization_pct: toOptNumber(ctx.utilization_pct),
+      timestamp_iso: toOptString(ctx.timestamp_iso) || nowIso,
+      message: toOptString(ctx.message),
+    };
+
+    if (!payload.message) {
+      const focus = payload.lane || payload.vrid || payload.container_id || payload.site || "unknown";
+      payload.message = `[${payload.severity.toUpperCase()}] ${payload.alert_type} for ${focus}`;
+    }
+
+    // Keep incoming webhook compatibility while exposing a stable workflow schema.
+    payload.text = payload.message;
+    return payload;
+  }
+
   async function sendSlackMessage(message, extras) {
     try {
       const config = getSlackConfig();
-      const payload = Object.assign({ text: message, mrkdwn: true, username: "SSP Util Bot", icon_emoji: ":robot_face:" }, (extras || {}));
+      const payload = Object.assign(
+        buildSlackPayload("general_alert", { message }),
+        { mrkdwn: true, username: "SSP Util Bot", icon_emoji: ":robot_face:" },
+        (extras || {})
+      );
+      if (!payload.message && payload.text) payload.message = String(payload.text);
+      if (!payload.text && payload.message) payload.text = String(payload.message);
 
       // Choose destination: workflow trigger vs incoming webhook
       const useWorkflow = !!config.useWorkflow;
@@ -1764,7 +1819,13 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
       if (!url) { alert("Please enter a URL for the selected delivery method"); return; }
       testBtn.disabled = true; testBtn.textContent = "Sending...";
       try {
-        const payload = { text: "🧪 *SSP Util* – Test message from dashboard configuration", mrkdwn: true };
+        const payload = Object.assign(
+          buildSlackPayload("test_notification", {
+            severity: "info",
+            message: "🧪 *SSP Util* – Test message from dashboard configuration"
+          }),
+          { mrkdwn: true }
+        );
         try {
           const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
           if (res.ok) { alert("✅ Test message sent to Slack!"); return; }

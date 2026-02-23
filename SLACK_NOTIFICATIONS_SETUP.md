@@ -131,25 +131,68 @@ Updated at: 14:25 by ops_user
 - Check SSP Util console for error messages: `[SSP Util]` prefix
  
  ## Workflow trigger (alternate)
- The Slack Workflow Builder can expose a webhook trigger that runs a configured workflow when your userscript POSTs to it. This is convenient when you want Slack to run a sequence of steps (e.g., post formatted message, run additional actions) without creating a full app.
+The Slack Workflow Builder can expose a webhook trigger that runs a configured workflow when your userscript POSTs to it. This is convenient when you want Slack to run a sequence of steps (e.g., post formatted message, run additional actions) without creating a full app.
 
- Setup:
- 1. Open Slack → Workflow Builder
- 2. Create a new workflow and choose the trigger "Webhook" (or "Incoming webhook trigger")
- 3. Add the workflow step "Send a message" and map any incoming payload variables you want to use
- 4. Save the workflow and copy the provided trigger URL
- 5. Paste the trigger URL into the "Workflow Trigger URL" field in SSP Util's Slack config modal
+Setup:
+1. Open Slack → Workflow Builder
+2. Create a new workflow and choose the trigger "Webhook" (or "Incoming webhook trigger")
+3. Add the workflow step "Send a message"
+4. Save the workflow and copy the provided trigger URL
+5. Paste the trigger URL into the "Workflow Trigger URL" field in SSP Util's Slack config modal
 
- Notes:
- - The workflow URL accepts JSON POSTs. Include keys your workflow expects (e.g., `text`, `vrid`, `lane`).
- - The SSP Util `sendSlackMessage()` method will send to the Workflow URL when you select the "Workflow trigger" delivery method in the config modal.
- - Treat the workflow URL as a secret; anyone with it can trigger the workflow.
+### Canonical SSP Util payload schema (stable snake_case)
+SSP Util now sends a standardized payload for workflow triggers and incoming webhooks. Field names are intentionally snake_case so Workflow Builder variable mapping remains stable across versions.
 
- Example payload to trigger a workflow (from the browser console or userscript):
- ```javascript
- await fetch('YOUR_WORKFLOW_URL', {
-	 method: 'POST',
-	 headers: { 'Content-Type': 'application/json' },
-	 body: JSON.stringify({ text: '*🚨 ALERT* VRID: ABC123', vrid: 'ABC123', lane: 'LDJ5->DAB8-CYC1' })
- });
- ```
+```json
+{
+  "alert_type": "capacity_breach",
+  "severity": "critical",
+  "site": "LDJ5",
+  "lane": "LDJ5->DAB8-CYC1",
+  "vrid": "AB1234567890CD",
+  "container_id": "CART-2024-001",
+  "disruption_type": "linehaul_delay",
+  "adhoc_needed": false,
+  "late_package_count": 18,
+  "cpt": "14:30",
+  "utilization_pct": 94,
+  "timestamp_iso": "2026-02-23T14:22:10.000Z",
+  "message": "[CRITICAL] capacity_breach for LDJ5->DAB8-CYC1",
+  "text": "[CRITICAL] capacity_breach for LDJ5->DAB8-CYC1"
+}
+```
+
+### Workflow Builder variable mapping guidance
+In your Workflow "Send a message" step, map these variables directly from the webhook payload:
+
+- `alert_type` → alert category (`capacity_breach`, `adhoc_needed`, `late_packages`, etc.)
+- `severity` → urgency (`info`, `warning`, `critical`)
+- `site`, `lane`, `vrid`, `container_id` → operational identifiers
+- `disruption_type` → disruption reason/category
+- `adhoc_needed` → boolean flag for extra capacity requirement
+- `late_package_count` → numeric package delay count
+- `cpt`, `utilization_pct`, `timestamp_iso` → time/capacity context
+- `message` (or `text`) → human-readable fallback text for Slack post body
+
+Compatibility notes:
+- `text` is included for Incoming Webhook compatibility.
+- `message` mirrors `text` and is preferred for workflow readability.
+- Keep workflow mappings pointed at these stable snake_case keys to avoid breakage on future releases.
+
+Example payload to trigger a workflow (from browser console or userscript):
+```javascript
+await fetch('YOUR_WORKFLOW_URL', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(buildSlackPayload('capacity_breach', {
+    severity: 'critical',
+    site: 'LDJ5',
+    lane: 'LDJ5->DAB8-CYC1',
+    vrid: 'AB1234567890CD',
+    cpt: '14:30',
+    utilization_pct: 94,
+    late_package_count: 18,
+    message: '[CRITICAL] capacity_breach for LDJ5->DAB8-CYC1'
+  }))
+});
+```
