@@ -44,6 +44,7 @@
 // @grant        GM_setValue
 // @require      https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js
 // @connect      track.relay.amazon.dev
+// @connect      midway-auth.amazon.com
 // @connect      trans-logistics.amazon.com
 // @connect      hooks.slack.com
 // @connect      hooks.workflow.slack.com
@@ -1010,196 +1011,328 @@ function getOpsWindow(nowMs = Date.now()) {
     } catch {}
   }
 
+  function _ibCsvNormalizeHeaderName(name) {
+    return String(name || "")
+      .replace(/\uFEFF/g, "")
+      .trim()
+      .toLowerCase()
+      .replace(/[_-]+/g, " ")
+      .replace(/\s+/g, " ");
+  }
+
+  function _ibCsvCanonicalHeaderName(normHeader) {
+    const h = _ibCsvNormalizeHeaderName(normHeader);
+    if (!h) return "";
+    if (/^(sort\s*\/?\s*route|sortroute|route)$/.test(h)) return "sort/route";
+    if (/^(load\s*type|loadtype|shipping\s*purpose\s*type|type)$/.test(h)) return "load type";
+    if (/^(equipment(\s*type)?|equipmenttype|trailer(\s*type)?)$/.test(h)) return "equipment";
+    if (/^(total\s*containers?|containers?|totalcontainers?|total containers)$/.test(h)) return "total containers";
+    if (/^(total\s*packages?|packages?|totalpackages?|total packages)$/.test(h)) return "total packages";
+    return h;
+  }
+
+  function _ibCsvNormalizeNumeric(raw) {
+    if (raw === null || raw === undefined) return null;
+    const txt = String(raw).trim();
+    if (!txt) return null;
+    if (/^(na|n\/a|null|none)$/i.test(txt)) return null;
+    if (/^[-\u2012\u2013\u2014]+$/.test(txt)) return null;
+    const clean = txt.replace(/,/g, "").replace(/\s+/g, "");
+    if (!clean) return null;
+    const n = Number(clean);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function _ibCsvDetectDelimiter(text) {
+    const firstLine = String(text || "").split(/\r?\n/, 1)[0] || "";
+    const commaCount = (firstLine.match(/,/g) || []).length;
+    const tabCount = (firstLine.match(/\t/g) || []).length;
+    return tabCount > commaCount ? "\t" : ",";
+  }
+
+  function _ibCsvParseDelimited(text, delimiter) {
+    const rows = [];
+    let row = [];
+    let cur = "";
+    let inQuotes = false;
+    const src = String(text || "");
+    for (let i = 0; i < src.length; i++) {
+      const ch = src[i];
+      const next = src[i + 1];
+      if (inQuotes) {
+        if (ch === '"') {
+          if (next === '"') {
+            cur += '"';
+            i++;
+          } else {
+            inQuotes = false;
+          }
+        } else {
+          cur += ch;
+        }
+        continue;
+      }
+      if (ch === '"') {
+        inQuotes = true;
+      } else if (ch === delimiter) {
+        row.push(cur);
+        cur = "";
+      } else if (ch === "\n") {
+        row.push(cur);
+        rows.push(row);
+        row = [];
+        cur = "";
+      } else if (ch === "\r") {
+        // ignore; LF handles row break
+      } else {
+        cur += ch;
+      }
+    }
+    row.push(cur);
+    if (row.some((c) => String(c || "").trim() !== "")) rows.push(row);
+    return { rows, unclosedQuote: inQuotes };
+  }
+
   /**
-   * Parse CSV data from inbound SSP export.
-   * Expected columns: Priority, Ranking, Load Type, Status, Sort/Route, VR ID, 
-   *   Total Packages, Total Containers, Equipment, Carrier, etc.
+   * Parse CSV/TSV data from inbound SSP export.
+   * Returns parsed rows plus parser diagnostics.
    */
   function parseInboundCsvData(csvText) {
     try {
-      const lines = csvText.trim().split(/\r?\n/);
-      if (!lines.length) return [];
-
-      // Parse header line
-      const header = lines[0].split(',').map(h => h.trim().toLowerCase());
-      const rows = [];
-
-      // Parse data rows
-      for (let i = 1; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (!line) continue;
-
-        // Basic CSV parsing (handle quoted fields)
-        const cols = [];
-        let current = '';
-        let inQuotes = false;
-        for (let j = 0; j < line.length; j++) {
-          const ch = line[j];
-          if (ch === '"') {
-            inQuotes = !inQuotes;
-          } else if (ch === ',' && !inQuotes) {
-            cols.push(current.trim().replace(/^"+|"+$/g, ''));
-            current = '';
-          } else {
-            current += ch;
-          }
-        }
-        cols.push(current.trim().replace(/^"+|"+$/g, ''));
-
-        // Map to object using header
-        const row = {};
-        for (let j = 0; j < header.length && j < cols.length; j++) {
-          row[header[j]] = cols[j];
-        }
-        rows.push(row);
+      const src = String(csvText || "").replace(/^\uFEFF/, "").trim();
+      if (!src) {
+        return {
+          rows: [],
+          delimiter: ",",
+          header: [],
+          parseError: "Input is empty. Paste CSV/TSV data first."
+        };
+      }
+      const delimiter = _ibCsvDetectDelimiter(src);
+      const parsed = _ibCsvParseDelimited(src, delimiter);
+      const matrix = parsed.rows || [];
+      if (!matrix.length) {
+        return {
+          rows: [],
+          delimiter,
+          header: [],
+          parseError: "No rows were parsed from input."
+        };
       }
 
-      return rows;
+      const headerRaw = (matrix[0] || []).map((h) => String(h || "").trim());
+      const headerNorm = headerRaw.map((h) => _ibCsvCanonicalHeaderName(h));
+      if (!headerNorm.length || headerNorm.every((h) => !h)) {
+        return {
+          rows: [],
+          delimiter,
+          header: headerNorm,
+          parseError: "Header row is missing or invalid."
+        };
+      }
+
+      const rows = [];
+      for (let i = 1; i < matrix.length; i++) {
+        const cols = matrix[i] || [];
+        if (!cols.length || cols.every((c) => String(c || "").trim() === "")) continue;
+        const rowObj = {};
+        for (let j = 0; j < headerNorm.length; j++) {
+          const key = headerNorm[j];
+          if (!key) continue;
+          rowObj[key] = String(cols[j] || "").trim();
+        }
+        rows.push(rowObj);
+      }
+
+      return {
+        rows,
+        delimiter,
+        header: headerNorm,
+        parseError: parsed.unclosedQuote ? "CSV has an unclosed quoted field." : ""
+      };
     } catch (e) {
       console.error("[SSP Util] CSV parse error:", e);
-      return [];
+      return {
+        rows: [],
+        delimiter: ",",
+        header: [],
+        parseError: `CSV parse error: ${String((e && e.message) || e || "unknown")}`
+      };
     }
   }
 
   /**
-   * Process inbound CSV rows and calculate statistics grouped by route, load type, and equipment.
-   * Returns object indexed as: route::loadType::equipment -> { avgC, avgP, n, stdDevC, stdDevP }
+   * Process inbound rows and calculate statistics grouped by route, load type, and equipment.
+   * Returns estimates + diagnostics.
    */
   function buildCsvEstimates(csvRows) {
+    const skipReasons = {
+      missing_route: 0,
+      missing_manifest_values: 0,
+      unmanifested_or_zero: 0
+    };
     try {
       const stats = {}; // route::loadType::equipment -> { samples: [...], n: count }
       const globalStats = {}; // route -> { samples: [...], n: count }
+      const routes = new Set();
+      let rowsTotal = 0;
+      let rowsAccepted = 0;
 
-      for (const row of csvRows) {
-        // Extract key fields with flexible column name matching
-        const totalC = Number(
-          row['total containers'] || 
-          row['totalcontainers'] || 
-          row['total_containers'] || 
-          row['containers'] || 
-          0
-        );
-        const totalP = Number(
-          row['total packages'] || 
-          row['totalpackages'] || 
-          row['total_packages'] || 
-          row['packages'] || 
-          0
-        );
+      for (const row of (csvRows || [])) {
+        rowsTotal += 1;
+        const sortRoute = String(row["sort/route"] || row.route || "").trim();
+        if (!sortRoute) {
+          skipReasons.missing_route += 1;
+          continue;
+        }
+        const totalC = _ibCsvNormalizeNumeric(row["total containers"]);
+        const totalP = _ibCsvNormalizeNumeric(row["total packages"]);
+        if (totalC === null || totalP === null) {
+          skipReasons.missing_manifest_values += 1;
+          continue;
+        }
+        if (!(totalC > 0) || !(totalP > 0)) {
+          skipReasons.unmanifested_or_zero += 1;
+          continue;
+        }
 
-        // Skip unmanifested loads (these will be the ones we need to estimate)
-        // Only include manifested loads (with actual counts) for statistics
-        if (totalC === 0 || totalP === 0) continue;
+        const loadType = String(row["load type"] || "__all").trim() || "__all";
+        const equipment = String(row.equipment || "__all").trim();
+        const equipShort = (equipment.match(/\d{2}/) || [])[0] || "__all";
+        routes.add(sortRoute);
+        rowsAccepted += 1;
 
-        const sortRoute = String(
-          row['sort/route'] || 
-          row['sort route'] || 
-          row['sortroute'] || 
-          row['route'] || 
-          ''
-        ).trim();
-
-        const loadType = String(
-          row['load type'] || 
-          row['loadtype'] || 
-          row['type'] || 
-          '__all'
-        ).trim();
-
-        const equipment = String(
-          row['equipment'] || 
-          row['equipment type'] || 
-          row['equipmenttype'] || 
-          '__all'
-        ).trim();
-
-        const equipShort = equipment.match(/\d{2}/) ? equipment.match(/\d{2}/)[0] : '__all';
-
-        if (!sortRoute) continue;
-
-        // Aggregate by route::loadType::equipment
         const key = `${sortRoute}::${loadType}::${equipShort}`;
         if (!stats[key]) stats[key] = { samples: [], n: 0 };
         stats[key].samples.push({ c: totalC, p: totalP });
         stats[key].n += 1;
 
-        // Also aggregate by route only (fallback)
         if (!globalStats[sortRoute]) globalStats[sortRoute] = { samples: [], n: 0 };
         globalStats[sortRoute].samples.push({ c: totalC, p: totalP });
         globalStats[sortRoute].n += 1;
       }
 
-      // Calculate averages and standard deviations
-      const result = {};
+      const estimates = {};
       for (const [key, data] of Object.entries(stats)) {
         if (!data.samples.length) continue;
-        const cs = data.samples.map(s => s.c);
-        const ps = data.samples.map(s => s.p);
+        const cs = data.samples.map((s) => s.c);
+        const ps = data.samples.map((s) => s.p);
         const avgC = cs.reduce((a, b) => a + b, 0) / cs.length;
         const avgP = ps.reduce((a, b) => a + b, 0) / ps.length;
-
         const varC = cs.reduce((sum, c) => sum + Math.pow(c - avgC, 2), 0) / cs.length;
         const varP = ps.reduce((sum, p) => sum + Math.pow(p - avgP, 2), 0) / ps.length;
-        const stdDevC = Math.sqrt(varC);
-        const stdDevP = Math.sqrt(varP);
-
-        result[key] = { n: data.n, avgC, avgP, stdDevC, stdDevP };
+        estimates[key] = { n: data.n, avgC, avgP, stdDevC: Math.sqrt(varC), stdDevP: Math.sqrt(varP) };
       }
 
-      // Add global fallbacks
       for (const [route, data] of Object.entries(globalStats)) {
         if (!data.samples.length) continue;
-        const cs = data.samples.map(s => s.c);
-        const ps = data.samples.map(s => s.p);
+        const cs = data.samples.map((s) => s.c);
+        const ps = data.samples.map((s) => s.p);
         const avgC = cs.reduce((a, b) => a + b, 0) / cs.length;
         const avgP = ps.reduce((a, b) => a + b, 0) / ps.length;
-
         const varC = cs.reduce((sum, c) => sum + Math.pow(c - avgC, 2), 0) / cs.length;
         const varP = ps.reduce((sum, p) => sum + Math.pow(p - avgP, 2), 0) / ps.length;
-        const stdDevC = Math.sqrt(varC);
-        const stdDevP = Math.sqrt(varP);
-
-        const globalKey = `${route}::__all::__all`;
-        result[globalKey] = { n: data.n, avgC, avgP, stdDevC, stdDevP };
+        estimates[`${route}::__all::__all`] = { n: data.n, avgC, avgP, stdDevC: Math.sqrt(varC), stdDevP: Math.sqrt(varP) };
       }
 
-      return result;
+      return {
+        estimates,
+        rowsTotal,
+        rowsAccepted,
+        rowsSkipped: Math.max(0, rowsTotal - rowsAccepted),
+        skipReasons,
+        uniqueRoutes: routes.size
+      };
     } catch (e) {
       console.error("[SSP Util] buildCsvEstimates error:", e);
-      return {};
+      return {
+        estimates: {},
+        rowsTotal: 0,
+        rowsAccepted: 0,
+        rowsSkipped: 0,
+        uniqueRoutes: 0,
+        skipReasons
+      };
     }
   }
 
   /**
-   * Import CSV data: parse, calculate statistics, and store.
+   * Import CSV/TSV data: parse, calculate statistics, and store.
    */
   function importInboundCsvEstimates(csvText) {
     try {
-      const rows = parseInboundCsvData(csvText);
+      const parsed = parseInboundCsvData(csvText);
+      const rows = parsed.rows || [];
+      if (parsed.parseError && !rows.length) {
+        return {
+          ok: false,
+          error: parsed.parseError,
+          rowsTotal: 0,
+          rowsAccepted: 0,
+          rowsSkipped: 0,
+          skipReasons: {}
+        };
+      }
       if (!rows.length) {
-        console.warn("[SSP Util] No valid rows in CSV");
-        return null;
+        return {
+          ok: false,
+          error: "No data rows found. Include a header and at least one data row.",
+          rowsTotal: 0,
+          rowsAccepted: 0,
+          rowsSkipped: 0,
+          skipReasons: {}
+        };
       }
 
-      const estimates = buildCsvEstimates(rows);
+      const built = buildCsvEstimates(rows);
+      const estimates = built.estimates || {};
+      const buckets = Object.keys(estimates).length;
+      if (!built.rowsAccepted || !buckets) {
+        return {
+          ok: false,
+          error: "No valid manifested rows found. Confirm Total Containers/Packages are numeric and greater than 0.",
+          delimiter: parsed.delimiter,
+          rowsTotal: built.rowsTotal,
+          rowsAccepted: built.rowsAccepted,
+          rowsSkipped: built.rowsSkipped,
+          skipReasons: built.skipReasons || {},
+          estimates: {}
+        };
+      }
+
       const result = {
+        ok: true,
         ts: Date.now(),
-        nodeId: String(STATE.nodeId || '').trim(),
-        estimates: estimates,
-        rowsProcessed: rows.length,
-        uniqueRoutes: new Set(rows.map(r => r['sort/route'] || r['route'] || '').filter(r => r)).size,
+        nodeId: String(STATE.nodeId || "").trim(),
+        estimates,
+        estimatesBuckets: buckets,
+        rowsProcessed: built.rowsAccepted,
+        rowsTotal: built.rowsTotal,
+        rowsAccepted: built.rowsAccepted,
+        rowsSkipped: built.rowsSkipped,
+        skipReasons: built.skipReasons || {},
+        delimiter: parsed.delimiter,
+        uniqueRoutes: built.uniqueRoutes
       };
 
       STATE.ibCsvEstimates = result;
       _ibCsvEstSaveToStorage(result);
       console.log("[SSP Util] Inbound CSV estimates imported", {
-        rowsProcessed: rows.length,
-        estimatesBuckets: Object.keys(estimates).length,
+        rowsProcessed: result.rowsProcessed,
+        rowsSkipped: result.rowsSkipped,
+        estimatesBuckets: result.estimatesBuckets
       });
       return result;
     } catch (e) {
       console.error("[SSP Util] importInboundCsvEstimates error:", e);
-      return null;
+      return {
+        ok: false,
+        error: `Import failed: ${String((e && e.message) || e || "unknown")}`,
+        rowsTotal: 0,
+        rowsAccepted: 0,
+        rowsSkipped: 0,
+        skipReasons: {}
+      };
     }
   }
 
@@ -1469,6 +1602,156 @@ function getOpsWindow(nowMs = Date.now()) {
     } catch { return null; }
   }
 
+  const SSP_RELAY_BOOTSTRAP_COOLDOWN_MS = 3 * 60 * 1000;
+  let __sspRelayBootstrapInflight = null;
+  let __sspRelayBootstrapLastAt = 0;
+  let __sspRelayBootstrapLastError = "";
+
+  function _sspRelayLooksLikeJwt(token) {
+    try {
+      const t = String(token || "").trim();
+      return t.split(".").length === 3 && t.length > 40;
+    } catch {
+      return false;
+    }
+  }
+
+  function _sspRelayNormalizeBearer(tokenOrBearer) {
+    const raw = String(tokenOrBearer || "").trim();
+    if (!raw) return "";
+    if (raw.startsWith("Bearer ")) return _sspIsBearerValid(raw) ? raw : "";
+    if (!_sspRelayLooksLikeJwt(raw)) return "";
+    const bearer = `Bearer ${raw}`;
+    return _sspIsBearerValid(bearer) ? bearer : "";
+  }
+
+  function _sspRelayBuildMidwayUrl() {
+    const nonce = (() => {
+      const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+      const arr = new Uint8Array(48);
+      let out = "";
+      try {
+        crypto.getRandomValues(arr);
+        for (let i = 0; i < arr.length; i++) out += chars[arr[i] % chars.length];
+      } catch (_) {
+        out = String(Math.random()).slice(2) + String(Date.now());
+      }
+      return out;
+    })();
+    const redirectUri = "https://track.relay.amazon.dev/?m=trip&preset=today&column=scheduled_end&type=vehicleRun";
+    return (
+      "https://midway-auth.amazon.com/SSO?" +
+      new URLSearchParams({
+        client_id: "track.relay.amazon.dev",
+        redirect_uri: redirectUri,
+        response_type: "id_token",
+        scope: "openid",
+        nonce
+      }).toString()
+    );
+  }
+
+  function _sspRelayFetchIdTokenViaMidway(timeoutMs = 15000) {
+    return new Promise((resolve, reject) => {
+      try {
+        if (typeof GM_xmlhttpRequest !== "function") {
+          reject(new Error("GM_xmlhttpRequest unavailable"));
+          return;
+        }
+        GM_xmlhttpRequest({
+          method: "GET",
+          url: _sspRelayBuildMidwayUrl(),
+          timeout: timeoutMs,
+          withCredentials: true,
+          anonymous: false,
+          headers: {
+            Accept: "*/*",
+            "Cache-Control": "no-cache",
+            Pragma: "no-cache",
+            Origin: "https://track.relay.amazon.dev",
+            Referer: "https://track.relay.amazon.dev/"
+          },
+          onload: (resp) => {
+            const status = Number(resp && resp.status);
+            const body = String((resp && resp.responseText) || "").trim();
+            if (!(status >= 200 && status < 300)) {
+              reject(new Error(`Midway HTTP ${status || 0}`));
+              return;
+            }
+            if (!_sspRelayLooksLikeJwt(body)) {
+              reject(new Error(`Midway token response not JWT (len=${body.length})`));
+              return;
+            }
+            resolve(body);
+          },
+          onerror: () => reject(new Error("Midway request failed")),
+          ontimeout: () => reject(new Error("Midway request timeout"))
+        });
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
+  async function _sspRelayBootstrapAuth(opts = {}) {
+    const force = !!opts.force;
+    const cooldownMs = Number(opts.cooldownMs || SSP_RELAY_BOOTSTRAP_COOLDOWN_MS);
+    const now = Date.now();
+    try {
+      const existing = _sspGetTrackAuthHeader();
+      if (!force && existing) {
+        return { ok: true, tried: false, at: now, error: "", reason: "already_authed" };
+      }
+      if (__sspRelayBootstrapInflight) return await __sspRelayBootstrapInflight;
+      if (
+        !force &&
+        __sspRelayBootstrapLastAt &&
+        (now - __sspRelayBootstrapLastAt) < cooldownMs &&
+        __sspRelayBootstrapLastError
+      ) {
+        return {
+          ok: false,
+          tried: false,
+          at: __sspRelayBootstrapLastAt,
+          error: __sspRelayBootstrapLastError,
+          reason: "cooldown"
+        };
+      }
+
+      const inflight = (async () => {
+        try {
+          const token = await _sspRelayFetchIdTokenViaMidway();
+          const bearer = _sspRelayNormalizeBearer(token);
+          if (!bearer) throw new Error("Midway token invalid or expired");
+          _sspPersistTrackAuth(bearer);
+          try { if (typeof unsafeWindow !== "undefined") unsafeWindow.__SSP_TRACK_AUTH__ = bearer; } catch {}
+          __sspRelayBootstrapLastAt = Date.now();
+          __sspRelayBootstrapLastError = "";
+          return { ok: true, tried: true, at: __sspRelayBootstrapLastAt, error: "" };
+        } catch (e) {
+          __sspRelayBootstrapLastAt = Date.now();
+          __sspRelayBootstrapLastError = String((e && e.message) || e || "bootstrap failed");
+          return {
+            ok: false,
+            tried: true,
+            at: __sspRelayBootstrapLastAt,
+            error: __sspRelayBootstrapLastError
+          };
+        } finally {
+          __sspRelayBootstrapInflight = null;
+        }
+      })();
+
+      __sspRelayBootstrapInflight = inflight;
+      return await inflight;
+    } catch (e) {
+      const msg = String((e && e.message) || e || "bootstrap failed");
+      __sspRelayBootstrapLastAt = Date.now();
+      __sspRelayBootstrapLastError = msg;
+      return { ok: false, tried: true, at: __sspRelayBootstrapLastAt, error: msg };
+    }
+  }
+
   // Install auth tap ASAP (on all matched pages).
   _sspInstallTrackAuthTap();
 
@@ -1491,6 +1774,31 @@ function getOpsWindow(nowMs = Date.now()) {
     document.head.appendChild(st);
   } catch {}
 })();
+
+  function ensureCompactUiCss() {
+    try {
+      if (document.getElementById("ssp2-style-compact")) return;
+      const st = document.createElement("style");
+      st.id = "ssp2-style-compact";
+      st.textContent = `
+        #ssp2-pillar { height: 44px !important; padding: 0 8px !important; gap: 6px !important; }
+        #ssp2-pillar button, #ssp2-pillar select, #ssp2-panel button, #ssp2-planpanel button,
+        #ssp-merge-panel button, #ssp-cases-panel button, #ssp-disrupt-panel button, #ssp2-relay-mini button {
+          padding: 4px 8px !important;
+          border-radius: 8px !important;
+          font-size: 11px !important;
+          line-height: 1.2 !important;
+        }
+        #ssp2-pillar input[type="checkbox"] { transform: scale(.92); }
+        #ssp2-h-status { font-size: 11px !important; gap: 6px !important; max-width: 50vw !important; }
+        #ssp2-panel, #ssp2-planpanel, #ssp-merge-panel, #ssp-cases-panel, #ssp-disrupt-panel, #ssp2-relay-mini { font-size: 11px !important; }
+        #ssp2-panelhdr, #ssp2-planhdr { padding: 8px !important; }
+      `;
+      document.head.appendChild(st);
+    } catch {}
+  }
+
+  ensureCompactUiCss();
 
 
   /* =====================================================
@@ -1640,6 +1948,8 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
   const UI_PREFS = {
     headerHidden: false,
     panelHidden: false,
+    panelRect: null,
+    planRect: null,
     ...(lsGet(UI_PREFS_KEY, {}) || {}),
   };
 
@@ -1648,6 +1958,98 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
   }
   function persistPrefs() {
     lsSet(UI_PREFS_KEY, UI_PREFS);
+  }
+
+  function _sspClampPanelRect(rect, minW, minH) {
+    try {
+      if (!rect || typeof rect !== "object") return null;
+      const vw = Math.max(320, window.innerWidth || 0);
+      const vh = Math.max(240, window.innerHeight || 0);
+      const margin = 8;
+      const maxW = Math.max(minW, vw - margin * 2);
+      const maxH = Math.max(minH, vh - margin * 2);
+      const width = Math.max(minW, Math.min(maxW, Number(rect.width || 0) || minW));
+      const height = Math.max(minH, Math.min(maxH, Number(rect.height || 0) || minH));
+      const left = Math.max(margin, Math.min(vw - width - margin, Number(rect.left || 0) || margin));
+      const top = Math.max(margin, Math.min(vh - height - margin, Number(rect.top || 0) || margin));
+      return { left, top, width, height };
+    } catch {
+      return null;
+    }
+  }
+
+  function _sspApplyPanelRectFromPrefs(panelEl, prefKey, minW, minH) {
+    try {
+      if (!panelEl) return;
+      const raw = UI_PREFS[prefKey];
+      const rect = _sspClampPanelRect(raw, minW, minH);
+      if (!rect) return;
+      panelEl.style.left = `${rect.left}px`;
+      panelEl.style.top = `${rect.top}px`;
+      panelEl.style.width = `${rect.width}px`;
+      panelEl.style.height = `${rect.height}px`;
+      panelEl.style.right = "auto";
+    } catch {}
+  }
+
+  function _sspSavePanelRectToPrefs(panelEl, prefKey, minW, minH) {
+    try {
+      if (!panelEl) return;
+      const rect = _sspClampPanelRect({
+        left: panelEl.offsetLeft,
+        top: panelEl.offsetTop,
+        width: panelEl.offsetWidth,
+        height: panelEl.offsetHeight
+      }, minW, minH);
+      if (!rect) return;
+      UI_PREFS[prefKey] = rect;
+      persistPrefs();
+    } catch {}
+  }
+
+  function _sspDebounce(fn, ms) {
+    let t = null;
+    return function () {
+      if (t) clearTimeout(t);
+      t = setTimeout(() => {
+        t = null;
+        try { fn(); } catch {}
+      }, Number(ms || 0));
+    };
+  }
+
+  function _sspWirePanelRectPersistence(panelEl, prefKey, minW, minH) {
+    try {
+      if (!panelEl) return;
+      if (panelEl.__sspRectPersistenceBound) return;
+      panelEl.__sspRectPersistenceBound = true;
+      const saveNow = () => _sspSavePanelRectToPrefs(panelEl, prefKey, minW, minH);
+      const saveDebounced = _sspDebounce(saveNow, 180);
+      panelEl.addEventListener("mouseup", saveDebounced);
+      window.addEventListener("mouseup", saveDebounced);
+      window.addEventListener("resize", () => {
+        try {
+          const rect = _sspClampPanelRect({
+            left: panelEl.offsetLeft,
+            top: panelEl.offsetTop,
+            width: panelEl.offsetWidth,
+            height: panelEl.offsetHeight
+          }, minW, minH);
+          if (!rect) return;
+          panelEl.style.left = `${rect.left}px`;
+          panelEl.style.top = `${rect.top}px`;
+          panelEl.style.width = `${rect.width}px`;
+          panelEl.style.height = `${rect.height}px`;
+          panelEl.style.right = "auto";
+          saveDebounced();
+        } catch {}
+      }, { passive: true });
+      if (typeof ResizeObserver === "function") {
+        const ro = new ResizeObserver(() => saveDebounced());
+        ro.observe(panelEl);
+        panelEl.__sspRectResizeObserver = ro;
+      }
+    } catch {}
   }
 
   /* =====================================================
@@ -2287,7 +2689,15 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
     overlayStats: { scanned: 0, matched: 0 },
     mergeStats: { ok: 0, soon: 0, now: 0 },
 
-    relayConnectivity: { state: "unknown", checkedAt: 0, via: "none", message: "" },
+    relayConnectivity: {
+      state: "unknown",
+      checkedAt: 0,
+      via: "none",
+      message: "",
+      bootstrapTried: false,
+      bootstrapAt: 0,
+      bootstrapError: ""
+    },
     relayConnectivityInflight: null,
     alertRuntime: { activeByKey: {}, evalInFlight: false, relayRows: [], lastRelayScanMs: 0 },
 
@@ -6330,9 +6740,9 @@ function ensurePanel() {
     const p = document.createElement("div");
     p.id = "ssp2-panel";
     p.style.cssText = `
-      position:fixed;top:90px;right:24px;
-      width:720px;height:640px;min-width:520px;min-height:420px;
-      max-width:calc(100vw - 40px);max-height:calc(100vh - 120px);
+      position:fixed;top:72px;right:12px;
+      width:620px;height:520px;min-width:460px;min-height:340px;
+      max-width:calc(100vw - 20px);max-height:calc(100vh - 96px);
       background:#fff;border:1px solid #ccc;border-radius:10px;
       box-shadow:0 4px 14px rgba(0,0,0,.2);
       font-family:Arial;font-size:12px;z-index:99999;
@@ -6395,6 +6805,23 @@ function ensurePanel() {
     `;
 
     document.body.appendChild(p);
+    _sspApplyPanelRectFromPrefs(p, "panelRect", 460, 340);
+    _sspWirePanelRectPersistence(p, "panelRect", 460, 340);
+
+    // Inline relay auth retry control in panel footer/status row.
+    const statusFooter = p.querySelector("#ov-stat") ? p.querySelector("#ov-stat").parentElement : null;
+    if (statusFooter && !document.getElementById("ssp2-relay-retry-footer")) {
+      statusFooter.style.display = "flex";
+      statusFooter.style.alignItems = "center";
+      statusFooter.style.gap = "8px";
+      statusFooter.style.flexWrap = "wrap";
+      const retryBtn = document.createElement("button");
+      retryBtn.id = "ssp2-relay-retry-footer";
+      retryBtn.textContent = "Relay Auth Retry";
+      retryBtn.style.display = "none";
+      retryBtn.style.marginLeft = "auto";
+      statusFooter.appendChild(retryBtn);
+    }
 
     // Global disruptions buttons (Action Panel)
     const openDis = document.getElementById("ssp2-open-disruptions");
@@ -6448,6 +6875,21 @@ function ensurePanel() {
     const csvImportCancel = document.getElementById("csv-import-cancel");
     const csvImportStatus = document.getElementById("csv-import-status");
     const csvEstStat = document.getElementById("csv-est-stat");
+    const relayRetryFooter = document.getElementById("ssp2-relay-retry-footer");
+
+    if (relayRetryFooter) {
+      relayRetryFooter.onclick = async () => {
+        relayRetryFooter.disabled = true;
+        relayRetryFooter.textContent = "Retrying...";
+        try {
+          await checkRelayConnectivity({ force: true, ttlMs: 0, bootstrapForce: true });
+          try { renderPanel(); } catch (_) {}
+        } finally {
+          relayRetryFooter.disabled = false;
+          relayRetryFooter.textContent = "Relay Auth Retry";
+        }
+      };
+    }
 
     if (csvImportBtn) {
       csvImportBtn.onclick = () => {
@@ -6500,6 +6942,38 @@ function ensurePanel() {
       };
     }
 
+    // Override CSV import handler with robust diagnostics UX.
+    if (csvImportPaste) {
+      csvImportPaste.onclick = () => {
+        try {
+          const csvText = String(csvImportTextarea?.value || "").trim();
+          if (!csvText) {
+            csvImportStatus.textContent = "Paste CSV/TSV data first";
+            return;
+          }
+          csvImportStatus.textContent = "Processing...";
+          const result = importInboundCsvEstimates(csvText);
+          if (result && result.ok !== false) {
+            const buckets = Number(result.estimatesBuckets || Object.keys(result.estimates || {}).length || 0);
+            csvImportStatus.textContent = `Imported ${result.rowsAccepted || result.rowsProcessed || 0}/${result.rowsTotal || 0} rows, ${buckets} buckets (skipped: ${result.rowsSkipped || 0})`;
+            csvEstStat.textContent = `CSV loaded (${buckets} buckets)`;
+            setTimeout(() => {
+              csvImportContainer.style.display = "none";
+              csvImportTextarea.value = "";
+              csvImportStatus.textContent = "";
+            }, 2000);
+          } else {
+            const reason = String((result && result.error) || "Import failed");
+            const skipped = Number((result && result.rowsSkipped) || 0);
+            csvImportStatus.textContent = `${reason}${skipped > 0 ? ` (skipped: ${skipped})` : ""}`;
+          }
+        } catch (e) {
+          csvImportStatus.textContent = `Error: ${String(e).substring(0, 60)}`;
+          console.error("[SSP Util] CSV import error:", e);
+        }
+      };
+    }
+
     // Display current CSV estimate status on load
     try {
       const existing = STATE.ibCsvEstimates || _ibCsvEstLoadFromStorage();
@@ -6512,13 +6986,17 @@ function ensurePanel() {
     const hdr = p.querySelector("#ssp2-panelhdr");
     let drag = false, ox = 0, oy = 0;
     hdr.onmousedown = (e) => { drag = true; ox = e.clientX - p.offsetLeft; oy = e.clientY - p.offsetTop; };
-    document.onmouseup = () => (drag = false);
-    document.onmousemove = (e) => {
+    document.addEventListener("mouseup", () => {
+      if (!drag) return;
+      drag = false;
+      _sspSavePanelRectToPrefs(p, "panelRect", 460, 340);
+    });
+    document.addEventListener("mousemove", (e) => {
       if (!drag) return;
       p.style.left = (e.clientX - ox) + "px";
       p.style.top = (e.clientY - oy) + "px";
       p.style.right = "auto";
-    };
+    });
 
     const joinVridsForUrl = (ids) => (ids || []).map(String).map(s => s.trim()).filter(Boolean).join(",");
 
@@ -7124,16 +7602,20 @@ function renderPanel() {
 
       pushPart(`Selected VRIDs: ${STATE.bulkSelection.size}`, `<span><b>Selected VRIDs:</b> ${STATE.bulkSelection.size}</span>`);
 
+      const relayState = String((STATE.relayConnectivity && STATE.relayConnectivity.state) || "unknown");
       const relayStatusLabel = (() => {
-        const st = String((STATE.relayConnectivity && STATE.relayConnectivity.state) || "unknown");
-        if (st === "connected") return "Relay connected";
-        if (st === "fallback") return "Relay fallback";
-        if (st === "no_auth") return "Relay not authed";
-        if (st === "auth_only") return "Relay auth ready";
-        if (st === "error") return "Relay error";
+        if (relayState === "connected") return "Relay connected";
+        if (relayState === "fallback") return "Relay fallback";
+        if (relayState === "no_auth") return "Relay not authed";
+        if (relayState === "auth_only") return "Relay auth ready";
+        if (relayState === "error") return "Relay error";
         return "Relay unknown";
       })();
-      pushPart(relayStatusLabel, getRelayConnectivityBadgeHtml());
+      const needsRelayRetry = relayState === "no_auth" || relayState === "error";
+      const relayHtml = needsRelayRetry
+        ? `${getRelayConnectivityBadgeHtml()} <button id="ssp2-relay-retry-inline" style="padding:2px 8px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;cursor:pointer;">Relay Auth Retry</button>`
+        : getRelayConnectivityBadgeHtml();
+      pushPart(relayStatusLabel, relayHtml);
 
       const sep = ` <span style="opacity:.35;margin:0 8px;">|</span> `;
       const html = partsHtml.join(sep);
@@ -7245,6 +7727,11 @@ function renderPanel() {
     } catch (_) {}
     b.textContent = `Selected: ${STATE.bulkSelection.size}`;
     ov.textContent = `${STATE.overlayStats.matched}/${STATE.overlayStats.scanned}`;
+    try {
+      const retryFooter = document.getElementById("ssp2-relay-retry-footer");
+      const st = String((STATE.relayConnectivity && STATE.relayConnectivity.state) || "unknown");
+      if (retryFooter) retryFooter.style.display = (st === "no_auth" || st === "error") ? "" : "none";
+    } catch (_) {}
     try { void checkRelayConnectivity({ ttlMs: 120000 }); } catch (_) {}
     // Action list (grouped by Lane -> VRIDs)
     if (list) {
@@ -8374,22 +8861,56 @@ async function checkRelayConnectivity(opts = {}) {
     const now = Date.now();
     const force = !!opts.force;
     const ttlMs = Number(opts.ttlMs || 120000);
-    const cached = STATE.relayConnectivity || { state: "unknown", checkedAt: 0, via: "none", message: "" };
+    const cached = STATE.relayConnectivity || {
+      state: "unknown",
+      checkedAt: 0,
+      via: "none",
+      message: "",
+      bootstrapTried: false,
+      bootstrapAt: 0,
+      bootstrapError: ""
+    };
+    const withBootstrap = (obj, boot) => ({
+      ...obj,
+      bootstrapTried: !!(boot && boot.tried),
+      bootstrapAt: Number((boot && boot.at) || 0),
+      bootstrapError: String((boot && boot.error) || "")
+    });
 
     if (!force && cached.checkedAt && (now - cached.checkedAt) < ttlMs) return cached;
     if (!force && STATE.relayConnectivityInflight) return await STATE.relayConnectivityInflight;
 
     const inflight = (async () => {
-      const auth = (typeof _sspGetTrackAuthHeader === "function") ? _sspGetTrackAuthHeader() : null;
+      let bootstrapMeta = { tried: false, at: 0, error: "" };
+      let auth = (typeof _sspGetTrackAuthHeader === "function") ? _sspGetTrackAuthHeader() : null;
       if (!auth) {
-        const out = { state: "no_auth", checkedAt: Date.now(), via: "none", message: "Relay Track auth missing" };
+        if (typeof _sspRelayBootstrapAuth === "function") {
+          bootstrapMeta = await _sspRelayBootstrapAuth({ force: !!opts.bootstrapForce });
+        }
+        auth = (typeof _sspGetTrackAuthHeader === "function") ? _sspGetTrackAuthHeader() : null;
+      }
+
+      if (!auth) {
+        const out = withBootstrap({
+          state: "no_auth",
+          checkedAt: Date.now(),
+          via: "none",
+          message: bootstrapMeta.error
+            ? `Relay Track auth missing (${bootstrapMeta.error}). Use Relay Auth Retry.`
+            : "Relay Track auth missing. Use Relay Auth Retry."
+        }, bootstrapMeta);
         STATE.relayConnectivity = out;
         return out;
       }
 
       const sampleVrid = String(opts.vrid || ((Array.isArray(STATE.outboundLoads) ? STATE.outboundLoads : []).find((l) => String(l?.vrId || l?.vrid || "").trim())?.vrId || "")).trim();
       if (!sampleVrid) {
-        const out = { state: "auth_only", checkedAt: Date.now(), via: "token", message: "Track auth present; no VRID sample available" };
+        const out = withBootstrap({
+          state: "auth_only",
+          checkedAt: Date.now(),
+          via: "token",
+          message: "Track auth present; no VRID sample available"
+        }, bootstrapMeta);
         STATE.relayConnectivity = out;
         return out;
       }
@@ -8398,18 +8919,28 @@ async function checkRelayConnectivity(opts = {}) {
         const detail = await _sspRelayGetDetail(sampleVrid);
         const src = String(detail?.__sspSource || "").toUpperCase();
         if (src === "FMC") {
-          const out = { state: "fallback", checkedAt: Date.now(), via: "fmc", message: `Track unavailable; using FMC fallback (${sampleVrid})` };
+          const out = withBootstrap({
+            state: "fallback",
+            checkedAt: Date.now(),
+            via: "fmc",
+            message: `Track unavailable; using FMC fallback (${sampleVrid})`
+          }, bootstrapMeta);
           STATE.relayConnectivity = out;
           return out;
         }
-        const out = { state: "connected", checkedAt: Date.now(), via: "track", message: `Relay Track connected (${sampleVrid})` };
+        const out = withBootstrap({
+          state: "connected",
+          checkedAt: Date.now(),
+          via: "track",
+          message: `Relay Track connected (${sampleVrid})`
+        }, bootstrapMeta);
         STATE.relayConnectivity = out;
         return out;
       } catch (e) {
         const msg = String((e && e.message) || e || "");
         const out = /Track auth/i.test(msg)
-          ? { state: "no_auth", checkedAt: Date.now(), via: "none", message: "Relay Track auth missing" }
-          : { state: "error", checkedAt: Date.now(), via: "none", message: msg.slice(0, 220) };
+          ? withBootstrap({ state: "no_auth", checkedAt: Date.now(), via: "none", message: "Relay Track auth missing. Use Relay Auth Retry." }, bootstrapMeta)
+          : withBootstrap({ state: "error", checkedAt: Date.now(), via: "none", message: msg.slice(0, 220) }, bootstrapMeta);
         STATE.relayConnectivity = out;
         return out;
       }
@@ -8420,7 +8951,15 @@ async function checkRelayConnectivity(opts = {}) {
     STATE.relayConnectivityInflight = null;
     return out;
   } catch (e) {
-    const out = { state: "error", checkedAt: Date.now(), via: "none", message: String((e && e.message) || e || "relay connectivity check failed") };
+    const out = {
+      state: "error",
+      checkedAt: Date.now(),
+      via: "none",
+      message: String((e && e.message) || e || "relay connectivity check failed"),
+      bootstrapTried: false,
+      bootstrapAt: 0,
+      bootstrapError: ""
+    };
     STATE.relayConnectivity = out;
     STATE.relayConnectivityInflight = null;
     return out;
@@ -9245,8 +9784,8 @@ function _ensureRelayMiniPopover() {
   pop.id = "ssp2-relay-mini";
   pop.style.position = "fixed";
   pop.style.zIndex = "999999";
-  pop.style.width = "520px";
-  pop.style.height = "360px";
+  pop.style.width = "470px";
+  pop.style.height = "320px";
   pop.style.display = "none";
   pop.style.border = "1px solid #d1d5db";
   pop.style.borderRadius = "14px";
@@ -9661,7 +10200,7 @@ function ensurePlanningPanel() {
     const p = document.createElement("div");
     p.id = "ssp2-planpanel";
     p.style.cssText = `
-      position:fixed;top:90px;right:460px;width:980px;height:720px;min-width:760px;min-height:420px;
+      position:fixed;top:72px;right:320px;width:900px;height:620px;min-width:680px;min-height:380px;
       background:#fff;border:1px solid #ccc;border-radius:10px;
       box-shadow:0 4px 14px rgba(0,0,0,.2);
       font-family:Arial;font-size:12px;z-index:99999;
@@ -9747,12 +10286,18 @@ function ensurePlanningPanel() {
       </div>
     `;
 document.body.appendChild(p);
+    _sspApplyPanelRectFromPrefs(p, "planRect", 680, 380);
+    _sspWirePanelRectPersistence(p, "planRect", 680, 380);
 
     // Drag
     const hdr = p.querySelector("#ssp2-planhdr");
     let drag = false, ox = 0, oy = 0;
     hdr.onmousedown = (e) => { drag = true; ox = e.clientX - p.offsetLeft; oy = e.clientY - p.offsetTop; };
-    document.addEventListener("mouseup", () => (drag = false));
+    document.addEventListener("mouseup", () => {
+      if (!drag) return;
+      drag = false;
+      _sspSavePanelRectToPrefs(p, "planRect", 680, 380);
+    });
     document.addEventListener("mousemove", (e) => {
       if (!drag) return;
       p.style.left = (e.clientX - ox) + "px";
@@ -10031,8 +10576,8 @@ function _ensureRelayPreviewPopover() {
   pop.id = "ssp2-relay-preview";
   pop.style.position = "fixed";
   pop.style.zIndex = "999999";
-  pop.style.width = "520px";
-  pop.style.height = "360px";
+  pop.style.width = "470px";
+  pop.style.height = "320px";
   pop.style.display = "none";
   pop.style.border = "1px solid #d1d5db";
   pop.style.borderRadius = "14px";
@@ -10887,9 +11432,9 @@ try {
     const bar = document.createElement("div");
     bar.id = "ssp2-pillar";
     bar.style.cssText = `
-      position:fixed;top:0;left:0;right:0;height:52px;
+      position:fixed;top:0;left:0;right:0;height:44px;
       display:${UI_PREFS.headerHidden ? "none" : "flex"};
-      align-items:center;gap:10px;padding:0 14px;
+      align-items:center;gap:6px;padding:0 8px;
       background:#ffffff;border-bottom:1px solid #e5e7eb;
       z-index:2147483647;font-family:Arial,sans-serif;
     `;
@@ -10940,8 +11485,8 @@ try {
 
     document.body.appendChild(bar);
 
-    document.documentElement.style.scrollPaddingTop = "60px";
-    document.body.style.paddingTop = UI_PREFS.headerHidden ? "" : "56px";
+    document.documentElement.style.scrollPaddingTop = "52px";
+    document.body.style.paddingTop = UI_PREFS.headerHidden ? "" : "48px";
 
     const $ = (sel) => bar.querySelector(sel);
 
@@ -10973,18 +11518,60 @@ try {
 
     $("#ssp2-h-relay-connect")?.addEventListener("click", async () => {
       try {
+        await checkRelayConnectivity({ force: true, ttlMs: 0, bootstrapForce: true });
+        try { renderPanel(); } catch (_) {}
+        return;
         const st = await checkRelayConnectivity({ force: true, ttlMs: 0 });
         if (st && st.state === "no_auth") {
-          window.open("https://track.relay.amazon.dev/", "_blank", "noopener");
-          alert("Relay auth is not captured yet. A Relay tab was opened; load a VRID in Track, then click Relay Connect again.");
+          // Legacy fallback intentionally disabled (inline retry flow is used instead).
+          // legacy alert disabled
         } else {
           renderPanel();
-          alert(`Relay connectivity: ${String(st?.state || "unknown")} — ${String(st?.message || "")}`);
+          // legacy alert disabled
         }
       } catch (e) {
-        alert(`Relay connectivity check failed: ${String((e && e.message) || e || "unknown error")}`);
+        // legacy alert disabled
       }
     });
+    // Replace relay button handler with inline-only auth/connectivity flow.
+    try {
+      const relayBtnOld = document.getElementById("ssp2-h-relay-connect");
+      if (relayBtnOld && relayBtnOld.parentNode) {
+        const relayBtn = relayBtnOld.cloneNode(true);
+        relayBtnOld.parentNode.replaceChild(relayBtn, relayBtnOld);
+        relayBtn.addEventListener("click", async () => {
+          try {
+            relayBtn.disabled = true;
+            relayBtn.textContent = "Checking...";
+            await checkRelayConnectivity({ force: true, ttlMs: 0, bootstrapForce: true });
+          } catch (_) {
+            // Inline status line shows error details.
+          } finally {
+            relayBtn.disabled = false;
+            relayBtn.textContent = "Relay Connect";
+            try { renderPanel(); } catch (_) {}
+          }
+        });
+      }
+      bar.addEventListener("click", async (e) => {
+        const retry = e.target && e.target.closest ? e.target.closest("#ssp2-relay-retry-inline") : null;
+        if (!retry) return;
+        e.preventDefault();
+        e.stopPropagation();
+        retry.disabled = true;
+        retry.textContent = "Retrying...";
+        try {
+          await checkRelayConnectivity({ force: true, ttlMs: 0, bootstrapForce: true });
+        } catch (_) {
+          // no-op
+        } finally {
+          retry.disabled = false;
+          retry.textContent = "Relay Auth Retry";
+          try { renderPanel(); } catch (_) {}
+        }
+      });
+    } catch (_) {}
+
     // Loads dropdown: classify by route keyword
     const lt = document.getElementById("ssp2-h-loadtype");
     if (lt) {
@@ -11058,7 +11645,7 @@ try {
       persistPrefs();
       const bar = document.getElementById("ssp2-pillar");
       if (bar) bar.style.display = "flex";
-      document.body.style.paddingTop = "56px";
+      document.body.style.paddingTop = "48px";
       tab.remove();
     };
 
@@ -12121,7 +12708,7 @@ function ensureMergePanel() {
   const panel = document.createElement("div");
   panel.id = "ssp-merge-panel";
   panel.style.cssText =
-    "width:min(980px,92vw);max-height:86vh;overflow:auto;background:#fff;border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.25);font-family:Arial;font-size:12px;";
+    "width:min(920px,92vw);max-height:84vh;overflow:auto;background:#fff;border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.25);font-family:Arial;font-size:12px;";
 
   panel.innerHTML = `
 
@@ -13052,7 +13639,7 @@ function ensureCasesPanel() {
 
   const panel = document.createElement("div");
   panel.id = "ssp-cases-panel";
-  panel.style.cssText = "width:min(980px,94vw);max-height:90vh;background:#fff;border-radius:14px;border:1px solid #e5e7eb;box-shadow:0 20px 70px rgba(0,0,0,.25);overflow:hidden;";
+  panel.style.cssText = "width:min(920px,92vw);max-height:86vh;background:#fff;border-radius:14px;border:1px solid #e5e7eb;box-shadow:0 20px 70px rgba(0,0,0,.25);overflow:hidden;";
 
   panel.innerHTML = `
     <div style="display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid #e5e7eb;background:#0b1020;color:#e5e7eb;">
@@ -13416,7 +14003,7 @@ function ensureDisruptionsPanel() {
 
   const panel = document.createElement("div");
   panel.id = "ssp-disrupt-panel";
-  panel.style.cssText = "width:min(1280px,96vw);max-height:90vh;background:#fff;border-radius:14px;border:1px solid #e5e7eb;box-shadow:0 20px 70px rgba(0,0,0,.25);overflow:hidden;";
+  panel.style.cssText = "width:min(1120px,94vw);max-height:86vh;background:#fff;border-radius:14px;border:1px solid #e5e7eb;box-shadow:0 20px 70px rgba(0,0,0,.25);overflow:hidden;";
 
   panel.innerHTML = `
     <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid #e5e7eb;">
@@ -15129,7 +15716,7 @@ async function openRelayCasesPanel(laneKey, cptMs) {
   if (!rows.length) {
     const rc = STATE.relayConnectivity || {};
     const hint = (String(rc.state || "") === "fallback" || String(rc.state || "") === "no_auth")
-      ? `<div style="margin-top:6px;color:#9ca3af;font-size:12px;">Relay Track is not fully available (${esc(String(rc.state||"unknown"))}). Open a VRID in Track and retry.</div>`
+      ? `<div style="margin-top:6px;color:#9ca3af;font-size:12px;">Relay Track is not fully available (${esc(String(rc.state||"unknown"))}). Use Relay Auth Retry, then refresh.</div>`
       : "";
     body.innerHTML = `<div style="padding:10px;color:#6b7280;">No Relay cases found for this lane/CPT.</div>${hint}`;
     return;
