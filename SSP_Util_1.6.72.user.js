@@ -10672,6 +10672,7 @@ function renderPlanningPanel() {
   async function _sspHydratePlanningRelayTimes(panel) {
     try {
       const node = (STATE && (STATE.nodeId || STATE.nodeID)) || "";
+      const planRelay = (STATE.__planRelayByVrid = STATE.__planRelayByVrid || {});
       const spans = panel.querySelectorAll('span[data-ssp-relay][data-vrid]');
       const vrids = Array.from(new Set(Array.from(spans).map(s=>String(s.dataset.vrid||"").trim()).filter(Boolean)));
       if (!vrids.length) return;
@@ -10687,6 +10688,19 @@ function renderPlanningPanel() {
           const sched = _sspRelayParseIsoToLocal(t.planned);
           const eta = _sspRelayParseIsoToLocal(t.eta);
           const aat = _sspRelayParseIsoToLocal(t.aat);
+          const schedMs = _msFromAny(t?.planned);
+          const etaMs = _msFromAny(t?.eta);
+          const arrivedMs = _msFromAny(t?.aat);
+          const status = String(detail?.executionStatusV2 || detail?.executionStatus || detail?.loadStatus || detail?.status || detail?.state || "").trim();
+          const prev = planRelay[v] || {};
+          planRelay[v] = {
+            ...prev,
+            scheduledMs: schedMs || prev.scheduledMs || null,
+            etaMs: etaMs || prev.etaMs || null,
+            arrivedMs: arrivedMs || prev.arrivedMs || null,
+            status: status || prev.status || "",
+            ts: Date.now(),
+          };
 
           panel.querySelectorAll(`span[data-ssp-relay="scheduled"][data-vrid="${v}"]`).forEach(el => el.textContent = sched || "-");
           panel.querySelectorAll(`span[data-ssp-relay="eta"][data-vrid="${v}"]`).forEach(el => el.textContent = eta || "-");
@@ -10801,20 +10815,38 @@ function renderPlanningPanel() {
           case "planId": return String(l?.planId || "");
           case "route": return String(l?.route || l?.lane || "");
           case "status": {
-            const st = String(l?.status || "").toUpperCase().trim();
+            const vr = String(l?.vrId || l?.vrid || "").trim();
+            const relaySt = String((STATE.__planRelayByVrid && vr && STATE.__planRelayByVrid[vr] ? STATE.__planRelayByVrid[vr].status : "") || "").toUpperCase().trim();
+            const st = String(l?.status || l?.loadStatus || "").toUpperCase().trim() || relaySt;
             const r = statusRank[st];
-            return (r != null ? r : 50);
+            return `${String(r != null ? r : 500).padStart(3, "0")}|${st || "UNKNOWN"}`;
           }
-          case "scheduled": return _getLoadTimeForPlanning({ scheduledArrivalTime: l?.scheduledArrivalTime }) || 0;
-          case "eta": return _getLoadTimeForPlanning({ estimatedArrivalTime: l?.estimatedArrivalTime }) || 0;
-          case "arrived": return _getLoadTimeForPlanning({ actualArrivalTime: l?.actualArrivalTime }) || 0;
+          case "scheduled": {
+            const vr = String(l?.vrId || l?.vrid || "").trim();
+            const relayMs = Number(STATE.__planRelayByVrid && vr && STATE.__planRelayByVrid[vr] ? STATE.__planRelayByVrid[vr].scheduledMs : 0) || 0;
+            return _getLoadTimeForPlanning({ scheduledArrivalTime: l?.scheduledArrivalTime }) || relayMs || 0;
+          }
+          case "eta": {
+            const vr = String(l?.vrId || l?.vrid || "").trim();
+            const relayMs = Number(STATE.__planRelayByVrid && vr && STATE.__planRelayByVrid[vr] ? STATE.__planRelayByVrid[vr].etaMs : 0) || 0;
+            return _getLoadTimeForPlanning({ estimatedArrivalTime: l?.estimatedArrivalTime }) || relayMs || 0;
+          }
+          case "arrived": {
+            const vr = String(l?.vrId || l?.vrid || "").trim();
+            const relayArr = Number(STATE.__planRelayByVrid && vr && STATE.__planRelayByVrid[vr] ? STATE.__planRelayByVrid[vr].arrivedMs : 0) || 0;
+            const relayEta = Number(STATE.__planRelayByVrid && vr && STATE.__planRelayByVrid[vr] ? STATE.__planRelayByVrid[vr].etaMs : 0) || 0;
+            return _getLoadTimeForPlanning({ actualArrivalTime: l?.actualArrivalTime }) || relayArr || relayEta || 0;
+          }
           case "cntrsLeft": {
+            const planId = String(l?.planId || "").trim();
+            const inTrailerC = Number(planId ? STATE?.ibContainerCount?.[planId]?.inTrailerCount?.C : NaN);
+            if (Number.isFinite(inTrailerC)) return inTrailerC;
             const nodeId = STATE?.nodeId || STATE?.nodeID || "";
             const inboundLoadId = _getInboundLoadIdForHierarchy(l);
             const cached = _getIbTrailerRemainingCached(nodeId, inboundLoadId);
             const raw = (typeof cached === "number") ? String(cached) : _getLoadContainersLeftForPlanning(l);
             const s = String(raw || "").trim();
-            if (!s || s === "…") return null;
+            if (!s || s === "..." || s === "…") return null;
             const m = s.match(/^(\d+)(?:\/(\d+))?$/);
             if (m) return Number(m[1]);
             const n = Number(s);
@@ -11383,17 +11415,23 @@ try {
 
       tr.appendChild(tdText(status));
       tr.appendChild(tdText(cntrsLeft));
-      tr.appendChild(tdText(sched));
       (function(){
         const sp = document.createElement("span");
-        sp.textContent = eta || "…";
+        sp.textContent = sched || "...";
+        sp.dataset.sspRelay = "scheduled";
+        sp.dataset.vrid = vrid || "";
+        tr.appendChild(tdNode(sp));
+      })();
+      (function(){
+        const sp = document.createElement("span");
+        sp.textContent = eta || "...";
         sp.dataset.sspRelay = "eta";
         sp.dataset.vrid = vrid || "";
         tr.appendChild(tdNode(sp));
       })();
       (function(){
         const sp = document.createElement("span");
-        sp.textContent = arrived || "…";
+        sp.textContent = arrived || "...";
         sp.dataset.sspRelay = "arrived";
         sp.dataset.vrid = vrid || "";
         tr.appendChild(tdNode(sp));
@@ -13042,6 +13080,34 @@ async function _sspRelayBuildOutboundDisruptionsForPanel(laneKey, cptMs) {
       o?.effectiveStart ??
       cptValue
     );
+  const etaFrom = (o) =>
+    _msFromAny(
+      o?.estimatedArrivalTime ??
+      o?.eta ??
+      o?.estimatedTime ??
+      o?.firstStopEstimatedArrivalTime ??
+      o?.arrival?.estimatedArrivalTime ??
+      null
+    );
+  const arrivedFrom = (o) =>
+    _msFromAny(
+      o?.actualArrivalTime ??
+      o?.arrivalTime ??
+      o?.actualTime ??
+      o?.firstStopActualArrivalTime ??
+      o?.arrival?.actualTime ??
+      o?.arrival?.completionTime ??
+      null
+    );
+  const loadStatusFrom = (o) =>
+    String(
+      o?.executionStatusV2 ??
+      o?.executionStatus ??
+      o?.loadStatus ??
+      o?.status ??
+      o?.state ??
+      ""
+    ).trim();
   const minutesFromDisruption = (d) => {
     const n = Number(
       d?.minutes ??
@@ -13072,9 +13138,8 @@ async function _sspRelayBuildOutboundDisruptionsForPanel(laneKey, cptMs) {
     const anchor = cpt || Date.now();
     const startMs = anchor - 12 * 60 * 60 * 1000;
     const endMs = anchor + 6 * 60 * 60 * 1000;
-    const restrictVrids = (String(laneKey || "") === "__ALL__")
-      ? null
-      : new Set(getFilteredOutboundVridsForLaneCpt(lane, cpt, { debugKey: "relay-disruptions-panel" }));
+    const restrictVrids = new Set(getFilteredOutboundVridsForLaneCpt(lane, cpt, { debugKey: "relay-disruptions-panel" }));
+    if (!restrictVrids.size) continue;
 
     let items = [];
     try {
@@ -13091,25 +13156,38 @@ async function _sspRelayBuildOutboundDisruptionsForPanel(laneKey, cptMs) {
     for (const it of items.slice(0, 260)) {
       const vrid = vridFrom(it);
       if (!vrid) continue;
-      if (restrictVrids && restrictVrids.size && !restrictVrids.has(vrid)) continue;
+      if (!restrictVrids.has(vrid)) continue;
       const entry = {
         vrid,
         laneKey: laneFrom(it, lane),
         cptMs: cpt || 0,
         scheduledMs: scheduledFrom(it, cpt) || null,
+        etaMs: etaFrom(it) || null,
+        arrivalMs: arrivedFrom(it) || null,
         containers: Number(it?.containers || it?.cntrsLeft || 0) || null,
         packages: Number(it?.packages || it?.pkgCount || 0) || null,
+        loadStatus: loadStatusFrom(it),
         disruptions: Array.isArray(it?.disruptions) ? it.disruptions : null,
       };
       metaByVrid.set(vrid, entry);
-      if (entry.disruptions === null) needDetails.push(vrid);
+      if (entry.disruptions === null || (!entry.scheduledMs && !entry.etaMs && !entry.arrivalMs) || !entry.loadStatus) needDetails.push(vrid);
     }
 
     for (const vrid of needDetails.slice(0, 80)) {
       try {
         const detail = await _sspRelayGetDetail(vrid, { allowFmcFallback: false });
         const rec = metaByVrid.get(vrid);
-        if (rec) rec.disruptions = _sspRelayExtractDisruptions(detail) || [];
+        if (rec) {
+          rec.disruptions = _sspRelayExtractDisruptions(detail) || [];
+          const t = _sspRelayTimesForNode(detail, (STATE && (STATE.nodeId || STATE.nodeID)) || "");
+          const sched = _msFromAny(t?.planned);
+          const eta = _msFromAny(t?.eta);
+          const arr = _msFromAny(t?.aat);
+          if (!rec.scheduledMs && sched) rec.scheduledMs = sched;
+          if (!rec.etaMs && eta) rec.etaMs = eta;
+          if (!rec.arrivalMs && arr) rec.arrivalMs = arr;
+          if (!rec.loadStatus) rec.loadStatus = loadStatusFrom(detail);
+        }
       } catch (e) {
         if (!firstErr) firstErr = e;
         const rec = metaByVrid.get(vrid);
@@ -13126,8 +13204,11 @@ async function _sspRelayBuildOutboundDisruptionsForPanel(laneKey, cptMs) {
         laneKey: rec.laneKey || lane,
         cptMs: rec.cptMs || cpt || 0,
         scheduledMs: rec.scheduledMs || null,
+        etaMs: rec.etaMs || null,
+        arrivalMs: rec.arrivalMs || null,
         containers: rec.containers,
         packages: rec.packages,
+        loadStatus: String(rec.loadStatus || ""),
         kind: String(top?.type || top?.disruptionType || top?.id || "Disruption"),
         severity: String(top?.severity || "UNKNOWN"),
         status: String(top?.status || top?.state || top?.disposition || ""),
@@ -13150,6 +13231,9 @@ async function _sspRelayBuildOutboundDisruptionsForPanel(laneKey, cptMs) {
         // Keep max disruption count and earliest schedule while preserving stronger severity row.
         cur.disruptionCount = Math.max(Number(cur.disruptionCount || 0), Number(candidate.disruptionCount || 0));
         if (!cur.scheduledMs || (candidate.scheduledMs && candidate.scheduledMs < cur.scheduledMs)) cur.scheduledMs = candidate.scheduledMs;
+        if (!cur.etaMs || (candidate.etaMs && candidate.etaMs < cur.etaMs)) cur.etaMs = candidate.etaMs;
+        if (!cur.arrivalMs || (candidate.arrivalMs && candidate.arrivalMs < cur.arrivalMs)) cur.arrivalMs = candidate.arrivalMs;
+        if (!cur.loadStatus && candidate.loadStatus) cur.loadStatus = candidate.loadStatus;
       }
     }
   }
@@ -13904,6 +13988,8 @@ async function openDisruptionsPanel(laneKey, cptMs) {
     outboundErr = e || new Error("Relay outbound disruptions unavailable");
   }
 
+  let outboundSort = String(STATE.__disruptOutboundSort || "lane_worst");
+
   const renderAll = () => {
     if (!allBox) return;
 
@@ -13931,6 +14017,21 @@ async function openDisruptionsPanel(laneKey, cptMs) {
     // Build outbound grouped-by-lane column
     let outboundHtml = "";
     if (outboundRows && outboundRows.length) {
+      const byRowSort = (a, b) => {
+        switch (outboundSort) {
+          case "scheduled_asc":
+            return (Number(a.scheduledMs || 0) - Number(b.scheduledMs || 0)) || (Number(b.minutes || 0) - Number(a.minutes || 0)) || String(a.vrid || "").localeCompare(String(b.vrid || ""));
+          case "severity_desc":
+            return (_sspRelaySeverityScore(b.severity) - _sspRelaySeverityScore(a.severity)) || (Number(b.minutes || 0) - Number(a.minutes || 0)) || String(a.vrid || "").localeCompare(String(b.vrid || ""));
+          case "containers_desc":
+            return (Number(b.containers || 0) - Number(a.containers || 0)) || (Number(b.minutes || 0) - Number(a.minutes || 0)) || String(a.vrid || "").localeCompare(String(b.vrid || ""));
+          case "vrid_asc":
+            return String(a.vrid || "").localeCompare(String(b.vrid || ""));
+          case "lane_worst":
+          default:
+            return (Number(b.minutes || 0) - Number(a.minutes || 0)) || String(a.vrid || "").localeCompare(String(b.vrid || ""));
+        }
+      };
       // Group by laneKey
       const lm = new Map();
       for (const r of outboundRows) {
@@ -13941,22 +14042,30 @@ async function openDisruptionsPanel(laneKey, cptMs) {
       // Compute lane severity (max minutes) and sort lanes by severity desc
       const lanes = Array.from(lm.entries()).map(([lane, rows]) => ({ lane, rows }));
       for (const entry of lanes) entry.maxMin = Math.max(...entry.rows.map(x => Number(x.minutes || 0) || 0));
-      lanes.sort((a,b) => Number(b.maxMin || 0) - Number(a.maxMin || 0));
+      if (outboundSort === "vrid_asc") lanes.sort((a, b) => String(a.lane || "").localeCompare(String(b.lane || "")));
+      else lanes.sort((a,b) => Number(b.maxMin || 0) - Number(a.maxMin || 0));
 
       // Render lanes as stacked cards (highest severity first)
       outboundHtml = lanes.map((ln) => {
-        const rows = ln.rows.slice().sort((a,b) => Number(b.minutes||0) - Number(a.minutes||0) || String(a.vrid||"").localeCompare(String(b.vrid||"")));
+        const rows = ln.rows.slice().sort(byRowSort);
         const laneHeader = `<div style="font-weight:900;margin-bottom:6px;">${esc(ln.lane)} — ${rows.length} VRID(s) — worst: ${rows.length?String(rows[0].minutes||0)+"m":"—"}</div>`;
         const vrs = rows.map((r) => {
           const vr = esc(r.vrid||"");
           const mins = Number(r.minutes||0);
           const cn = (r.containers == null || Number.isNaN(Number(r.containers))) ? "—" : String(Number(r.containers));
+          const pk = (r.packages == null || Number.isNaN(Number(r.packages))) ? "—" : String(Number(r.packages));
+          const sched = r.scheduledMs ? fmtTime(r.scheduledMs) : "—";
+          const etaArr = r.arrivalMs ? fmtTime(r.arrivalMs) : (r.etaMs ? fmtTime(r.etaMs) : "—");
+          const sev = String(r.severity || "UNKNOWN");
+          const kind = String(r.kind || "Disruption");
+          const loadStatus = String(r.loadStatus || "");
+          const disruptCount = Number(r.disruptionCount || 0);
           const href = (typeof buildRelayUrl === "function") ? buildRelayUrl(r.vrid || "") : "";
           const link = href ? `<a href="${esc(href)}" target="_blank" rel="noopener" style="color:#2563eb;text-decoration:none;font-weight:900;">${vr}</a>` : `<span style="color:#2563eb;font-weight:900;">${vr}</span>`;
           const caseBtn = r.caseUrl ? `<a href="${esc(r.caseUrl)}" target="_blank" rel="noopener" style="margin-left:8px;padding:4px 8px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;text-decoration:none;color:#111827;">Cases</a>` : "";
-          return `<div class="ssp-disrupt-row-ob" data-lane="${esc(ln.lane)}" data-vrid="${esc(r.vrid||"")}" style="padding:8px;margin-bottom:6px;border-radius:8px;background:#fff;border:1px solid #f3f4f6;display:flex;justify-content:space-between;align-items:center;">
-                    <div>${link}${caseBtn}<div style="font-size:11px;color:#6b7280;margin-top:4px;">C ${cn}</div></div>
-                    <div style="font-weight:900;color:#dc2626;">${String(mins)}m</div>
+          return `<div class="ssp-disrupt-row-ob" data-lane="${esc(ln.lane)}" data-cpt="${String(Number(r.cptMs || 0))}" data-vrid="${esc(r.vrid||"")}" style="padding:8px;margin-bottom:6px;border-radius:8px;background:#fff;border:1px solid #f3f4f6;display:flex;justify-content:space-between;align-items:center;gap:8px;">
+                    <div style="min-width:0;">${link}${caseBtn}<div style="font-size:11px;color:#6b7280;margin-top:4px;">${esc(kind)} • ${esc(sev)}${loadStatus ? ` • ${esc(loadStatus)}` : ""}</div><div style="font-size:11px;color:#6b7280;margin-top:3px;">Sched: ${sched} • ETA/Arr: ${etaArr} • C ${cn} • P ${pk} • Hits ${disruptCount}</div></div>
+                    <div style="font-weight:900;color:#dc2626;white-space:nowrap;">${String(mins)}m</div>
                   </div>`;
         }).join("");
         return `<div style="margin-bottom:12px;padding:10px;border-radius:10px;background:#f9fafb;border:1px solid #eef2ff;">${laneHeader}${vrs}</div>`;
@@ -13973,11 +14082,33 @@ async function openDisruptionsPanel(laneKey, cptMs) {
           ${inboundHtml}
         </div>
         <div style="flex:1;min-width:320px;">
-          <div style="font-weight:900;margin-bottom:6px;">Outbound — grouped by lane (highest severity first)</div>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;">
+            <div style="font-weight:900;">Outbound — grouped by lane</div>
+            <div style="margin-left:auto;display:flex;align-items:center;gap:6px;">
+              <label for="ssp-disrupt-ob-sort" style="color:#6b7280;font-size:11px;font-weight:800;">Sort</label>
+              <select id="ssp-disrupt-ob-sort" style="padding:4px 8px;border-radius:8px;border:1px solid #d1d5db;background:#fff;font-weight:800;font-size:11px;cursor:pointer;">
+                <option value="lane_worst">Worst Delay</option>
+                <option value="scheduled_asc">Scheduled</option>
+                <option value="severity_desc">Severity</option>
+                <option value="containers_desc">Containers</option>
+                <option value="vrid_asc">VRID</option>
+              </select>
+            </div>
+          </div>
           ${outboundHtml}
         </div>
       </div>
     `;
+
+    const sortEl = allBox.querySelector("#ssp-disrupt-ob-sort");
+    if (sortEl) {
+      sortEl.value = outboundSort;
+      sortEl.onchange = () => {
+        outboundSort = String(sortEl.value || "lane_worst");
+        try { STATE.__disruptOutboundSort = outboundSort; } catch (_) {}
+        renderAll();
+      };
+    }
 
     // Jump behavior: clicking outbound/inbound rows will scroll to action panel lane card
     allBox.querySelectorAll(".ssp-disrupt-row-ob, .ssp-disrupt-row-ib").forEach((el) => {
