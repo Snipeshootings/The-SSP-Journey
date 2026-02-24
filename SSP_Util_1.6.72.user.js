@@ -991,24 +991,51 @@ function getOpsWindow(nowMs = Date.now()) {
   // - Feeds estimates into planning panel headcount, merge panel, and inbound units
   // =====================================================
   const IB_CSV_EST = {
-    storageKey: () => `ssp2_ibCsvEstimates_v1:${String(STATE.nodeId||"").trim() || "UNKNOWN"}`,
-    maxAgeMs: 7 * 24 * 60 * 60 * 1000, // 7 days
+    keyBase: "ssp2_ibCsvEstimates_v2",
+    legacyKeyBase: "ssp2_ibCsvEstimates_v1",
+    // Keep imported lane history for roughly a quarter.
+    maxAgeMs: 120 * 24 * 60 * 60 * 1000,
   };
+
+  function _ibCsvEstStorageKeys() {
+    const node = String(STATE.nodeId || "").trim();
+    const keys = [];
+    if (node) keys.push(`${IB_CSV_EST.keyBase}:${node}`);
+    keys.push(`${IB_CSV_EST.keyBase}:GLOBAL`);
+    if (node) keys.push(`${IB_CSV_EST.legacyKeyBase}:${node}`);
+    keys.push(`${IB_CSV_EST.legacyKeyBase}:UNKNOWN`);
+    return keys;
+  }
 
   function _ibCsvEstLoadFromStorage() {
     try {
-      const raw = localStorage.getItem(IB_CSV_EST.storageKey());
-      if (!raw) return null;
-      const obj = JSON.parse(raw);
-      if (!obj || typeof obj !== "object") return null;
-      if (!obj.ts || (Date.now() - obj.ts) > IB_CSV_EST.maxAgeMs) return null;
-      return obj;
+      let best = null;
+      for (const key of _ibCsvEstStorageKeys()) {
+        const raw = localStorage.getItem(key);
+        if (!raw) continue;
+        let obj = null;
+        try { obj = JSON.parse(raw); } catch { obj = null; }
+        if (!obj || typeof obj !== "object") continue;
+        if (!obj.ts || (Date.now() - obj.ts) > IB_CSV_EST.maxAgeMs) continue;
+        if (!best || Number(obj.ts) > Number(best.ts || 0)) {
+          best = obj;
+        }
+      }
+      if (best) {
+        // Migrate legacy/unknown imports into current scoped keys.
+        _ibCsvEstSaveToStorage(best);
+      }
+      return best;
     } catch { return null; }
   }
 
   function _ibCsvEstSaveToStorage(obj) {
     try {
-      localStorage.setItem(IB_CSV_EST.storageKey(), JSON.stringify(obj));
+      const txt = JSON.stringify(obj);
+      const node = String(STATE.nodeId || "").trim();
+      if (node) localStorage.setItem(`${IB_CSV_EST.keyBase}:${node}`, txt);
+      // Global fallback lets imports survive node detection timing differences across refreshes.
+      localStorage.setItem(`${IB_CSV_EST.keyBase}:GLOBAL`, txt);
     } catch {}
   }
 
@@ -9067,39 +9094,73 @@ if (chip) {
     }
   }
 
-function _getLoadContainersLeftForPlanning(l) {
+function _getLoadCountsForPlanningMath(l, opts = {}) {
     const planId = String(l?.planId || "").trim();
-    if (!planId) return "";
+    const m = planId ? (STATE?.ibContainerCount?.[planId]) : null;
+    const it = m?.inTrailerCount || {};
+    const total = m?.totalCount || m?.total || {};
 
-    // Preferred: bulk inboundContainerCount (inTrailerCount)
-    const m = STATE?.ibContainerCount?.[planId];
-    if (m && typeof m === "object") {
-      const it = m?.inTrailerCount || {};
-      const total = m?.totalCount || m?.total || {};
-      // Convention: P=packages, C=containers
-      const c = (typeof it?.C === "number") ? it.C : null;
+    let C = (typeof it?.C === "number") ? it.C : null;
+    const pTotal = (typeof total?.P === "number") ? total.P : null;
+    const pInTrailer = (typeof it?.P === "number") ? it.P : null;
+    let P = (pTotal != null) ? pTotal : pInTrailer;
+    let source = (C != null || P != null) ? "manifest" : "";
 
-      // Prefer TOTAL package count for planning/disruptions (inTrailer packages are often 0 even when total exists)
-      const pTotal = (typeof total?.P === "number") ? total.P : null;
-      const pInTrailer = (typeof it?.P === "number") ? it.P : null;
-      const p = (pTotal != null) ? pTotal : pInTrailer;
-
-      if (p != null) {
-        STATE.__planPkgs = STATE.__planPkgs || {};
-        STATE.__planPkgs[planId] = p;
+    // Fallbacks from load-level fields if count service has not populated yet.
+    if (C == null) {
+      const cCandidates = [l?.inTrailerCount?.C, l?.inTrailerCountC, l?.containerCountInTrailer];
+      for (const v of cCandidates) {
+        const n = Number(v);
+        if (Number.isFinite(n) && n >= 0) {
+          C = n;
+          source = source || "load";
+          break;
+        }
       }
-if (c != null) return String(c);
-      // If C missing but counts exist, return blank (avoid misleading)
-      return "";
+    }
+    if (P == null) {
+      const pCandidates = [l?.totalPackages, l?.packageCount, l?.packages];
+      for (const v of pCandidates) {
+        const n = Number(v);
+        if (Number.isFinite(n) && n >= 0) {
+          P = n;
+          source = source || "load";
+          break;
+        }
+      }
     }
 
-    // Fallbacks (rare): if load already has embedded counts
-    const n =
-      Number(l?.inTrailerCount?.C) ||
-      Number(l?.inTrailerCountC) ||
-      Number(l?.containerCountInTrailer) ||
-      0;
-    return n ? String(n) : "";
+    // For unmanifested/zero rows, use imported 2wk CSV lane stats first.
+    const allowEstimate = opts && opts.allowEstimate !== false;
+    const isCompleted = String(l?.status || l?.loadStatus || "").toUpperCase().trim() === "COMPLETED";
+    if (allowEstimate && !isCompleted) {
+      const est = estimateInboundIfUnmanifested({
+        sortRoute: String(l?.route || l?.lane || "").trim(),
+        totalContainers: Number.isFinite(Number(C)) ? Number(C) : 0,
+        totalPackages: Number.isFinite(Number(P)) ? Number(P) : 0,
+        equipmentType: String(l?.equipmentType || l?.trailerEquipmentType || "").trim(),
+        loadType: String(l?.shippingPurposeType || l?.loadType || l?.shippingPurpose || "").trim(),
+      });
+      if (est && Number(est.estC) > 0) {
+        if (!(Number(C) > 0)) C = Number(est.estC);
+        if (!(Number(P) > 0) && Number.isFinite(Number(est.estP))) P = Number(est.estP);
+        source = String(est.source || "estimated");
+      }
+    }
+
+    if (P != null && planId) {
+      STATE.__planPkgs = STATE.__planPkgs || {};
+      STATE.__planPkgs[planId] = P;
+    }
+    return { planId, C, P, source };
+  }
+
+function _getLoadContainersLeftForPlanning(l) {
+    const { C } = _getLoadCountsForPlanningMath(l, { allowEstimate: true });
+    const n = Number(C);
+    if (!Number.isFinite(n)) return "";
+    const rounded = Math.round(n * 10) / 10;
+    return Number.isInteger(rounded) ? String(rounded) : String(rounded);
   }
 
 function _findShiftByKey(key) {
@@ -11436,16 +11497,16 @@ function renderPlanningPanel() {
             return _getLoadTimeForPlanning({ actualArrivalTime: l?.actualArrivalTime }) || relayArr || relayEta || 0;
           }
           case "cntrsLeft": {
-            const planId = String(l?.planId || "").trim();
-            const inTrailerC = Number(planId ? STATE?.ibContainerCount?.[planId]?.inTrailerCount?.C : NaN);
-            if (Number.isFinite(inTrailerC)) return inTrailerC;
+            const projected = _getLoadCountsForPlanningMath(l, { allowEstimate: true });
+            const projectedC = Number(projected?.C);
+            if (Number.isFinite(projectedC)) return projectedC;
             const nodeId = STATE?.nodeId || STATE?.nodeID || "";
             const inboundLoadId = _getInboundLoadIdForHierarchy(l);
             const cached = _getIbTrailerRemainingCached(nodeId, inboundLoadId);
             const raw = (typeof cached === "number") ? String(cached) : _getLoadContainersLeftForPlanning(l);
             const s = String(raw || "").trim();
             if (!s || s === "..." || s === "…") return null;
-            const m = s.match(/^(\d+)(?:\/(\d+))?$/);
+            const m = s.match(/^(\d+(?:\.\d+)?)(?:\/(\d+(?:\.\d+)?))?$/);
             if (m) return Number(m[1]);
             const n = Number(s);
             return Number.isFinite(n) ? n : null;
@@ -11486,15 +11547,8 @@ function renderPlanningPanel() {
       const mor2W = mor2 ? _shiftToWindowMs(mor2, baseDay0Ms) : null;
       const cutoffMs = mor2W ? (mor2W.endMs - 30 * 60 * 1000) : null;
 
-      // Helper: carts (C) + pkgs (P) remaining for a load (in trailer)
-      const getCounts = (l) => {
-        const planId = String(l?.planId || "").trim();
-        const m = planId ? (STATE?.ibContainerCount?.[planId]) : null;
-        const it = m?.inTrailerCount || {};
-        const C = (typeof it?.C === "number") ? it.C : null;
-        const P = (typeof it?.P === "number") ? it.P : null;
-        return { planId, C, P };
-      };
+      // Helper: carts (C) + pkgs (P) remaining for a load (in trailer), with CSV estimate fallback.
+      const getCounts = (l) => _getLoadCountsForPlanningMath(l, { allowEstimate: true });
 
       const isCompleted = (l) => String(l?.status || l?.loadStatus || "").toUpperCase() === "COMPLETED";
 
@@ -12349,13 +12403,13 @@ try {
       // Alerts panel
       const alertsPanel = document.createElement("div");
       alertsPanel.id = "ssp2-settings-tab-alerts-panel";
-      alertsPanel.style.cssText = "padding:14px;display:none;";
+      alertsPanel.style.cssText = "padding:14px;display:none;overflow:auto;flex:1;";
       alertsPanel.innerHTML = _renderAlertsSettingsHtml();
 
       // Shift panel
       const shiftPanel = document.createElement("div");
       shiftPanel.id = "ssp2-settings-tab-shift-panel";
-      shiftPanel.style.cssText = "padding:14px;display:none;";
+      shiftPanel.style.cssText = "padding:14px;display:none;overflow:auto;flex:1;";
 
       shiftPanel.innerHTML = _renderShiftSettingsHtml();
 
@@ -12655,18 +12709,21 @@ function openSettingsModal(defaultTab) {
       position:fixed;inset:0;
       background:rgba(0,0,0,.35);
       z-index:2147483647;
-      display:flex;align-items:center;justify-content:center;
+      display:flex;align-items:flex-start;justify-content:center;
+      padding:16px 12px;overflow:auto;
       font-family:Arial,sans-serif;
     `;
 
     const modal = document.createElement("div");
     modal.id = "ssp2-settings-modal";
     modal.style.cssText = `
-      width:720px;max-width:92vw;
+      width:min(1120px,96vw);
+      max-height:calc(100vh - 32px);
       background:#fff;border-radius:14px;
       box-shadow:0 10px 30px rgba(0,0,0,.25);
       border:1px solid #e5e7eb;
       overflow:hidden;
+      display:flex;flex-direction:column;
     `;
 
     modal.innerHTML = `
@@ -12678,7 +12735,7 @@ function openSettingsModal(defaultTab) {
         </div>
       </div>
 
-      <div style="padding:14px;display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+      <div style="padding:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px;flex:1;overflow:auto;align-content:start;">
         <div style="border:1px solid #e5e7eb;border-radius:12px;padding:12px;">
           <div style="font-weight:900;margin-bottom:8px;">Refresh</div>
           <label style="display:flex;justify-content:space-between;gap:10px;align-items:center;">
@@ -15911,6 +15968,11 @@ function _hhmmToMinutes(hhmm) {
   }
 
   function _getLoadContainerCount(load) {
+    const planId = String(load?.planId || "").trim();
+    const m = planId ? STATE?.ibContainerCount?.[planId] : null;
+    const totalC = (typeof m?.totalCount?.C === "number") ? m.totalCount.C : null;
+    if (Number.isFinite(totalC) && totalC >= 0) return totalC;
+
     const candidates = [
       load?.containerCount,
       load?.containers,
@@ -15918,10 +15980,26 @@ function _hhmmToMinutes(hhmm) {
       load?.expectedContainers,
       load?.units,
     ];
+    let resolved = null;
     for (const v of candidates) {
       const n = Number(v);
-      if (Number.isFinite(n) && n >= 0) return n;
+      if (Number.isFinite(n) && n >= 0) {
+        resolved = n;
+        break;
+      }
     }
+
+    if (!(Number(resolved) > 0)) {
+      const est = estimateInboundIfUnmanifested({
+        sortRoute: String(load?.route || load?.lane || "").trim(),
+        totalContainers: Number.isFinite(Number(resolved)) ? Number(resolved) : 0,
+        totalPackages: Number(load?.totalPackages ?? load?.packageCount ?? load?.packages ?? 0),
+        equipmentType: String(load?.equipmentType || load?.trailerEquipmentType || "").trim(),
+        loadType: String(load?.shippingPurposeType || load?.loadType || load?.shippingPurpose || "").trim(),
+      });
+      if (est && Number(est.estC) > 0) return Number(est.estC);
+    }
+    if (Number.isFinite(Number(resolved)) && Number(resolved) >= 0) return Number(resolved);
     return 1;
   }
 
