@@ -819,6 +819,7 @@ function getOpsWindow(nowMs = Date.now()) {
   const end = new Date(start);
   end.setDate(end.getDate() + 1);
   return { startMs: start.getTime(), endMs: end.getTime() };
+}
   // =====================================================
   // Inbound Dock Mgmt Route Averages (Completed Loads)
   // - Used to estimate containers/packages for scheduled loads that are still unmanifested upstream (0 cntrs)
@@ -1402,8 +1403,6 @@ function getOpsWindow(nowMs = Date.now()) {
       source: `avg_${avg.n || 0}`,
     };
   }
-
-}
 
   // =====================================================
   // CSV / Download Helpers
@@ -6910,7 +6909,7 @@ function ensurePanel() {
       };
     }
 
-    if (csvImportPaste) {
+    if (false && csvImportPaste) {
       csvImportPaste.onclick = () => {
         try {
           const csvText = csvImportTextarea.value.trim();
