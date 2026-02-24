@@ -2687,6 +2687,9 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
     ibContribInflight: new Set(),
     ibContribQueue: [],
     ibContribWorkerRunning: false,
+    mergeDecisionByLaneCpt: {},
+    mergeDecisionTsByLaneCpt: {},
+    mergeDecisionInflight: new Set(),
 
     overlayStats: { scanned: 0, matched: 0 },
     mergeStats: { ok: 0, soon: 0, now: 0 },
@@ -7267,6 +7270,597 @@ if (r) STATE._lastBulkFmc = { at: Date.now(), ids, resp: r };
     return laneNorm + "::" + String(Number(cptMs || 0));
   }
 
+  const MERGE_DECISION_TTL_MS = 60 * 1000;
+  const MERGE_DECISION_TARGET_UTIL = 0.85;
+
+  function _mergeDecisionKey(laneKey, cptMs) {
+    return _ibContribKey(laneKey, cptMs);
+  }
+
+  function _mergeNum(v, fallback = 0) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : Number(fallback || 0);
+  }
+
+  function _mergePct(num, den) {
+    const d = _mergeNum(den, 0);
+    if (!d || d <= 0) return 0;
+    return _mergeNum(num, 0) / d;
+  }
+
+  function _mergeScenarioMetrics(base) {
+    const capTotal = Math.max(0, _mergeNum(base?.capTotal, 0));
+    const capPer = Math.max(1, _mergeNum(base?.capPer, Number(SETTINGS.cap53ftCarts) || 36));
+    const loaded = Math.max(0, _mergeNum(base?.loaded, 0));
+    const current = Math.max(0, _mergeNum(base?.current, 0));
+    const upstream = Math.max(0, _mergeNum(base?.upstream, 0));
+    const inboundW = Math.max(0, Math.min(1, _mergeNum(base?.inboundW, Number(SETTINGS.mergeInboundWeight) || 0.35)));
+    const numerator = loaded + current + inboundW * upstream;
+    const projPct = _mergePct(numerator, capTotal);
+    const hardPct = _mergePct(loaded + current, capTotal);
+    const overage = Math.max(0, numerator - capTotal);
+    const neededLoads = (capPer > 0)
+      ? (numerator <= 0.01 ? 0 : Math.max(1, Math.ceil(numerator / capPer)))
+      : 0;
+    return {
+      capTotal,
+      capPer,
+      loaded,
+      current,
+      upstream,
+      inboundW,
+      numerator,
+      projPct,
+      hardPct,
+      overage,
+      neededLoads,
+    };
+  }
+
+  function _mergeBaselineFromGroup(g) {
+    const mm = (g && g.mergeMeta) ? g.mergeMeta : null;
+    const loads = Math.max(1, _mergeNum(mm?.loads, (Array.isArray(g?.vrids) ? g.vrids.length : 0) || 1));
+    const capTotal = Math.max(0, _mergeNum(mm?.capTotal, _mergeNum(g?.capacityTotal, 0)));
+    const capPer = Math.max(1, _mergeNum(mm?.capPer, capTotal && loads ? (capTotal / loads) : ((Number(SETTINGS.cap53ftCarts) || 36))));
+    const loaded = Math.max(0, _mergeNum(mm?.loaded, _mergeNum(g?.loadedUnits, 0)));
+    const current = Math.max(0, _mergeNum(mm?.current, _mergeNum(g?.currentUnits, 0)));
+    const upstream = Math.max(0, _mergeNum(mm?.upstream, _mergeNum(g?.inboundUnits, 0)));
+    const inboundW = Math.max(0, Math.min(1, _mergeNum(mm?.inboundW, Number(SETTINGS.mergeInboundWeight) || 0.35)));
+    const metrics = _mergeScenarioMetrics({ capTotal, capPer, loaded, current, upstream, inboundW });
+    return Object.assign({ loads }, metrics);
+  }
+
+  function _mergeStatusNorm(v) {
+    return String(v || "").trim().toUpperCase();
+  }
+
+  function _mergeInboundPresenceClass(row) {
+    const st = _mergeStatusNorm(row?.status);
+    const loc = _mergeStatusNorm(row?.loc);
+    if (st.includes("COMPLETED") || st.includes("CANCEL") || st.includes("DEPART")) return "ignore";
+    if (
+      st.includes("SCHEDULED") ||
+      st.includes("NOTARRIVED") ||
+      st.includes("NOT_ARRIVED") ||
+      st.includes("TRANSIT") ||
+      st.includes("LINEHAUL")
+    ) return "upstream";
+    if (
+      loc.includes("YARD") ||
+      loc.includes("DOOR") ||
+      loc.includes("CHECKIN") ||
+      loc.includes("CHECK-IN") ||
+      loc.includes("STAG") ||
+      loc.includes("UNLOAD") ||
+      st.includes("YARD") ||
+      st.includes("DOOR") ||
+      st.includes("CHECKIN") ||
+      st.includes("ARRIVED")
+    ) return "yard";
+    return "in_facility";
+  }
+
+  function _mergeBuildOutboundCandidates(g) {
+    const out = [];
+    const seen = new Set();
+    const rows = Array.isArray(g?.vrids) ? g.vrids : [];
+    for (const v of rows) {
+      const vrid = String(v?.vrid || v?.vrId || "").trim();
+      if (!vrid || seen.has(vrid)) continue;
+      seen.add(vrid);
+      const idx = (STATE.vridIndex && STATE.vridIndex[vrid]) ? STATE.vridIndex[vrid] : {};
+      const status = _mergeStatusNorm(v?.status || idx?.status || "");
+      if (status.includes("CANCEL") || status.includes("DEPART")) continue;
+
+      const capacity = Math.max(0, _mergeNum(idx?.capacity, v?.capacity || 0));
+      const loadedUnits = Math.max(0, _mergeNum((STATE.vridLoadedUnits && STATE.vridLoadedUnits[vrid]) || 0, 0));
+      const curRaw = Number((STATE.vridUnits && STATE.vridUnits[vrid]) || 0);
+      const currentUnits = Number.isFinite(curRaw) ? Math.max(0, curRaw) : loadedUnits;
+      let curAdj = currentUnits;
+      if (loadedUnits > 0 && curAdj >= loadedUnits && capacity > 0 && (curAdj - loadedUnits) <= capacity) {
+        curAdj = Math.max(0, curAdj - loadedUnits);
+      }
+      const facilityUnits = loadedUnits + Math.max(0, curAdj);
+      const facilityUtilPct = _mergePct(facilityUnits, capacity);
+      const underutilScore = (capacity > 0 && facilityUtilPct < MERGE_DECISION_TARGET_UTIL)
+        ? (MERGE_DECISION_TARGET_UTIL - facilityUtilPct)
+        : 0;
+      out.push({
+        vrid,
+        capacity,
+        loadedUnits,
+        currentUnits,
+        facilityUnits,
+        facilityUtilPct,
+        underutilScore,
+        status: String(v?.status || idx?.status || ""),
+        loadGroupId: String(idx?.loadGroupId || v?.loadGroupId || "").trim(),
+      });
+    }
+
+    out.sort((a, b) =>
+      (_mergeNum(a.facilityUtilPct, 0) - _mergeNum(b.facilityUtilPct, 0)) ||
+      (_mergeNum(a.facilityUnits, 0) - _mergeNum(b.facilityUnits, 0)) ||
+      String(a.vrid).localeCompare(String(b.vrid))
+    );
+    return out;
+  }
+
+  function _mergeBuildInboundCandidates(g) {
+    const lane = String(g?.lane || "-").trim();
+    const cptMs = Number(g?.cptMs || 0);
+    const key = _mergeDecisionKey(lane, cptMs);
+    const rows = (STATE.ibContribByLaneCpt && Array.isArray(STATE.ibContribByLaneCpt[key])) ? STATE.ibContribByLaneCpt[key] : [];
+    const out = [];
+    for (const r of rows) {
+      const vrid = String(r?.vrid || "").trim();
+      const planId = String(r?.planId || "").trim();
+      const units = Math.max(0, _mergeNum(r?.units, 0));
+      const containers = Math.max(0, _mergeNum(r?.containers, 0));
+      if (!vrid || !planId || !(units > 0 || containers > 0)) continue;
+      const attributed = true;
+      const presenceClass = _mergeInboundPresenceClass(r);
+      let mergeable = false;
+      let mergeableReason = "";
+      if (!attributed) {
+        mergeable = false;
+        mergeableReason = "Not attributable to lane/CPT";
+      } else if (presenceClass === "ignore") {
+        mergeable = false;
+        mergeableReason = "Completed/cancelled/departed";
+      } else if (presenceClass === "upstream") {
+        mergeable = false;
+        mergeableReason = "Upstream only";
+      } else {
+        mergeable = true;
+        mergeableReason = "Eligible";
+      }
+      out.push({
+        vrid,
+        planId,
+        units,
+        containers,
+        status: String(r?.status || ""),
+        loc: String(r?.loc || ""),
+        attributed,
+        presenceClass,
+        mergeable,
+        mergeableReason,
+      });
+    }
+    out.sort((a, b) =>
+      (_mergeNum(b.units, 0) - _mergeNum(a.units, 0)) ||
+      (_mergeNum(b.containers, 0) - _mergeNum(a.containers, 0)) ||
+      String(a.vrid).localeCompare(String(b.vrid))
+    );
+    return out;
+  }
+
+  async function _mergeFetchOutboundBlockers(lane, cptMs) {
+    const out = [];
+    try {
+      if (typeof _sspRelayBuildOutboundDisruptionsForPanel !== "function") return out;
+      const relay = await _sspRelayBuildOutboundDisruptionsForPanel(lane, cptMs);
+      const rows = Array.isArray(relay?.rows) ? relay.rows : [];
+      for (const r of rows.slice(0, 24)) {
+        const mins = _mergeNum(r?.minutes, 0);
+        out.push({
+          blockerType: "outbound_disruption",
+          severity: mins >= 60 ? "critical" : "warning",
+          lane: String(r?.laneKey || lane || ""),
+          cptMs: Number(r?.cptMs || cptMs || 0),
+          vrid: String(r?.vrid || ""),
+          minutes: mins,
+          source: "relay",
+          message: `${String(r?.kind || "Disruption")} ${mins ? `(${mins}m)` : ""}`.trim(),
+        });
+      }
+    } catch (_) {}
+    return out;
+  }
+
+  function _mergeBuildBlockers(g, inboundCandidates) {
+    const lane = String(g?.lane || "-").trim();
+    const cptMs = Number(g?.cptMs || 0);
+    const key = _mergeDecisionKey(lane, cptMs);
+    const out = [];
+    try {
+      const inboundRows = (typeof computeDisruptionsForLaneCpt === "function")
+        ? (computeDisruptionsForLaneCpt(lane, cptMs) || [])
+        : [];
+      for (const r of inboundRows.slice(0, 36)) {
+        const mins = _mergeNum(r?.minutes, 0);
+        out.push({
+          blockerType: "inbound_disruption",
+          severity: mins >= 60 ? "critical" : "warning",
+          lane,
+          cptMs,
+          vrid: String(r?.vrid || ""),
+          minutes: mins,
+          source: "ssp",
+          message: `${String(r?.kind || "Inbound issue")} ${mins ? `(${mins}m)` : ""}`.trim(),
+        });
+      }
+    } catch (_) {}
+
+    if (g?.currentUnitsPending) {
+      out.push({
+        blockerType: "data_quality",
+        severity: "warning",
+        lane,
+        cptMs,
+        source: "ssp",
+        message: "Current units are still loading",
+      });
+    }
+    if (g?.inboundUnitsPending) {
+      out.push({
+        blockerType: "data_quality",
+        severity: "warning",
+        lane,
+        cptMs,
+        source: "ssp",
+        message: "Inbound units are still loading",
+      });
+    }
+    if (!Array.isArray(g?.loadGroupIds) || !g.loadGroupIds.length) {
+      out.push({
+        blockerType: "data_quality",
+        severity: "warning",
+        lane,
+        cptMs,
+        source: "ssp",
+        message: "Missing lane/loadGroup attribution",
+      });
+    }
+    const ts = Number((STATE.ibContribTsByLaneCpt && STATE.ibContribTsByLaneCpt[key]) || 0);
+    if (ts && (Date.now() - ts) > (5 * 60 * 1000)) {
+      out.push({
+        blockerType: "data_quality",
+        severity: "warning",
+        lane,
+        cptMs,
+        source: "cache",
+        message: "Inbound contributor cache is stale",
+      });
+    }
+    if (Array.isArray(inboundCandidates) && !inboundCandidates.length) {
+      out.push({
+        blockerType: "data_quality",
+        severity: "warning",
+        lane,
+        cptMs,
+        source: "ssp",
+        message: "No inbound VRIDs attributable to lane/CPT",
+      });
+    }
+    return out;
+  }
+
+  function _mergeAttachBlockers(action, blockers) {
+    const lane = String(action?.references?.lane || "");
+    const cptMs = Number(action?.references?.cptMs || 0);
+    const inV = String(action?.references?.inboundVrid || "").trim();
+    const outV = String(action?.references?.outboundVrid || "").trim();
+    const refs = [];
+    for (const b of (blockers || [])) {
+      if (!b) continue;
+      if (String(b.lane || "") !== lane) continue;
+      if (Number(b.cptMs || 0) !== cptMs) continue;
+      const bv = String(b.vrid || "").trim();
+      if (!bv || bv === inV || bv === outV) refs.push(b);
+    }
+    return refs;
+  }
+
+  function _mergeAttachCandidateBlockers(candidate, blockers, lane, cptMs) {
+    const vrid = String(candidate?.vrid || "").trim();
+    const refs = [];
+    for (const b of (blockers || [])) {
+      if (!b) continue;
+      if (String(b.lane || "") !== String(lane || "")) continue;
+      if (Number(b.cptMs || 0) !== Number(cptMs || 0)) continue;
+      const bv = String(b.vrid || "").trim();
+      if (!bv || (vrid && bv === vrid)) refs.push(b);
+    }
+    return refs;
+  }
+
+  function _mergeBuildActions(snapshot) {
+    const actions = [];
+    const baseline = snapshot?.baseline || _mergeScenarioMetrics({});
+    const outbound = Array.isArray(snapshot?.outboundCandidates) ? snapshot.outboundCandidates : [];
+    const inbound = Array.isArray(snapshot?.inboundCandidates) ? snapshot.inboundCandidates : [];
+    const target = MERGE_DECISION_TARGET_UTIL;
+
+    for (const i of inbound) {
+      if (!i || i.presenceClass === "ignore") continue;
+      const isFacility = i.presenceClass === "in_facility";
+      const isYardLike = (i.presenceClass === "yard" || i.presenceClass === "upstream");
+      let postCurrent = baseline.current;
+      let postUpstream = baseline.upstream;
+      if (isFacility) postCurrent = Math.max(0, baseline.current - _mergeNum(i.units, 0));
+      else if (isYardLike) postUpstream = Math.max(0, baseline.upstream - _mergeNum(i.units, 0));
+      const post = _mergeScenarioMetrics({
+        capTotal: baseline.capTotal,
+        capPer: baseline.capPer,
+        loaded: baseline.loaded,
+        current: postCurrent,
+        upstream: postUpstream,
+        inboundW: baseline.inboundW,
+      });
+      const riskDelta = _mergeNum(baseline.overage, 0) - _mergeNum(post.overage, 0);
+      const utilGain = (
+        Math.max(0, _mergeNum(baseline.projPct, 0) - 1) -
+        Math.max(0, _mergeNum(post.projPct, 0) - 1)
+      ) * 100;
+      actions.push({
+        actionType: "cancel_inbound",
+        title: `Cancel inbound ${i.vrid}`,
+        reason: `Simulate canceling inbound ${i.vrid} (${i.presenceClass})`,
+        riskDelta,
+        utilGain,
+        touches: 1,
+        scenario: { baseline, post },
+        references: { inboundVrid: i.vrid, lane: snapshot.lane, cptMs: snapshot.cptMs },
+      });
+    }
+
+    for (const o of outbound) {
+      const cap = _mergeNum(o?.capacity, 0);
+      const capTotalPost = _mergeNum(baseline.capTotal, 0) - cap;
+      if (capTotalPost <= 0) continue;
+      const post = _mergeScenarioMetrics({
+        capTotal: capTotalPost,
+        capPer: baseline.capPer,
+        loaded: baseline.loaded,
+        current: baseline.current,
+        upstream: baseline.upstream,
+        inboundW: baseline.inboundW,
+      });
+      const riskDelta = _mergeNum(baseline.overage, 0) - _mergeNum(post.overage, 0);
+      const utilGain = (
+        Math.max(0, _mergeNum(baseline.projPct, 0) - 1) -
+        Math.max(0, _mergeNum(post.projPct, 0) - 1)
+      ) * 100;
+      actions.push({
+        actionType: "cancel_outbound",
+        title: `Cancel outbound ${o.vrid}`,
+        reason: `Reduce capacity by ${cap} units (what-if)`,
+        riskDelta,
+        utilGain,
+        touches: 1,
+        scenario: { baseline, post },
+        references: { outboundVrid: o.vrid, lane: snapshot.lane, cptMs: snapshot.cptMs },
+      });
+    }
+
+    const mergeableInbound = inbound
+      .filter((x) => x && x.mergeable)
+      .slice()
+      .sort((a, b) => (_mergeNum(b.units, 0) - _mergeNum(a.units, 0)) || String(a.vrid).localeCompare(String(b.vrid)));
+    const receivingOutbound = outbound
+      .filter((x) => x && _mergeNum(x.capacity, 0) > 0 && _mergeNum(x.facilityUtilPct, 0) < target)
+      .slice()
+      .sort((a, b) => (_mergeNum(a.facilityUtilPct, 0) - _mergeNum(b.facilityUtilPct, 0)) || String(a.vrid).localeCompare(String(b.vrid)));
+
+    const usedInbound = new Set();
+    for (const i of mergeableInbound) {
+      if (usedInbound.has(i.vrid)) continue;
+      let best = null;
+      for (const o of receivingOutbound) {
+        const cap = _mergeNum(o.capacity, 0);
+        if (cap <= 0) continue;
+        const postUtil = _mergePct((_mergeNum(o.facilityUnits, 0) + _mergeNum(i.units, 0)), cap);
+        if (postUtil > 1) continue;
+        const beforeGap = Math.abs(target - _mergeNum(o.facilityUtilPct, 0));
+        const afterGap = Math.abs(target - postUtil);
+        const utilGain = (beforeGap - afterGap) * 100;
+        const cand = { o, postUtil, utilGain };
+        if (!best) best = cand;
+        else {
+          const bestDist = Math.abs(target - _mergeNum(best.postUtil, 0));
+          const curDist = Math.abs(target - _mergeNum(cand.postUtil, 0));
+          if (curDist < bestDist || (curDist === bestDist && _mergeNum(cand.utilGain, 0) > _mergeNum(best.utilGain, 0))) best = cand;
+        }
+      }
+      if (!best) continue;
+      usedInbound.add(i.vrid);
+      actions.push({
+        actionType: "merge_pair",
+        title: `Merge ${i.vrid} -> ${best.o.vrid}`,
+        reason: `Post-merge target alignment near ${Math.round(target * 100)}%`,
+        riskDelta: 0,
+        utilGain: _mergeNum(best.utilGain, 0),
+        touches: 2,
+        scenario: {
+          baseline,
+          post: {
+            outboundVrid: best.o.vrid,
+            outboundPreUtilPct: _mergeNum(best.o.facilityUtilPct, 0),
+            outboundPostUtilPct: _mergeNum(best.postUtil, 0),
+            outboundCapacity: _mergeNum(best.o.capacity, 0),
+            outboundFacilityUnits: _mergeNum(best.o.facilityUnits, 0),
+            inboundUnits: _mergeNum(i.units, 0),
+          },
+        },
+        references: { inboundVrid: i.vrid, outboundVrid: best.o.vrid, lane: snapshot.lane, cptMs: snapshot.cptMs },
+      });
+    }
+
+    if (!actions.length) {
+      actions.push({
+        actionType: "hold",
+        title: "Hold",
+        reason: "No higher-value action detected for this lane/CPT",
+        riskDelta: 0,
+        utilGain: 0,
+        touches: 0,
+        scenario: { baseline, post: baseline },
+        references: { lane: snapshot.lane, cptMs: snapshot.cptMs },
+      });
+    }
+    return actions;
+  }
+
+  function _mergeSortActions(actions) {
+    const arr = Array.isArray(actions) ? actions.slice() : [];
+    arr.sort((a, b) =>
+      (_mergeNum(b?.riskDelta, 0) - _mergeNum(a?.riskDelta, 0)) ||
+      (_mergeNum(b?.utilGain, 0) - _mergeNum(a?.utilGain, 0)) ||
+      (_mergeNum(a?.touches, 0) - _mergeNum(b?.touches, 0)) ||
+      String(a?.references?.outboundVrid || a?.references?.inboundVrid || "").localeCompare(
+        String(b?.references?.outboundVrid || b?.references?.inboundVrid || "")
+      )
+    );
+    return arr;
+  }
+
+  async function _computeMergeDecisionForGroup(g, options = {}) {
+    const lane = String(g?.lane || "-").trim();
+    const cptMs = Number(g?.cptMs || 0);
+    const key = _mergeDecisionKey(lane, cptMs);
+
+    const baseline = _mergeBaselineFromGroup(g || {});
+    const outboundCandidates = _mergeBuildOutboundCandidates(g || {});
+    const inboundCandidates = _mergeBuildInboundCandidates(g || {});
+    const blockers = _mergeBuildBlockers(g || {}, inboundCandidates);
+
+    if (options.includeRelay) {
+      const ob = await _mergeFetchOutboundBlockers(lane, cptMs);
+      for (const b of (ob || [])) blockers.push(b);
+    }
+
+    const outboundWithBlockers = outboundCandidates.map((r) => ({
+      ...r,
+      blockers: _mergeAttachCandidateBlockers(r, blockers, lane, cptMs),
+    }));
+    const inboundWithBlockers = inboundCandidates.map((r) => ({
+      ...r,
+      blockers: _mergeAttachCandidateBlockers(r, blockers, lane, cptMs),
+    }));
+
+    const snapshot = {
+      key,
+      lane,
+      cptMs,
+      generatedAt: Date.now(),
+      baseline: {
+        capTotal: baseline.capTotal,
+        loaded: baseline.loaded,
+        current: baseline.current,
+        upstream: baseline.upstream,
+        inboundW: baseline.inboundW,
+        projPct: baseline.projPct,
+        hardPct: baseline.hardPct,
+        overage: baseline.overage,
+        neededLoads: baseline.neededLoads,
+        capPer: baseline.capPer,
+      },
+      outboundCandidates: outboundWithBlockers,
+      inboundCandidates: inboundWithBlockers,
+      actions: [],
+      topActions: [],
+      blockers,
+    };
+
+    const actions = _mergeSortActions(_mergeBuildActions(snapshot));
+    for (const a of actions) {
+      a.blockers = _mergeAttachBlockers(a, blockers);
+    }
+    snapshot.actions = actions;
+    snapshot.topActions = actions.slice(0, 3);
+    return snapshot;
+  }
+
+  function _isMergeDecisionFresh(key, maxAgeMs = MERGE_DECISION_TTL_MS) {
+    try {
+      const ts = Number((STATE.mergeDecisionTsByLaneCpt && STATE.mergeDecisionTsByLaneCpt[key]) || 0);
+      if (!ts) return false;
+      return (Date.now() - ts) <= Number(maxAgeMs || 0);
+    } catch (_) { return false; }
+  }
+
+  function _scheduleMergeDecisionRender() {
+    try {
+      if (STATE.__mergeDecisionRenderTimer) clearTimeout(STATE.__mergeDecisionRenderTimer);
+      STATE.__mergeDecisionRenderTimer = setTimeout(() => {
+        try { if (typeof renderPanel === "function") renderPanel(); } catch (_) {}
+      }, 80);
+    } catch (_) {}
+  }
+
+  function _getMergeDecisionForGroup(g) {
+    const key = _mergeDecisionKey(String(g?.lane || "-"), Number(g?.cptMs || 0));
+    return (STATE.mergeDecisionByLaneCpt && STATE.mergeDecisionByLaneCpt[key]) ? STATE.mergeDecisionByLaneCpt[key] : null;
+  }
+
+  async function _ensureMergeDecisionForGroup(g, options = {}) {
+    try {
+      if (!g) return null;
+      const lane = String(g?.lane || "-").trim();
+      const cptMs = Number(g?.cptMs || 0);
+      const key = _mergeDecisionKey(lane, cptMs);
+      if (!key) return null;
+
+      const force = !!options.force;
+      const ttlMs = Number(options.ttlMs || MERGE_DECISION_TTL_MS);
+      if (!force && _isMergeDecisionFresh(key, ttlMs)) return STATE.mergeDecisionByLaneCpt[key] || null;
+
+      if (STATE.mergeDecisionInflight.has(key)) return STATE.mergeDecisionByLaneCpt[key] || null;
+      STATE.mergeDecisionInflight.add(key);
+      try {
+        const snap = await _computeMergeDecisionForGroup(g, { includeRelay: !!options.includeRelay });
+        STATE.mergeDecisionByLaneCpt[key] = snap;
+        STATE.mergeDecisionTsByLaneCpt[key] = Date.now();
+        if (!options.silentRender) _scheduleMergeDecisionRender();
+        return snap;
+      } finally {
+        try { STATE.mergeDecisionInflight.delete(key); } catch (_) {}
+      }
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function _renderMergeTopActionsHtml(snapshot, esc) {
+    if (!snapshot || !Array.isArray(snapshot.topActions) || !snapshot.topActions.length) {
+      return `<div style="margin-top:6px;color:#6b7280;font-size:12px;">Top actions: computing...</div>`;
+    }
+    const rows = snapshot.topActions.map((a) => {
+      const kind = String(a?.actionType || "").replace(/_/g, " ").toUpperCase();
+      const tab = _mergeNormalizeScenarioTab(a?.actionType);
+      const rv = _mergeNum(a?.riskDelta, 0);
+      const uv = _mergeNum(a?.utilGain, 0);
+      const color = rv > 0 ? "#065f46" : (uv > 0 ? "#1d4ed8" : "#6b7280");
+      return `<span class="open-merge" data-lane="${esc(snapshot.lane)}" data-cpt="${snapshot.cptMs}" data-merge-tab="${tab}" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;padding:2px 8px;border-radius:999px;border:1px solid #e5e7eb;background:#fff;">
+        <span style="font-weight:900;color:#111827;">${esc(kind)}</span>
+        <span style="font-weight:800;color:${color};">R ${rv.toFixed(1)} | U ${uv.toFixed(1)}</span>
+      </span>`;
+    }).join(" ");
+    return `<div style="margin-top:6px;"><div style="color:#374151;font-weight:900;margin-bottom:4px;">Top Actions</div><div style="display:flex;gap:6px;flex-wrap:wrap;">${rows}</div></div>`;
+  }
+
   function _isIbContribFresh(lgKey, maxAgeMs) {
     try {
       const ts = Number(STATE.ibContribTsByLaneCpt?.[lgKey] || 0);
@@ -8180,6 +8774,9 @@ if (DEBUG.laneGroups) {
           const __ibRows = (STATE.ibContribByLaneCpt && STATE.ibContribByLaneCpt[__ibKey]) ? STATE.ibContribByLaneCpt[__ibKey] : [];
           const __ibTs = (STATE.ibContribTsByLaneCpt && STATE.ibContribTsByLaneCpt[__ibKey]) ? Number(STATE.ibContribTsByLaneCpt[__ibKey]||0) : 0;
 
+          try { void _ensureMergeDecisionForGroup(g, { includeRelay: false }); } catch (_) {}
+          const __decision = _getMergeDecisionForGroup(g);
+          const __topActionsHtml = _renderMergeTopActionsHtml(__decision, esc);
           const ibContribHtml = '';
 // Disruptions indicator (empty until we have lates/slips)
 const __dkey = _ibContribKey(g.lane, g.cptMs);
@@ -8210,7 +8807,7 @@ const __caseVridCount = (STATE.obCaseVridCountByLaneCpt && typeof STATE.obCaseVr
   ? STATE.obCaseVridCountByLaneCpt[__caseKey]
   : 0;
 
-return `            <details ${idx == 0 ? "open" : ""} style="border:1px solid #e5e7eb;border-radius:12px;padding:10px;margin-bottom:8px;background:#fff;">              <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:10px;">                <div style="font-weight:900;">                  <span class="ssp-open-lane-map" data-lane="${esc(g.lane)}" data-cpt="${g.cptMs}" style="cursor:pointer;text-decoration:underline;">${esc(g.lane)}</span> (${fmtCptLabel((g && g.cptMs) || (lane && lane.cptMs) || cptMs)})                  <div style="margin-top:2px;color:#111827;font-weight:800;">${sub}</div>${ibContribHtml}                  <div style="margin-top:2px;color:#6b7280;font-weight:800;">Loads shown: ${g.vrids.length} | CPT remaining loads: ${g.remainingLoadsCpt}</div>                </div>                <div style="display:flex;gap:6px;align-items:center;">
+return `            <details ${idx == 0 ? "open" : ""} style="border:1px solid #e5e7eb;border-radius:12px;padding:10px;margin-bottom:8px;background:#fff;">              <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:10px;">                <div style="font-weight:900;">                  <span class="ssp-open-lane-map" data-lane="${esc(g.lane)}" data-cpt="${g.cptMs}" style="cursor:pointer;text-decoration:underline;">${esc(g.lane)}</span> (${fmtCptLabel((g && g.cptMs) || (lane && lane.cptMs) || cptMs)})                  <div style="margin-top:2px;color:#111827;font-weight:800;">${sub}</div>${__topActionsHtml}${ibContribHtml}                  <div style="margin-top:2px;color:#6b7280;font-weight:800;">Loads shown: ${g.vrids.length} | CPT remaining loads: ${g.remainingLoadsCpt}</div>                </div>                <div style="display:flex;gap:6px;align-items:center;">
 	                  <span class="cap-dot open-merge" data-lane="${esc(g.lane)}" data-cpt="${g.cptMs}" title="Capacity: ${capLabel(pct)} (${pct}%)" style="cursor:pointer;width:12px;height:12px;border-radius:999px;display:inline-block;border:1px solid #e5e7eb;background:${capColor(pct)};"></span>
 <span class="merge-dot open-merge" data-lane="${esc(g.lane)}" data-cpt="${g.cptMs}" title="Merge: ${stateLabel(g.mergeState)}" style="cursor:pointer;width:12px;height:12px;border-radius:999px;display:inline-block;border:1px solid #e5e7eb;background:${stateColor(g.mergeState)};"></span>
 ${disruptDotHtml}
@@ -8278,7 +8875,8 @@ if (chip) {
   e.stopPropagation();
   const lane = chip.getAttribute("data-lane") || "";
   const cpt = Number(chip.getAttribute("data-cpt") || 0);
-  openMergePanel(lane, cpt);
+  const initialTab = chip.getAttribute("data-merge-tab") || "";
+  openMergePanel(lane, cpt, { initialTab });
   return;
 }
 
@@ -12808,6 +13406,31 @@ function ensureMergePanel() {
       <div style="font-weight:900;margin:6px 0;">Inbound VRIDs contributing to this route</div>
       <div id="ssp-merge-inb" style="border:1px solid #e5e7eb;border-radius:10px;padding:10px;"></div>
     </div>
+
+    <div style="padding:0 12px 12px 12px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin:6px 0;">
+        <div style="font-weight:900;">Decision Engine</div>
+        <button id="ssp-merge-decision-refresh" style="padding:4px 10px;border:1px solid #d1d5db;border-radius:8px;background:#fff;cursor:pointer;font-weight:800;">Refresh recommendations</button>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div>
+          <div style="font-weight:900;margin-bottom:6px;">Section A: Outbound receiving candidates</div>
+          <div id="ssp-merge-outbound-recv" style="border:1px solid #e5e7eb;border-radius:10px;padding:10px;max-height:26vh;overflow:auto;"></div>
+        </div>
+        <div>
+          <div style="font-weight:900;margin-bottom:6px;">Section B: Inbound mergeable candidates</div>
+          <div id="ssp-merge-inbound-mergeable" style="border:1px solid #e5e7eb;border-radius:10px;padding:10px;max-height:26vh;overflow:auto;"></div>
+        </div>
+      </div>
+      <div style="margin-top:10px;">
+        <div style="font-weight:900;margin-bottom:6px;">Section C: Scenario results</div>
+        <div id="ssp-merge-actions" style="border:1px solid #e5e7eb;border-radius:10px;padding:10px;"></div>
+      </div>
+      <div style="margin-top:10px;">
+        <div style="font-weight:900;margin-bottom:6px;">Section D: Blockers</div>
+        <div id="ssp-merge-blockers" style="border:1px solid #e5e7eb;border-radius:10px;padding:10px;"></div>
+      </div>
+    </div>
   `;
 
   overlay.appendChild(panel);
@@ -12821,6 +13444,185 @@ function ensureMergePanel() {
   panel.querySelector("#ssp-merge-close").addEventListener("click", () => {
     overlay.style.display = "none";
   });
+}
+
+function _mergeEsc(v) {
+  return String(v ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function _mergeFmtPct(p) {
+  const n = Number(p || 0);
+  if (!Number.isFinite(n)) return "0%";
+  return `${Math.round(n * 100)}%`;
+}
+
+function _mergeFmtSigned(n, digits = 1) {
+  const v = Number(n || 0);
+  if (!Number.isFinite(v)) return "0.0";
+  const s = v.toFixed(digits);
+  return v > 0 ? `+${s}` : s;
+}
+
+function _mergeNormalizeScenarioTab(tab) {
+  const t = String(tab || "").trim().toLowerCase();
+  if (t === "cancel_inbound" || t === "cancel_outbound" || t === "merge_pair") return t;
+  return "merge_pair";
+}
+
+function _mergeRenderScenarioRows(actions, tabId) {
+  const rows = (Array.isArray(actions) ? actions : []).filter((a) => {
+    if (tabId === "cancel_inbound") return a?.actionType === "cancel_inbound";
+    if (tabId === "cancel_outbound") return a?.actionType === "cancel_outbound";
+    if (tabId === "merge_pair") return a?.actionType === "merge_pair";
+    return false;
+  });
+  if (!rows.length) return `<div style="color:#6b7280;">No scenarios for this tab.</div>`;
+  return rows.slice(0, 30).map((a) => {
+    const rv = Number(a?.riskDelta || 0);
+    const uv = Number(a?.utilGain || 0);
+    const refIn = String(a?.references?.inboundVrid || "").trim();
+    const refOut = String(a?.references?.outboundVrid || "").trim();
+    const blk = Array.isArray(a?.blockers) ? a.blockers.length : 0;
+    let postExtra = "";
+    if (a?.actionType === "merge_pair") {
+      const postPct = Number(a?.scenario?.post?.outboundPostUtilPct || 0);
+      postExtra = ` | post util ${_mergeFmtPct(postPct)}`;
+    } else {
+      const post = a?.scenario?.post || {};
+      postExtra = ` | post proj ${_mergeFmtPct(post?.projPct || 0)}`;
+    }
+    return `<div style="padding:8px 0;border-top:1px solid #f3f4f6;">
+      <div style="font-weight:900;">${_mergeEsc(a?.title || "Action")}</div>
+      <div style="color:#374151;font-size:12px;">${_mergeEsc(a?.reason || "")}</div>
+      <div style="margin-top:2px;font-size:12px;">
+        <span style="font-weight:800;color:${rv > 0 ? "#065f46" : "#7f1d1d"};">Risk d ${_mergeFmtSigned(rv)}</span>
+        <span style="margin-left:8px;font-weight:800;color:${uv > 0 ? "#1d4ed8" : "#6b7280"};">Util d ${_mergeFmtSigned(uv)}</span>
+        <span style="margin-left:8px;color:#6b7280;">touches ${Number(a?.touches || 0)}${_mergeEsc(postExtra)}</span>
+        ${refIn ? `<span style="margin-left:8px;color:#111827;font-weight:800;">IB ${_mergeEsc(refIn)}</span>` : ""}
+        ${refOut ? `<span style="margin-left:8px;color:#111827;font-weight:800;">OB ${_mergeEsc(refOut)}</span>` : ""}
+        ${blk ? `<span style="margin-left:8px;color:#92400e;font-weight:800;">blockers ${blk}</span>` : ""}
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function _renderMergeDecisionPanelSnapshot(snapshot, laneKey, cptMs, options = {}) {
+  const outEl = document.getElementById("ssp-merge-outbound-recv");
+  const inEl = document.getElementById("ssp-merge-inbound-mergeable");
+  const actEl = document.getElementById("ssp-merge-actions");
+  const blkEl = document.getElementById("ssp-merge-blockers");
+  if (!outEl || !inEl || !actEl || !blkEl) return;
+
+  if (!snapshot) {
+    outEl.innerHTML = `<div style="color:#6b7280;">Loading outbound candidates...</div>`;
+    inEl.innerHTML = `<div style="color:#6b7280;">Loading inbound candidates...</div>`;
+    actEl.innerHTML = `<div style="color:#6b7280;">Computing scenarios...</div>`;
+    blkEl.innerHTML = `<div style="color:#6b7280;">Loading blockers...</div>`;
+    return;
+  }
+
+  const outRows = (snapshot.outboundCandidates || []).filter((x) => Number(x?.capacity || 0) > 0);
+  const recvRows = outRows.filter((x) => Number(x?.facilityUtilPct || 0) < MERGE_DECISION_TARGET_UTIL);
+  outEl.innerHTML = recvRows.length
+    ? `<table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <thead><tr>
+          <th style="text-align:left;padding:6px 8px;">VRID</th>
+          <th style="text-align:right;padding:6px 8px;">Facility</th>
+          <th style="text-align:right;padding:6px 8px;">Util</th>
+          <th style="text-align:right;padding:6px 8px;">Slack to 85%</th>
+          <th style="text-align:right;padding:6px 8px;">Blockers</th>
+        </tr></thead>
+        <tbody>
+          ${recvRows.slice(0, 40).map((r) => {
+            const cap = Number(r?.capacity || 0);
+            const fac = Number(r?.facilityUnits || 0);
+            const util = Number(r?.facilityUtilPct || 0);
+            const slack = Math.max(0, (MERGE_DECISION_TARGET_UTIL * cap) - fac);
+            const blk = Array.isArray(r?.blockers) ? r.blockers.length : 0;
+            return `<tr>
+              <td style="padding:6px 8px;border-top:1px solid #f3f4f6;font-weight:900;">${_mergeEsc(r?.vrid || "")}</td>
+              <td style="padding:6px 8px;border-top:1px solid #f3f4f6;text-align:right;">${fac}/${cap}</td>
+              <td style="padding:6px 8px;border-top:1px solid #f3f4f6;text-align:right;">${_mergeFmtPct(util)}</td>
+              <td style="padding:6px 8px;border-top:1px solid #f3f4f6;text-align:right;">${slack.toFixed(1)}</td>
+              <td style="padding:6px 8px;border-top:1px solid #f3f4f6;text-align:right;color:${blk ? "#92400e" : "#6b7280"};font-weight:${blk ? "900" : "700"};">${blk}</td>
+            </tr>`;
+          }).join("")}
+        </tbody>
+      </table>`
+    : `<div style="color:#6b7280;">No underutilized outbound candidates below 85%.</div>`;
+
+  const inRows = Array.isArray(snapshot.inboundCandidates) ? snapshot.inboundCandidates : [];
+  inEl.innerHTML = inRows.length
+    ? `<table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <thead><tr>
+          <th style="text-align:left;padding:6px 8px;">VRID</th>
+          <th style="text-align:right;padding:6px 8px;">Units</th>
+          <th style="text-align:left;padding:6px 8px;">Presence</th>
+          <th style="text-align:left;padding:6px 8px;">Attributed</th>
+          <th style="text-align:left;padding:6px 8px;">Mergeable</th>
+          <th style="text-align:right;padding:6px 8px;">Blockers</th>
+        </tr></thead>
+        <tbody>
+          ${inRows.slice(0, 50).map((r) => `<tr>
+            <td style="padding:6px 8px;border-top:1px solid #f3f4f6;font-weight:900;">${_mergeEsc(r?.vrid || "")}</td>
+            <td style="padding:6px 8px;border-top:1px solid #f3f4f6;text-align:right;">${Number(r?.units || 0).toFixed(1)}</td>
+            <td style="padding:6px 8px;border-top:1px solid #f3f4f6;">${_mergeEsc(r?.presenceClass || "")}</td>
+            <td style="padding:6px 8px;border-top:1px solid #f3f4f6;color:${r?.attributed ? "#065f46" : "#6b7280"};">${r?.attributed ? "Yes" : "No"}</td>
+            <td style="padding:6px 8px;border-top:1px solid #f3f4f6;color:${r?.mergeable ? "#065f46" : "#6b7280"};">${r?.mergeable ? "Yes" : "No"}${r?.mergeable ? "" : ` (${_mergeEsc(r?.mergeableReason || "")})`}</td>
+            <td style="padding:6px 8px;border-top:1px solid #f3f4f6;text-align:right;color:${Array.isArray(r?.blockers) && r.blockers.length ? "#92400e" : "#6b7280"};font-weight:${Array.isArray(r?.blockers) && r.blockers.length ? "900" : "700"};">${Array.isArray(r?.blockers) ? r.blockers.length : 0}</td>
+          </tr>`).join("")}
+        </tbody>
+      </table>`
+    : `<div style="color:#6b7280;">No attributable inbound candidates.</div>`;
+
+  const actions = Array.isArray(snapshot.actions) ? snapshot.actions : [];
+  const top = Array.isArray(snapshot.topActions) ? snapshot.topActions : [];
+  const activeTab = _mergeNormalizeScenarioTab(options?.activeTab || actEl.dataset.activeTab || "merge_pair");
+  actEl.dataset.activeTab = activeTab;
+  actEl.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+      <div style="color:#111827;font-weight:900;">Top actions: ${top.length}</div>
+      <div style="color:#6b7280;font-size:12px;">Lane ${_mergeEsc(snapshot.lane || laneKey || "")} | CPT ${_mergeEsc(fmtTime(Number(snapshot.cptMs || cptMs || 0)))}</div>
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">
+      <button class="ssp-merge-tab" data-tab="cancel_inbound" style="padding:4px 10px;border-radius:999px;border:1px solid #d1d5db;background:${activeTab === "cancel_inbound" ? "#111827" : "#fff"};color:${activeTab === "cancel_inbound" ? "#fff" : "#111827"};font-weight:900;cursor:pointer;">Cancel inbound</button>
+      <button class="ssp-merge-tab" data-tab="cancel_outbound" style="padding:4px 10px;border-radius:999px;border:1px solid #d1d5db;background:${activeTab === "cancel_outbound" ? "#111827" : "#fff"};color:${activeTab === "cancel_outbound" ? "#fff" : "#111827"};font-weight:900;cursor:pointer;">Cancel outbound</button>
+      <button class="ssp-merge-tab" data-tab="merge_pair" style="padding:4px 10px;border-radius:999px;border:1px solid #d1d5db;background:${activeTab === "merge_pair" ? "#111827" : "#fff"};color:${activeTab === "merge_pair" ? "#fff" : "#111827"};font-weight:900;cursor:pointer;">Merge pair</button>
+    </div>
+    <div id="ssp-merge-actions-body" style="margin-top:8px;">${_mergeRenderScenarioRows(actions, activeTab)}</div>
+  `;
+  actEl.querySelectorAll(".ssp-merge-tab").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const tab = _mergeNormalizeScenarioTab(btn.getAttribute("data-tab"));
+      actEl.dataset.activeTab = tab;
+      if (typeof options?.onTabChange === "function") {
+        try { options.onTabChange(tab); } catch (_) {}
+      }
+      actEl.querySelectorAll(".ssp-merge-tab").forEach((x) => {
+        x.style.background = "#fff";
+        x.style.color = "#111827";
+      });
+      btn.style.background = "#111827";
+      btn.style.color = "#fff";
+      const body = actEl.querySelector("#ssp-merge-actions-body");
+      if (body) body.innerHTML = _mergeRenderScenarioRows(actions, tab);
+    });
+  });
+
+  const blockers = Array.isArray(snapshot.blockers) ? snapshot.blockers : [];
+  blkEl.innerHTML = blockers.length
+    ? blockers.slice(0, 60).map((b) => `<div style="padding:6px 0;border-top:1px solid #f3f4f6;">
+        <span style="font-weight:900;color:${String(b?.severity || "") === "critical" ? "#b91c1c" : "#92400e"};">${_mergeEsc(String(b?.severity || "warning").toUpperCase())}</span>
+        <span style="margin-left:6px;color:#111827;">${_mergeEsc(b?.message || "")}</span>
+        ${b?.vrid ? `<span style="margin-left:6px;color:#374151;font-weight:800;">VRID ${_mergeEsc(b.vrid)}</span>` : ""}
+        ${Number(b?.minutes || 0) ? `<span style="margin-left:6px;color:#6b7280;">${Number(b.minutes)}m</span>` : ""}
+      </div>`).join("")
+    : `<div style="color:#6b7280;">No blockers detected for this lane/CPT.</div>`;
 }
 
 
@@ -14190,7 +14992,7 @@ function barRow(labelLeft, valueRight, pct, accent) {
   `;
 }
 
-function openMergePanel(laneKey, cptMs) {
+function openMergePanel(laneKey, cptMs, options = {}) {
   STATE.mergePanelOpen = true;
   ensureMergePanel();
   const overlay = document.getElementById("ssp-merge-overlay");
@@ -14201,6 +15003,11 @@ function openMergePanel(laneKey, cptMs) {
   const under = document.getElementById("ssp-merge-under");
   const mergeable = document.getElementById("ssp-merge-mergeable");
   const inb = document.getElementById("ssp-merge-inb");
+  const outRecv = document.getElementById("ssp-merge-outbound-recv");
+  const inMergeable = document.getElementById("ssp-merge-inbound-mergeable");
+  const actSim = document.getElementById("ssp-merge-actions");
+  const blockersBox = document.getElementById("ssp-merge-blockers");
+  const decisionRefreshBtn = document.getElementById("ssp-merge-decision-refresh");
 
   const runId = ++STATE.mergePanelRunId;
 
@@ -14211,6 +15018,52 @@ function openMergePanel(laneKey, cptMs) {
   const laneTxt = __all ? "All lanes" : (laneKey || (g && g.lane) || "—");
   const cptTxt = fmtTime(Number(cptMs || (g && g.cptMs) || 0));
   sub.textContent = __all ? `${laneTxt}` : `${laneTxt} (CPT ${cptTxt})`;
+  let decisionActiveTab = _mergeNormalizeScenarioTab(options?.initialTab || "merge_pair");
+  const decisionGroup = g || {
+    lane: laneTxt,
+    cptMs: Number(cptMs || 0),
+    vrids: [],
+    mergeMeta: null,
+    capacityTotal: 0,
+    loadedUnits: 0,
+    currentUnits: 0,
+    inboundUnits: 0,
+    loadGroupIds: [],
+    currentUnitsPending: false,
+    inboundUnitsPending: false,
+  };
+  const renderDecisionSnapshot = () => {
+    try {
+      const snap = _getMergeDecisionForGroup(decisionGroup);
+      if (outRecv && inMergeable && actSim && blockersBox) {
+        _renderMergeDecisionPanelSnapshot(snap, laneTxt, Number(cptMs || 0), {
+          activeTab: decisionActiveTab,
+          onTabChange: (tab) => { decisionActiveTab = _mergeNormalizeScenarioTab(tab); },
+        });
+      }
+    } catch (_) {}
+  };
+  renderDecisionSnapshot();
+  void (async () => {
+    try {
+      await _ensureMergeDecisionForGroup(decisionGroup, { includeRelay: true, silentRender: true });
+      if (STATE.mergePanelRunId === runId) renderDecisionSnapshot();
+    } catch (_) {}
+  })();
+  if (decisionRefreshBtn) {
+    decisionRefreshBtn.onclick = async () => {
+      try {
+        decisionRefreshBtn.disabled = true;
+        decisionRefreshBtn.textContent = "Refreshing...";
+        await _ensureMergeDecisionForGroup(decisionGroup, { includeRelay: true, force: true, silentRender: true });
+      } catch (_) {}
+      finally {
+        decisionRefreshBtn.disabled = false;
+        decisionRefreshBtn.textContent = "Refresh recommendations";
+        if (STATE.mergePanelRunId === runId) renderDecisionSnapshot();
+      }
+    };
+  }
 
   // Helpful context for leaders: show the query windows we are using.
   const qw = getQueryWindows(Date.now());
