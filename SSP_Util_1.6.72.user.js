@@ -6,14 +6,14 @@
 // VERSION HISTORY
 // ===============================
 //
-// 1.5.x – Merge + Planning Foundation
+// 1.5.x �?" Merge + Planning Foundation
 // - Introduced merge panel with capacity logic
 // - Added Current Units (CU) pulling per lane
 // - Implemented inbound VRID awareness
 // - Initial planning panel + shift bucketing logic
 // - Container bucket renderer (Loaded / Staged / etc.)
 //
-// 1.6.x – Relay Integration + Stability
+// 1.6.x �?" Relay Integration + Stability
 // - Relay integration improvements (track/map, meta badges, auth capture)
 // - Inbound + CU caching by lane and widened prefetch for visible VRIDs
 // - Merge utilization standardized:
@@ -22,7 +22,7 @@
 // - Performance + reliability hardening (guards, syntax fixes, handler restores)
 // - Duplicate/legacy cleanup groundwork
 //
-// 1.7.x – UI & Execution Enhancements
+// 1.7.x �?" UI & Execution Enhancements
 // - Grid-based dockable UI foundation (toolbox/widgets)
 // - Resize + layout lock behavior
 // - Merge panel inbound summaries + disruptions attention blocks
@@ -633,7 +633,7 @@ function normalizeObLoadType(v) {
           if (!lane) continue;
           const lg = String(g?.loadGroupId || g?.loadGroupCountStruct?.loadGroupId || "").trim();
           if (!lg) continue;
-          const key = String(lane).trim().toUpperCase().replace(/\s+/g,"").replace(/[|]/g,"").replace(/→/g,"->") + "::" + String(cptMs);
+          const key = String(lane).trim().toUpperCase().replace(/\s+/g,"").replace(/[|]/g,"").replace(/�?'/g,"->") + "::" + String(cptMs);
           if (!tmp[key]) tmp[key] = new Set();
           tmp[key].add(lg);
         }
@@ -658,7 +658,7 @@ function normalizeObLoadType(v) {
           if (!cptMs) continue;
           const lane = findLaneLike(g);
           if (!lane) continue;
-          const key = String(lane).trim().toUpperCase().replace(/\s+/g,"").replace(/[|]/g,"").replace(/→/g,"->") + "::" + String(cptMs);
+          const key = String(lane).trim().toUpperCase().replace(/\s+/g,"").replace(/[|]/g,"").replace(/�?'/g,"->") + "::" + String(cptMs);
           const s = out[key] || (out[key] = { totalC:0,inTrailerC:0,unloadedC:0,totalP:0,inTrailerP:0,unloadedP:0, loadGroupIds: new Set(), _seenLG: new Set() });
           const lg = String(g?.loadGroupId || g?.loadGroupCountStruct?.loadGroupId || "").trim();
           if (lg) {
@@ -773,7 +773,7 @@ function fmtCptLabel(cptMs) {
  */
 function formatDelta(n) {
     const v = Number(n);
-    if (!Number.isFinite(v)) return "—";
+    if (!Number.isFinite(v)) return "�?"";
     if (v === 0) return "0";
     return v > 0 ? `+${v}` : `${v}`;
   }
@@ -806,7 +806,7 @@ function getLatestLoadGroupStatusCache(loadGroupId, status) {
 
 
 /* ============================
-   OPS DAY WINDOW (07:00 → next day 07:00)
+   OPS DAY WINDOW (07:00 �?' next day 07:00)
    ============================ */
 /**
  * Return the current operational window boundaries (shift/ops) used for bucketing and KPIs.
@@ -2269,7 +2269,7 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
           <li>Go to <a href="https://api.slack.com/apps" target="_blank" style="color:#0066cc;text-decoration:underline;">api.slack.com/apps</a></li>
           <li>Create a new app for your workspace (or use an existing app)</li>
           <li>For simple posting: enable "Incoming Webhooks" and create a webhook URL</li>
-          <li>For Workflow trigger: open Workflow Builder → Create workflow → Add "Webhook" trigger and copy the trigger URL (often hooks.slack.com/triggers/...)</li>
+          <li>For Workflow trigger: open Workflow Builder �?' Create workflow �?' Add "Webhook" trigger and copy the trigger URL (often hooks.slack.com/triggers/...)</li>
           <li>Paste the appropriate URL into the matching field above</li>
         </ol>
       </div>
@@ -2300,14 +2300,14 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
       if (!url) { alert("Please enter a URL for the selected delivery method"); return; }
       testBtn.disabled = true; testBtn.textContent = "Sending...";
       try {
-        const payload = { text: "🧪 *SSP Util* – Test message from dashboard configuration", mrkdwn: true };
+        const payload = { text: "�Y�� *SSP Util* �?" Test message from dashboard configuration", mrkdwn: true };
         const result = await postSlack(url, payload);
         if (result.ok) {
-          alert(`✅ Test message sent to Slack! (HTTP ${result.status})`);
+          alert(`�o. Test message sent to Slack! (HTTP ${result.status})`);
           return;
         }
-        alert(`❌ Slack request failed (HTTP ${result.status || "n/a"})${result.responseText ? `\n${result.responseText}` : ""}`);
-      } catch (e) { alert(`❌ Error: ${String(e && e.message ? e.message : e)}`); }
+        alert(`�O Slack request failed (HTTP ${result.status || "n/a"})${result.responseText ? `\n${result.responseText}` : ""}`);
+      } catch (e) { alert(`�O Error: ${String(e && e.message ? e.message : e)}`); }
       finally { testBtn.disabled = false; testBtn.textContent = "Test Message"; }
     });
 
@@ -2315,7 +2315,7 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
       const webhook = input.value.trim(); const workflow = workflowInput.value.trim(); const enabled = checkbox.checked;
       const method = methodRadios.find(r => r.checked)?.value || 'webhook'; const useWorkflow = method === 'workflow';
       setSlackConfig({ webhookUrl: webhook, workflowUrl: workflow, enabled, useWorkflow });
-      alert("✅ Slack configuration saved!"); closeModal();
+      alert("�o. Slack configuration saved!"); closeModal();
     });
 
     cancelBtn.addEventListener("click", closeModal);
@@ -3765,10 +3765,10 @@ function hydrateDriverMapsFromFmcSearch(json) {
       .toUpperCase()
       .replace(/\s+/g, '')
       .replace(/[|]/g, '')
-      .replace(/→/g, '->')
-      .replace(/—/g, '-')
-      .replace(/–/g, '-')
-      .replace(/−/g, '-')
+      .replace(/�?'/g, '->')
+      .replace(/�?"/g, '-')
+      .replace(/�?"/g, '-')
+      .replace(/�^'/g, '-')
       .replace(/_/g, '')
       .replace(/\u00A0/g, '');
   }
@@ -4145,7 +4145,7 @@ async function dumpObPayloadForVrid(vrid) {
 function __diagTrunc(s, max) {
   if (s == null) return s;
   s = String(s);
-  return s.length > max ? (s.slice(0, max) + "…(truncated)") : s;
+  return s.length > max ? (s.slice(0, max) + "�?�(truncated)") : s;
 }
 
 function __diagSafePayload(payload) {
@@ -4877,7 +4877,7 @@ async function fetchDriverDetail(scac, driverId) {
 
   function equipShort(equipmentTypeRaw) {
     const e = normalizeEquipmentType(equipmentTypeRaw);
-    return e?.short ?? "—";
+    return e?.short ?? "�?"";
   }
 
   function safePreview(obj) {
@@ -5364,7 +5364,7 @@ async function loadInbound() {
 STATE.ibByPlanId = buildIbByPlanId(STATE.inboundLoadsAll);
   STATE.inboundLoadsAll = deduped;
 
-  // Display/shift-planning window count: last 3h → ops cutoff (07:00) plus anything physically present.
+  // Display/shift-planning window count: last 3h �?' ops cutoff (07:00) plus anything physically present.
   const nowMs = Date.now();
   const windowStartMs = nowMs - ibLookbackMs;
   STATE.inboundLoadsWindow = deduped.filter(l => {
@@ -5773,8 +5773,8 @@ function scheduleDriverPrefetch(reason = "") {
 
       if (DEBUG.loadLoop) {
         dlog("OB_LOAD", {
-          lane: laneDbg || "—",
-          vrid: vridDbg || "—",
+          lane: laneDbg || "�?"",
+          vrid: vridDbg || "�?"",
           cpt: fmtTime(cptMs),
           equipRaw,
           equip,
@@ -5968,7 +5968,7 @@ Object.values(map).forEach(cpt => {
   const overage = Math.max(0, projUnits - capTotal);
 
   // For cancellation: if projected volume fits in fewer loads and we're within a reasonable planning horizon,
-  // recommend canceling extra loads (respect ops cancellation lead time) — but avoid early false positives when
+  // recommend canceling extra loads (respect ops cancellation lead time) �?" but avoid early false positives when
   // data is sparse (e.g., upstream feeds not populated yet).
   const neededLoadsRaw = Math.ceil(projUnits / capPer);
   const neededLoads = (projUnits <= 0.01) ? 0 : Math.max(1, neededLoadsRaw);
@@ -6352,7 +6352,7 @@ try {
       // Capacity per VRID from indexed outbound load data; fallback to 0 if unknown
       const vinfo = (STATE.vridIndex && STATE.vridIndex[vrid]) || null;
       const capUnits = Number(vinfo?.capacity || 0);
-      const laneKey = (vinfo?.lane || "—");
+      const laneKey = (vinfo?.lane || "�?"");
       const cptKeyMs = Number(vinfo?.cptMs || 0);
       const gkey = laneKey + "::" + String(cptKeyMs);
 
@@ -6398,7 +6398,7 @@ try {
         locUI.innerHTML = "";
       }
 
-      // Selection pill (uses native SSP row checkbox — no second checkbox)
+      // Selection pill (uses native SSP row checkbox �?" no second checkbox)
       const overlay = document.createElement("span");
       overlay.className = "ssp2-overlay";
       overlay.style.cssText = `
@@ -6451,7 +6451,7 @@ try {
         color:#111827;
         white-space:nowrap;
       `;
-      utilBadge.textContent = capUnits > 0 ? `${currentUnits} / ${capUnits}` : `${currentUnits} / —`;
+      utilBadge.textContent = capUnits > 0 ? `${currentUnits} / ${capUnits}` : `${currentUnits} / �?"`;
       overlay.append(utilBadge);
 
       // Keep internal selection synced to native checkbox changes (only bind once)
@@ -6783,15 +6783,15 @@ function ensurePanel() {
 
     p.innerHTML = `
       <div id="ssp2-panelhdr" style="padding:10px;font-weight:800;background:#f3f3f3;cursor:move;border-radius:10px 10px 0 0">
-        SSP Util 1.6.71 — Action Panel
+        SSP Util 1.6.71 �?" Action Panel
       </div>
       <div style="padding:10px;flex:1;min-height:0;display:flex;flex-direction:column">
         <div id="ssp2-status" style="white-space:pre-wrap"></div>
 
         <div id="ssp2-signal-widget" style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
           <button id="ssp2-open-disruptions" style="cursor:pointer;padding:5px 12px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;">Disruptions</button>
-          <button id="ssp2-disruptions-ob" style="cursor:pointer;padding:5px 12px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;display:none;">Late: …</button>
-          <button id="ssp2-disruptions-ib" style="cursor:pointer;padding:5px 12px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;display:none;">Issues: …</button>
+          <button id="ssp2-disruptions-ob" style="cursor:pointer;padding:5px 12px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;display:none;">Late: �?�</button>
+          <button id="ssp2-disruptions-ib" style="cursor:pointer;padding:5px 12px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;display:none;">Issues: �?�</button>
 
           <span style="width:1px;height:18px;background:#e5e7eb;display:inline-block;margin:0 2px;"></span>
 
@@ -6818,7 +6818,7 @@ function ensurePanel() {
           <button id="show-error">Last Error</button>
           <button id="csv-ib">CSV XD Graph</button>
           <button id="csv-ib4">CSV IB4CPT</button>
-          <button id="csv-import-est">📊 Import 2wk CSV</button>
+          <button id="csv-import-est">�Y"S Import 2wk CSV</button>
         </div>
 
         <div id="csv-import-container" style="margin-top:8px;display:none;flex-direction:column;gap:8px;padding:8px;background:#f9f9f9;border:1px solid #e5e7eb;border-radius:6px">
@@ -6831,7 +6831,7 @@ function ensurePanel() {
         </div>
 
         <div style="margin-top:8px;color:#555">
-          Overlay: <span id="ov-stat"></span> | Last: <span id="last-stat">—</span> | Est: <span id="csv-est-stat">—</span>
+          Overlay: <span id="ov-stat"></span> | Last: <span id="last-stat">�?"</span> | Est: <span id="csv-est-stat">�?"</span>
         </div>
       </div>
     `;
@@ -6947,7 +6947,7 @@ function ensurePanel() {
         try {
           const csvText = csvImportTextarea.value.trim();
           if (!csvText) {
-            csvImportStatus.textContent = "❌ Paste CSV data first";
+            csvImportStatus.textContent = "�O Paste CSV data first";
             return;
           }
 
@@ -6957,7 +6957,7 @@ function ensurePanel() {
           const result = importInboundCsvEstimates(csvText);
           
           if (result) {
-            csvImportStatus.textContent = `✅ Imported ${result.rowsProcessed} rows, ${result.estimatesBuckets || Object.keys(result.estimates || {}).length} estimate buckets`;
+            csvImportStatus.textContent = `�o. Imported ${result.rowsProcessed} rows, ${result.estimatesBuckets || Object.keys(result.estimates || {}).length} estimate buckets`;
             csvEstStat.textContent = `CSV loaded`;
             setTimeout(() => {
               csvImportContainer.style.display = "none";
@@ -6965,10 +6965,10 @@ function ensurePanel() {
               csvImportStatus.textContent = "";
             }, 2000);
           } else {
-            csvImportStatus.textContent = "❌ Import failed. Check console.";
+            csvImportStatus.textContent = "�O Import failed. Check console.";
           }
         } catch (e) {
-          csvImportStatus.textContent = `❌ Error: ${String(e).substring(0, 40)}`;
+          csvImportStatus.textContent = `�O Error: ${String(e).substring(0, 40)}`;
           console.error("[SSP Util] CSV import error:", e);
         }
       };
@@ -7226,7 +7226,7 @@ if (r) STATE._lastBulkFmc = { at: Date.now(), ids, resp: r };
 
   // --- Current Units prefetch (no-click Lane Panel support) ---
   function _cuGroupKey(laneKey, cptMs) {
-    return String(laneKey || "—").trim() + "::" + String(Number(cptMs || 0));
+    return String(laneKey || "�?"").trim() + "::" + String(Number(cptMs || 0));
   }
 
   function _isCuFresh(groupKey, maxAgeMs) {
@@ -7293,7 +7293,7 @@ if (r) STATE._lastBulkFmc = { at: Date.now(), ids, resp: r };
 
 // --- Inbound contributors prefetch (no-click Lane Panel support) ---
   function _ibContribKey(laneKey, cptMs) {
-    const laneNorm = String(laneKey || "—").trim();
+    const laneNorm = String(laneKey || "�?"").trim();
     return laneNorm + "::" + String(Number(cptMs || 0));
   }
 
@@ -7902,7 +7902,7 @@ if (r) STATE._lastBulkFmc = { at: Date.now(), ids, resp: r };
       // If we already have something reasonably fresh, don't refetch.
       if (_isIbContribFresh(lgKey, 5 * 60 * 1000)) return;
 
-      STATE.ibContribQueue.push({ laneKey: String(laneKey || "—"), cptMs: Number(cptMs || 0), lgKey });
+      STATE.ibContribQueue.push({ laneKey: String(laneKey || "�?""), cptMs: Number(cptMs || 0), lgKey });
       if (!STATE.ibContribWorkerRunning) {
         STATE.ibContribWorkerRunning = true;
         void (async function worker() {
@@ -7932,7 +7932,7 @@ if (r) STATE._lastBulkFmc = { at: Date.now(), ids, resp: r };
     try {
       const arr = Array.isArray(groups) ? groups : [];
       for (const g of arr) {
-        const lane = (g && g.lane) ? g.lane : "—";
+        const lane = (g && g.lane) ? g.lane : "�?"";
         const cpt = (g && g.cptMs) ? g.cptMs : 0;
         _enqueueIbContrib(lane, cpt);
       }
@@ -7941,7 +7941,7 @@ if (r) STATE._lastBulkFmc = { at: Date.now(), ids, resp: r };
 
   async function _fetchIbContribForLane(laneKey, cptMs, lgKey) {
     // Determine loadGroupIds for this Lane::CPT (same source used by Merge Panel).
-    const key = String(laneKey || "—") + "::" + String(Number(cptMs || 0));
+    const key = String(laneKey || "�?"") + "::" + String(Number(cptMs || 0));
     const lgIds = (STATE.ibLaneCptLoadGroups && STATE.ibLaneCptLoadGroups[key]) ? STATE.ibLaneCptLoadGroups[key] : [];
     if (!Array.isArray(lgIds) || !lgIds.length) {
       STATE.ibContribByLaneCpt[lgKey] = [];
@@ -8143,7 +8143,7 @@ function renderPanel() {
     const list = document.getElementById("ssp2-list");
     const lastEl = document.getElementById("last-stat");
     if (!s || !b || !ov) return;
-    if (lastEl) lastEl.textContent = STATE.lastRun ? STATE.lastRun.toLocaleTimeString() : "—";
+    if (lastEl) lastEl.textContent = STATE.lastRun ? STATE.lastRun.toLocaleTimeString() : "�?"";
 
     const qw = getQueryWindows(Date.now());
     const ibGroupsCount = Array.isArray(STATE.ib4cptGroups) ? STATE.ib4cptGroups.length : 0;
@@ -8260,7 +8260,7 @@ function renderPanel() {
         // hide in-panel status block (requested: move to header)
         s.style.display = "none";
         const hn = document.getElementById("ssp2-h-node");
-        if (hn) hn.textContent = `node: ${(STATE && (STATE.nodeId || STATE.nodeID)) ? (STATE.nodeId || STATE.nodeID) : "—"}`;
+        if (hn) hn.textContent = `node: ${(STATE && (STATE.nodeId || STATE.nodeID)) ? (STATE.nodeId || STATE.nodeID) : "�?""}`;
       }
     } catch {}
 // Update capacity signal buttons (Action Panel)
@@ -8422,7 +8422,7 @@ function renderPanel() {
         });
 
       for (const x of loads) {
-        const laneKey = x.lane || "—";
+        const laneKey = x.lane || "�?"";
         const key = laneKey + "::" + String(x.cptMs || 0);
 
         if (!groups.has(key)) {
@@ -8457,7 +8457,7 @@ STATE.actionGroups = groups;
         const rank = { load: 0, ok: 0, soon: 1, now: 2, risk: 3, adhoc: 4, cancel: 5 };
         const laneBest = new Map(); // lane -> bestState
         for (const g of groups.values()) {
-          const lane = String(g.lane || "—");
+          const lane = String(g.lane || "�?"");
           const st = String(g.mergeState || "load");
           const cur = laneBest.get(lane) || "load";
           const rNew = (rank[st] != null) ? rank[st] : 0;
@@ -8660,7 +8660,7 @@ STATE.actionGroups = groups;
       const laneStates = new Map(); // lane -> "now" | "soon" | "ok"
       const rank = (st) => (st === "now" ? 2 : st === "soon" ? 1 : 0);
       for (const g of sortedGroups) {
-        const lane = String(g?.lane || "—");
+        const lane = String(g?.lane || "�?"");
         const st = String(g?.mergeState || "ok");
         const cur = laneStates.get(lane) || "ok";
         if (rank(st) > rank(cur)) laneStates.set(lane, st);
@@ -8697,7 +8697,7 @@ if (DEBUG.laneGroups) {
       }
 
       if (DEBUG.laneGroupsFull) {
-        dgroup("[SSP UTIL][LANE_GROUPS FULL] Lane::CPT → VRIDs", () => {
+        dgroup("[SSP UTIL][LANE_GROUPS FULL] Lane::CPT �?' VRIDs", () => {
           sortedGroups.forEach(g => {
             console.groupCollapsed(`GROUP ${g.lane} | CPT ${g.cptStr} | merge=${g.mergeState} | vrids=${g.vrids.length}`);
             console.log("group:", {
@@ -8740,18 +8740,18 @@ if (DEBUG.laneGroups) {
               return String(a.vrid).localeCompare(String(b.vrid));
             })
             .map((v) => {
-              const laneTxt = g.lane !== "—" ? g.lane : v.lane || "—";
+              const laneTxt = g.lane !== "�?"" ? g.lane : v.lane || "�?"";
               const idxMeta = (STATE.vridIndex && STATE.vridIndex[v.vrid]) ? STATE.vridIndex[v.vrid] : {};
               const locTxt = v.location ? ` <span style="color:#6b7280;">@ ${esc(v.location)}</span>` : "";
               const doorTxt = idxMeta.dockDoor ? ` <span style="color:#6b7280;">| ${esc(idxMeta.dockDoor)}</span>` : "";
               const trTxt = idxMeta.trailerNumber ? ` <span style="color:#6b7280;">| ${esc(idxMeta.trailerNumber)}</span>` : "";
               const eq = equipShort(v.equip);
-              const eqBadge = eq !== "—" ? ` <span style=\"margin-left:6px;padding:2px 8px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;font-size:12px;\">${esc(eq)}</span>` : "";
+              const eqBadge = eq !== "�?"" ? ` <span style=\"margin-left:6px;padding:2px 8px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;font-size:12px;\">${esc(eq)}</span>` : "";
               const cap = Number((STATE.vridIndex && STATE.vridIndex[v.vrid])?.capacity || 0);
               const curRaw = (STATE.vridUnits && Object.prototype.hasOwnProperty.call(STATE.vridUnits, v.vrid)) ? STATE.vridUnits[v.vrid] : null;
-              const curTxt = (curRaw === null || curRaw === undefined) ? "—" : String(Number(curRaw) || 0);
+              const curTxt = (curRaw === null || curRaw === undefined) ? "�?"" : String(Number(curRaw) || 0);
               const utilBadge = cap ? ` <span style="margin-left:8px;padding:2px 8px;border-radius:999px;background:#111827;color:#fff;font-weight:900;font-size:12px;">${curTxt}/${cap}</span>` : "";
-              return `                <div style="display:flex;gap:8px;align-items:center;justify-content:space-between;padding:6px 0;border-top:1px solid #f3f4f6;">                  <div style="font-weight:900;">                    ${esc(v.vrid)}${utilBadge}${eqBadge} <span class="ssp-relay-meta" data-vrid="${esc(v.vrid)}" style="margin-left:6px;"><span style="color:#9ca3af;font-weight:800;">—</span></span>${locTxt}${doorTxt}${trTxt}                    <div style="margin-top:2px;color:#6b7280;font-weight:800;">${esc(laneTxt)}</div>                  </div>                  <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;align-items:center;">                    ${mkBtn("TT", "tt:" + v.vrid, "Open TT for VRID")}                    ${mkBtn("Relay", "relay:" + v.vrid, "Open Relay for VRID")}                    ${mkBtn("FMC", "fmc:" + v.vrid, "Open FMC for VRID")}                    ${mkBtn("Select", "sel:" + v.vrid, "Toggle SSP row checkbox")}                  </div>                </div>              `;
+              return `                <div style="display:flex;gap:8px;align-items:center;justify-content:space-between;padding:6px 0;border-top:1px solid #f3f4f6;">                  <div style="font-weight:900;">                    ${esc(v.vrid)}${utilBadge}${eqBadge} <span class="ssp-relay-meta" data-vrid="${esc(v.vrid)}" style="margin-left:6px;"><span style="color:#9ca3af;font-weight:800;">�?"</span></span>${locTxt}${doorTxt}${trTxt}                    <div style="margin-top:2px;color:#6b7280;font-weight:800;">${esc(laneTxt)}</div>                  </div>                  <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;align-items:center;">                    ${mkBtn("TT", "tt:" + v.vrid, "Open TT for VRID")}                    ${mkBtn("Relay", "relay:" + v.vrid, "Open Relay for VRID")}                    ${mkBtn("FMC", "fmc:" + v.vrid, "Open FMC for VRID")}                    ${mkBtn("Select", "sel:" + v.vrid, "Toggle SSP row checkbox")}                  </div>                </div>              `;
             })
             .join("");
 
@@ -8769,14 +8769,14 @@ if (DEBUG.laneGroups) {
           const __cu = (STATE.cuByGroupKey && STATE.cuByGroupKey[__groupKey]) ? STATE.cuByGroupKey[__groupKey] : null;
           const __cuUnits = (__cu && !__cu.loading && !__cu.error) ? Number(__cu.units || 0) : null;
           const curDisp = (__cuUnits === null || Number.isNaN(__cuUnits))
-            ? (g.currentUnitsPending ? "…" : String(Number(g.currentUnits || 0)))
+            ? (g.currentUnitsPending ? "�?�" : String(Number(g.currentUnits || 0)))
             : String(__cuUnits);
-          const inbDisp = g.inboundUnitsPending ? "…" : String(Number(g.inboundUnits || 0));
+          const inbDisp = g.inboundUnitsPending ? "�?�" : String(Number(g.inboundUnits || 0));
           const curNum = (__cuUnits === null || __cuUnits === undefined || Number.isNaN(__cuUnits))
             ? (g.currentUnitsPending ? null : Number(g.currentUnits || 0))
             : Number(__cuUnits || 0);
           const pct = (capTotal > 0 && curNum !== null && !Number.isNaN(curNum)) ? Math.round((curNum / capTotal) * 100) : 0;
-          const pctDisp = (!capTotal || curNum === null) ? "…" : String(pct);
+          const pctDisp = (!capTotal || curNum === null) ? "�?�" : String(pct);
 
           // Display utilization as (Loaded + Current + Inbound*w) / Capacity when mergeMeta is available.
           const __mm = g && g.mergeMeta ? g.mergeMeta : null;
@@ -8787,13 +8787,13 @@ if (DEBUG.laneGroups) {
           const __utilPct = (__utilDen > 0) ? Math.round((__utilNum / __utilDen) * 100) : 0;
           const __utilFactorDisp = (__utilDen > 0 && Number.isFinite(__utilNum))
             ? `${__utilNum.toFixed(1)}/${__utilDen} (${__utilPct}%)`
-            : "…";
+            : "�?�";
 
-          const ibVridsDisp = (g.inboundVridCount && Number(g.inboundVridCount) > 0) ? ` • VRIDs: <b>${Number(g.inboundVridCount)}</b>` : ``;
+          const ibVridsDisp = (g.inboundVridCount && Number(g.inboundVridCount) > 0) ? ` �?� VRIDs: <b>${Number(g.inboundVridCount)}</b>` : ``;
           const sub =
             g.capacityTotal
               ? `Capacity: <b>${g.capacityTotal}</b> units | Loaded: <b>${g.loadedUnits || 0}</b> | Current: <b>${curDisp}</b> units | Inbound: <b>${inbDisp}</b> units${ibVridsDisp} <span style="color:#6b7280;">| Util: <b>${__utilFactorDisp}</b></span>`
-              : `Capacity: —`;
+              : `Capacity: �?"`;
 
 
           // Inline inbound VRIDs contributing (prefetched; falls back to count when empty)
@@ -8845,7 +8845,7 @@ ${disruptDotHtml}
       STATE.dockOppsOpen = true;
 
       list.innerHTML =
-        `<div style="font-weight:900;margin-bottom:8px;">Dock Opportunities (Lane → VRIDs)</div>` +
+        `<div style="font-weight:900;margin-bottom:8px;">Dock Opportunities (Lane �?' VRIDs)</div>` +
         (groupHtml || `<div style="color:#6b7280;">No outbound loads detected (or outside horizon).</div>`);
       // Prefetch Relay badges (cases/disruptions/notes) for visible VRIDs (non-blocking).
       // We keep a conservative cap to avoid hammering Track, but aim to cover what's on-screen.
@@ -9195,7 +9195,7 @@ function _updatePlanSortIndicators(panel) {
       }
 
       if (PLAN.sort && PLAN.sort.key === k) {
-        arr.textContent = PLAN.sort.dir === "desc" ? "▼" : "▲";
+        arr.textContent = PLAN.sort.dir === "desc" ? "�-�" : "�-�";
         arr.style.opacity = "1";
         th.style.fontWeight = "900";
       } else {
@@ -9213,7 +9213,7 @@ function _sspRelayLaneLabel(detail) {
   try {
     const lanes = detail && detail.lanes;
     if (Array.isArray(lanes) && lanes.length) {
-      const full = lanes[2] || lanes.find(x => String(x||"").includes("→")) || "";
+      const full = lanes[2] || lanes.find(x => String(x||"").includes("�?'")) || "";
       const s = String(full || "").trim();
       if (s) return s.replace(/\s+/g, "");
     }
@@ -9222,7 +9222,7 @@ function _sspRelayLaneLabel(detail) {
     const stops = (detail && detail.stops) || [];
     const a = stops[0] && stops[0].location && stops[0].location.nodeCode;
     const b = stops[stops.length-1] && stops[stops.length-1].location && stops[stops.length-1].location.nodeCode;
-    if (a && b) return `${a}→${b}`;
+    if (a && b) return `${a}�?'${b}`;
   } catch {}
   return "";
 }
@@ -9829,7 +9829,7 @@ function _sspUpdateRelayMetaBadgesInDom(meta) {
     if (meta.notesCount) {
       parts.push(mkBadge("notes", `N:${meta.notesCount}`, `Notes (${meta.notesCount})`, "#2563eb"));
     }
-    el.innerHTML = parts.length ? parts.join(" ") : `<span style="color:#9ca3af;font-weight:800;">—</span>`;
+    el.innerHTML = parts.length ? parts.join(" ") : `<span style="color:#9ca3af;font-weight:800;">�?"</span>`;
   }
 }
 
@@ -10218,8 +10218,8 @@ function _sspRelayRenderDisruptionsHtml(disruptions) {
     const body = host.body;
 
     ov.style.display = "flex";
-    title.textContent = `Relay ${k} — ${v}`;
-    body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Loading…</div>`;
+    title.textContent = `Relay ${k} �?" ${v}`;
+    body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Loading�?�</div>`;
 
     let detail = null, notes = null;
     try { detail = await _sspRelayGetDetail(v); } catch(_) { detail = null; }
@@ -10378,7 +10378,7 @@ function _sspRelayFormatMeta(detail, nodeCode, sched, eta, aat, route, curPos) {
           m.set(t, (m.get(t) || 0) + 1);
         }
         const arr = Array.from(m.entries()).sort((a,b)=>b[1]-a[1]).slice(0, 3);
-        return arr.map(([k,v]) => v > 1 ? `${k}×${v}` : k).join(", ");
+        return arr.map(([k,v]) => v > 1 ? `${k}�-${v}` : k).join(", ");
       } catch (_) { return ""; }
     })();
 
@@ -10462,7 +10462,7 @@ function _ensureRelayMiniPopover() {
         <button id="ssp2-relay-mini-dump" title="Dump raw Relay detail/route objects to console" style="padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#e5e7eb;font-weight:900;cursor:pointer;">Dump</button>
         <button id="ssp2-relay-mini-map" title="Toggle basemap layer" style="padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#e5e7eb;font-weight:900;cursor:pointer;">Map</button>
         <button id="ssp2-relay-mini-open" style="padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#e5e7eb;font-weight:900;cursor:pointer;">Open</button>
-        <button id="ssp2-relay-mini-close" style="padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#e5e7eb;font-weight:900;cursor:pointer;">✕</button>
+        <button id="ssp2-relay-mini-close" style="padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#e5e7eb;font-weight:900;cursor:pointer;">�o.</button>
       </div>
     </div>
     <div id="ssp2-relay-mini-body" style="padding:10px;box-sizing:border-box;max-height:calc(100% - 46px);height:calc(100% - 46px);overflow-y:auto;">
@@ -10818,7 +10818,7 @@ async function _showRelayMiniForAnchor(anchorEl, vrid, nodeCode) {
   if (openBtn) openBtn.onclick = () => window.open(url, "_blank", "noopener,noreferrer");
 
   const meta = pop.querySelector("#ssp2-relay-mini-meta");
-  if (meta) meta.textContent = "Loading Relay…";
+  if (meta) meta.textContent = "Loading Relay�?�";
 
   const cv = pop.querySelector("#ssp2-relay-mini-cv");
   try { _drawRouteOnCanvas(cv, null, null); } catch {}
@@ -10877,7 +10877,7 @@ function ensurePlanningPanel() {
       <div style="padding:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;border-bottom:1px solid #e5e7eb;">
         <label style="font-weight:800;">Window:</label>
         <select id="ssp2-plan-window" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:800;cursor:pointer;">
-          <option value="ops">Ops Window (07:00→07:00)</option>
+          <option value="ops">Ops Window (07:00�?'07:00)</option>
           <option value="active">Active / Upcoming Shift</option>
         </select>
 
@@ -10901,7 +10901,7 @@ function ensurePlanningPanel() {
       </div>
 
       <div id="ssp2-plan-body" style="display:flex;gap:10px;padding:10px;flex:1;min-height:0;">
-        <!-- Left: Loads (≈2/3) -->
+        <!-- Left: Loads (�?^2/3) -->
         <div id="ssp2-plan-left" style="flex:2;min-width:0;display:flex;flex-direction:column;">
           <div id="ssp2-plan-scroll" style="overflow:auto;flex:1;min-height:0;">
             <table id="ssp2-plan-table" style="width:100%;border-collapse:collapse;font-size:12px;">
@@ -10924,7 +10924,7 @@ function ensurePlanningPanel() {
           </div>
         </div>
 
-        <!-- Right: Math + Debug (≈1/3) -->
+        <!-- Right: Math + Debug (�?^1/3) -->
         <div id="ssp2-plan-right" style="flex:1;min-width:340px;max-width:520px;display:flex;flex-direction:column;border-left:1px solid #e5e7eb;padding-left:10px;min-height:0;">
           <div id="ssp2-plan-right-top" style="flex:1;min-height:0;display:flex;flex-direction:column;">
             <div style="font-weight:900;margin-bottom:6px;">Container Math</div>
@@ -11252,7 +11252,7 @@ function _ensureRelayPreviewPopover() {
       <div id="ssp2-relay-vrid" style="font-weight:800;opacity:.9;"></div>
       <div style="margin-left:auto;display:flex;gap:8px;align-items:center;">
         <button id="ssp2-relay-open" style="padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#e5e7eb;font-weight:900;cursor:pointer;">Open</button>
-        <button id="ssp2-relay-close" style="padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#e5e7eb;font-weight:900;cursor:pointer;">✕</button>
+        <button id="ssp2-relay-close" style="padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#e5e7eb;font-weight:900;cursor:pointer;">�o.</button>
       </div>
     </div>
     <div style="position:relative;width:100%;height:calc(100% - 44px);">
@@ -11341,7 +11341,7 @@ function renderPlanningPanel() {
         try {
           const detail = await _sspRelayGetDetail(v);
           // NOTE: Do NOT overwrite the route/lane labels shown in SSP.
-          // Relay detail often only provides origin→dest (and may omit CART/CYC/DR1 suffixes),
+          // Relay detail often only provides origin�?'dest (and may omit CART/CYC/DR1 suffixes),
           // which is confusing for site ops. Keep SSP's own lane string as the source of truth.
           const t = _sspRelayTimesForNode(detail, node);
           const sched = _sspRelayParseIsoToLocal(t.planned);
@@ -11505,7 +11505,7 @@ function renderPlanningPanel() {
             const cached = _getIbTrailerRemainingCached(nodeId, inboundLoadId);
             const raw = (typeof cached === "number") ? String(cached) : _getLoadContainersLeftForPlanning(l);
             const s = String(raw || "").trim();
-            if (!s || s === "..." || s === "…") return null;
+            if (!s || s === "..." || s === "�?�") return null;
             const m = s.match(/^(\d+(?:\.\d+)?)(?:\/(\d+(?:\.\d+)?))?$/);
             if (m) return Number(m[1]);
             const n = Number(s);
@@ -11532,7 +11532,7 @@ function renderPlanningPanel() {
     // Render meta + counts
     const completed = rows.filter(l => String(l?.status || l?.loadStatus || "").toUpperCase() === "COMPLETED").length;
     const open = rows.length - completed;
-    meta.textContent = `Ops: ${fmtTime(ops.startMs)}→${fmtTime(ops.endMs)} | Window: ${fmtTime(wStart)}→${fmtTime(wEnd)}`;
+    meta.textContent = `Ops: ${fmtTime(ops.startMs)}�?'${fmtTime(ops.endMs)} | Window: ${fmtTime(wStart)}�?'${fmtTime(wEnd)}`;
     cnt.textContent = `Total: ${rows.length} | Remaining: ${open} | Completed: ${completed}`;
     // Right panel: Container Math (top) + Debug (bottom)
     try {
@@ -11585,7 +11585,7 @@ function renderPlanningPanel() {
       // 3) Shift-over-shift forecast (within ops window)
 // Bucketing rule (ops-responsibility):
 // - Buckets are NOT strict "arrival between shift start/end" slices.
-// - Each bucket starts at the PRIOR bucket end, so gaps (e.g., 01:15→02:00) roll into the next shift.
+// - Each bucket starts at the PRIOR bucket end, so gaps (e.g., 01:15�?'02:00) roll into the next shift.
 // - Equivalent: assign each load to the earliest shift whose bucketEnd (shift end) it falls before.
       const shifts = _getEnabledShifts();
 
@@ -11675,8 +11675,8 @@ function renderPlanningPanel() {
       }
 // Render: top-right container math (algorithm first, then numbers)
       if (mathMeta) {
-        const cutTxt = (cutoffMs != null) ? `${fmtTime(ops.startMs)}→${fmtTime(cutoffMs)}` : "n/a";
-        const mor2Txt = mor2W ? `${fmtTime(mor2W.startMs)}→${fmtTime(mor2W.endMs)} (cutoff ${fmtTime(cutoffMs)})` : "MOR2 not configured";
+        const cutTxt = (cutoffMs != null) ? `${fmtTime(ops.startMs)}�?'${fmtTime(cutoffMs)}` : "n/a";
+        const mor2Txt = mor2W ? `${fmtTime(mor2W.startMs)}�?'${fmtTime(mor2W.endMs)} (cutoff ${fmtTime(cutoffMs)})` : "MOR2 not configured";
         mathMeta.textContent = `Target: ${targetCph} CPH | MOR2: ${mor2Txt} | Cutoff Window: ${cutTxt}`;
       }
 
@@ -11760,7 +11760,7 @@ function renderPlanningPanel() {
       lines.push("");
       if (cutoffMs != null) {
         lines.push("Ops-to-Cutoff Totals (Remaining; due before cutoff):");
-        lines.push(`  Window: ${fmtTime(ops.startMs)}→${fmtTime(cutoffMs)}  (loads: ${loads_cut}, missingCounts: ${missing_cut})`);
+        lines.push(`  Window: ${fmtTime(ops.startMs)}�?'${fmtTime(cutoffMs)}  (loads: ${loads_cut}, missingCounts: ${missing_cut})`);
         lines.push(`  C (containers): ${sumC_cut.toLocaleString()}   |   P (pkgs): ${sumP_cut.toLocaleString()}`);
         lines.push("");
       } else {
@@ -11768,20 +11768,20 @@ function renderPlanningPanel() {
         lines.push("");
       }
 
-      // Primary staffing call (now → cutoff)
+      // Primary staffing call (now �?' cutoff)
       if (cutoffMs != null) {
         const hrsLeft = (cutRemainingHrs != null) ? cutRemainingHrs : ((cutoffMs > nowMs) ? ((cutoffMs - nowMs) / 3600000) : 0);
         const hcTotal = (hc_cut_total != null) ? hc_cut_total : null;
         lines.push("Ops-to-Cutoff Staffing (Primary):");
-        lines.push(`  Horizon: now→cutoff  (hrsLeft: ${Math.max(0, hrsLeft).toFixed(2)} | target: ${targetCph} CPH)`);
+        lines.push(`  Horizon: now�?'cutoff  (hrsLeft: ${Math.max(0, hrsLeft).toFixed(2)} | target: ${targetCph} CPH)`);
         lines.push(`  C_total_due: ${sumC_cut.toLocaleString()}  |  P_total_due: ${sumP_cut.toLocaleString()}  |  HC_total_now_to_cutoff: ${hcTotal == null ? "n/a" : hcTotal}`);
         if (perShiftCut && perShiftCut.length) {
           const bucketedC = perShiftCut.reduce((a,b)=>a+(b.C||0),0);
           const bucketedP = perShiftCut.reduce((a,b)=>a+(b.P||0),0);
-          lines.push(`  Bucketed (sum of shift intervals ≤ cutoff): C=${bucketedC.toLocaleString()} P=${bucketedP.toLocaleString()} | Unbucketed: C=${(sumC_cut_unbucketed||0).toLocaleString()} P=${(sumP_cut_unbucketed||0).toLocaleString()} (loads=${loads_cut_unbucketed||0}, missingCounts=${missing_cut_unbucketed||0})`);
+          lines.push(`  Bucketed (sum of shift intervals �?� cutoff): C=${bucketedC.toLocaleString()} P=${bucketedP.toLocaleString()} | Unbucketed: C=${(sumC_cut_unbucketed||0).toLocaleString()} P=${(sumP_cut_unbucketed||0).toLocaleString()} (loads=${loads_cut_unbucketed||0}, missingCounts=${missing_cut_unbucketed||0})`);
           lines.push("  Breakdown by shift interval (informational):");
           for (const iv of perShiftCut) {
-            const span2 = `${fmtTime(iv.start)}→${fmtTime(iv.end)}`;
+            const span2 = `${fmtTime(iv.start)}�?'${fmtTime(iv.end)}`;
             lines.push(`    ${iv.label}  ${span2}  | C=${(iv.C||0).toLocaleString()} P=${(iv.P||0).toLocaleString()} | loads=${iv.loads||0} missing=${iv.missing||0} | HC_interval=${iv.hc||0}`);
           }
         } else {
@@ -11808,7 +11808,7 @@ function renderPlanningPanel() {
       }
 
       for (const ps of perShift) {
-        const span = `${fmtTime(ps.start)}→${fmtTime(ps.end)}`;
+        const span = `${fmtTime(ps.start)}�?'${fmtTime(ps.end)}`;
         let hcNowTxt = "";
         if (ps && ps.hcNow != null) {
           const dueC = (ps.hcNowDueC || 0);
@@ -11828,10 +11828,10 @@ function renderPlanningPanel() {
 
       // SUMMARY cards for PAs/AMs (execution view)
       if (mathUi) {
-        const fmtInt = (n) => (n == null ? "—" : Number(n).toLocaleString());
+        const fmtInt = (n) => (n == null ? "�?"" : Number(n).toLocaleString());
         const hrsLeft = (cutoffMs != null) ? Math.max(0, (cutoffMs - nowMs) / 3600000) : null;
 
-        // Progress within cutoff horizon (ops.start → cutoff)
+        // Progress within cutoff horizon (ops.start �?' cutoff)
         let prog = null;
         if (cutoffMs != null && cutoffMs > ops.startMs) {
           prog = Math.min(1, Math.max(0, (nowMs - ops.startMs) / (cutoffMs - ops.startMs)));
@@ -11894,7 +11894,7 @@ function renderPlanningPanel() {
               <div style="font-weight:900;color:#ffffff;">C ${fmtInt(iv.C)}</div>
             </div>
             <div style="display:flex;justify-content:space-between;color:#cbd5e1;font-size:11px;font-weight:800;">
-              <span>${fmtTime(iv.start)}→${fmtTime(iv.end)}</span>
+              <span>${fmtTime(iv.start)}�?'${fmtTime(iv.end)}</span>
               <span>HC interval ${fmtInt(iv.hc)}</span>
             </div>
           </div>
@@ -11904,10 +11904,10 @@ function renderPlanningPanel() {
         let html = "";
         html += card(
           "Ops-to-Cutoff Headcount (Primary)",
-          big(hcTotal == null ? "—" : String(hcTotal), "HC needed now→cutoff"),
+          big(hcTotal == null ? "�?"" : String(hcTotal), "HC needed now�?'cutoff"),
           [
-            kv("C due ≤ cutoff", fmtInt(sumC_cut)),
-            kv("Hours left", hrsLeft == null ? "—" : hrsLeft.toFixed(2)),
+            kv("C due �?� cutoff", fmtInt(sumC_cut)),
+            kv("Hours left", hrsLeft == null ? "�?"" : hrsLeft.toFixed(2)),
             kv("Target", `${targetCph} CPH`),
             cutoffMs != null ? kv("Cutoff", fmtTime(cutoffMs)) : ""
           ].filter(Boolean).join(""),
@@ -11919,9 +11919,9 @@ function renderPlanningPanel() {
             "Active Bucket",
             big(String(active.hcNow != null ? active.hcNow : active.hc), `${active.label}`),
             [
-              kv("Due ≤ bucket end (C)", fmtInt(active.hcNowDueC)),
+              kv("Due �?� bucket end (C)", fmtInt(active.hcNowDueC)),
               kv("Bucket end", fmtTime(active.end)),
-              kv("Hours left in bucket", (active.hcNowHrs != null ? active.hcNowHrs.toFixed(2) : "—"))
+              kv("Hours left in bucket", (active.hcNowHrs != null ? active.hcNowHrs.toFixed(2) : "�?""))
             ].join("")
           );
         }
@@ -11956,8 +11956,8 @@ function renderPlanningPanel() {
           pkgsLeft: (STATE.__planPkgs && l?.planId) ? STATE.__planPkgs[String(l.planId).trim()] : undefined,
         }));
         dbgPre.textContent = [
-          `Window: ${new Date(wStart).toLocaleString()} → ${new Date(wEnd).toLocaleString()}`,
-          `Ops: ${new Date(ops.startMs).toLocaleString()} → ${new Date(ops.endMs).toLocaleString()}`,
+          `Window: ${new Date(wStart).toLocaleString()} �?' ${new Date(wEnd).toLocaleString()}`,
+          `Ops: ${new Date(ops.startMs).toLocaleString()} �?' ${new Date(ops.endMs).toLocaleString()}`,
           `Sample: ${JSON.stringify(sample, null, 2)}`
         ].join("\n");
       }
@@ -12007,9 +12007,9 @@ let cntrsLeft = "";
 try {
   cntrsLeft = String(_getLoadContainersLeftForPlanning(l) || "");
   // If we don't have it yet but the planId exists, show placeholder while bulk call resolves
-  if (!cntrsLeft && planId) cntrsLeft = "…";
+  if (!cntrsLeft && planId) cntrsLeft = "�?�";
 } catch {
-  cntrsLeft = planId ? "…" : "";
+  cntrsLeft = planId ? "�?�" : "";
 }
 
       // VRID link -> Relay (opens new tab)
@@ -12135,7 +12135,7 @@ try {
       <div style="display:flex;align-items:center;gap:8px;">
         <span style="font-weight:800;">SSP Util 2.0</span>
         <span style="padding:2px 8px;border-radius:999px;background:#f3f4f6;border:1px solid #e5e7eb;font-weight:700;">ssp-dock</span>
-        <span id="ssp2-h-node" style="padding:2px 8px;border-radius:999px;background:#eef2ff;border:1px solid #c7d2fe;font-weight:800;color:#1e3a8a;">node: …</span>
+        <span id="ssp2-h-node" style="padding:2px 8px;border-radius:999px;background:#eef2ff;border:1px solid #c7d2fe;font-weight:800;color:#1e3a8a;">node: �?�</span>
       </div>
 
       <div style="display:flex;align-items:center;gap:12px;margin-left:10px;">
@@ -12598,7 +12598,7 @@ try {
             </div>
           </div>
           <div style="margin-top:10px;font-size:12px;opacity:.7;">
-            Use Current→Next for cross-midnight shifts (Wrap). Use Next→Next for Mor2-style planning.
+            Use Current�?'Next for cross-midnight shifts (Wrap). Use Next�?'Next for Mor2-style planning.
           </div>
         </div>
       </div>
@@ -12728,7 +12728,7 @@ function openSettingsModal(defaultTab) {
 
     modal.innerHTML = `
       <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:#f3f4f6;border-bottom:1px solid #e5e7eb;">
-        <div style="font-weight:900;">SSP Util 2.0 — Settings</div>
+        <div style="font-weight:900;">SSP Util 2.0 �?" Settings</div>
         <div style="display:flex;gap:8px;align-items:center;">
           <button id="ssp2-settings-reset" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:800;cursor:pointer;">Reset</button>
           <button id="ssp2-settings-close" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:800;cursor:pointer;">Close</button>
@@ -12767,7 +12767,7 @@ function openSettingsModal(defaultTab) {
           </label>
 
           <div style="margin-top:8px;color:#6b7280;font-size:11px;">
-            Note: This is settings-only right now. The timed “Pull CSV” prompt will be wired next.
+            Note: This is settings-only right now. The timed �?oPull CSV�?� prompt will be wired next.
           </div>
         </div>
 
@@ -12916,7 +12916,7 @@ function openSettingsModal(defaultTab) {
           </div>
 
           <div style="margin-top:8px;color:#6b7280;font-size:11px;">
-            Diagnostics records fetchdata entities and timing per refresh cycle. Use “Download diag.json” when reporting issues.
+            Diagnostics records fetchdata entities and timing per refresh cycle. Use �?oDownload diag.json�?� when reporting issues.
           </div>
         </div>
       </div>
@@ -14514,7 +14514,7 @@ function ensureLaneMapPanel() {
       <div id="ssp2-lane-map-title" style="font-weight:800;opacity:.95;"></div>
       <div style="margin-left:auto;display:flex;gap:8px;">
         <button id="ssp2-lane-map-open-relay" style="padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#e5e7eb;font-weight:900;cursor:pointer;">Open in Relay</button>
-        <button id="ssp2-lane-map-close" style="padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#e5e7eb;font-weight:900;cursor:pointer;">✕</button>
+        <button id="ssp2-lane-map-close" style="padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#e5e7eb;font-weight:900;cursor:pointer;">�o.</button>
       </div>
     </div>
     <div id="ssp2-lane-map-body" style="padding:10px;max-height:calc(75vh - 46px);overflow:auto;">
@@ -14530,9 +14530,9 @@ function openLaneMapPanel(lane, cptMs) {
   const p = ensureLaneMapPanel();
   const title = p.querySelector("#ssp2-lane-map-title");
   const list = p.querySelector("#ssp2-lane-map-list");
-  const laneStr = String(lane||"—");
+  const laneStr = String(lane||"�?"");
   const cptStr = fmtTime(Number(cptMs||0));
-  if (title) title.textContent = `${laneStr} (CPT ${cptStr || "—"})`;
+  if (title) title.textContent = `${laneStr} (CPT ${cptStr || "�?""})`;
   const key = `${laneStr}|${Number(cptMs||0)}`;
   const vrids = (STATE.__laneCptToVrids && STATE.__laneCptToVrids[key]) ? STATE.__laneCptToVrids[key] : [];
   const nodeCode = (STATE && (STATE.nodeId || STATE.nodeID)) || "";
@@ -14616,12 +14616,12 @@ async function openCasesPanel(laneKey, cptMs) {
   const body = document.getElementById("ssp-cases-body");
   if (!overlay || !body) return;
 
-  const laneLabel = String(laneKey || "—");
+  const laneLabel = String(laneKey || "�?"");
   const cptLabel = cptMs ? fmtTime(Number(cptMs || 0)) : "";
   if (subEl) subEl.textContent = cptLabel ? `${laneLabel} (CPT ${cptLabel})` : laneLabel;
 
   overlay.style.display = "flex";
-  body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Loading cases…</div>`;
+  body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Loading cases�?�</div>`;
 
   const rows = await computeOutboundCasesForLaneCpt(laneKey, cptMs);
 
@@ -14633,7 +14633,7 @@ async function openCasesPanel(laneKey, cptMs) {
   const renderRow = (r, i) => {
     const zebra = (i % 2) ? "background:#f9fafb;" : "background:#fff;";
     const vr = esc(String(r.vrid || ""));
-    const sched = r.scheduledMs ? fmtTime(Number(r.scheduledMs || 0)) : "—";
+    const sched = r.scheduledMs ? fmtTime(Number(r.scheduledMs || 0)) : "�?"";
     const cc = Number(r.caseCount || 0) || 0;
 
     const relayUrl = (typeof _sspRelayTrackMapUrlForVrid === "function") ? _sspRelayTrackMapUrlForVrid(vr) : "";
@@ -14660,7 +14660,7 @@ async function openCasesPanel(laneKey, cptMs) {
       <div class="ssp-case-row" data-vrid="${vr}" style="display:grid;grid-template-columns:170px 80px 90px 1fr;gap:10px;align-items:center;padding:10px 10px;border-radius:12px;${zebra}">
         <div>${vrLink}<div style="color:#6b7280;font-weight:800;font-size:11px;margin-top:2px;">Sched ${esc(sched)}</div></div>
         <div style="font-weight:900;">${cc} case${cc===1?"":"s"}</div>
-        <div style="color:#6b7280;font-weight:800;font-size:12px;">${cid ? `#${cid}` : "—"}</div>
+        <div style="color:#6b7280;font-weight:800;font-size:12px;">${cid ? `#${cid}` : "�?""}</div>
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end;">
           ${status ? `<span style="padding:4px 10px;border-radius:999px;border:1px solid #e5e7eb;background:#f3f4f6;font-weight:900;color:#111827;">${status}</span>` : ""}
           ${topic ? `<span style="padding:4px 10px;border-radius:999px;border:1px solid #e5e7eb;background:#f3f4f6;font-weight:900;color:#111827;">${topic}</span>` : ""}
@@ -14670,7 +14670,7 @@ async function openCasesPanel(laneKey, cptMs) {
         </div>
       </div>
       <div class="ssp-case-detail-box" data-casebox="${cid}" style="display:none;margin:-4px 10px 10px 10px;padding:10px 10px;border:1px solid #e5e7eb;border-radius:12px;background:#fff;">
-        <div style="color:#6b7280;font-weight:800;">Loading…</div>
+        <div style="color:#6b7280;font-weight:800;">Loading�?�</div>
       </div>
     `;
   };
@@ -14696,7 +14696,7 @@ async function openCasesPanel(laneKey, cptMs) {
       if (!box) return;
       if (box.style.display === "none") {
         box.style.display = "block";
-        box.innerHTML = `<div style="color:#6b7280;font-weight:800;">Loading…</div>`;
+        box.innerHTML = `<div style="color:#6b7280;font-weight:800;">Loading�?�</div>`;
         const data = await fetchFmcCaseDetails(cid);
         if (!data) {
           box.innerHTML = `<div style="color:#6b7280;">Unable to fetch case details via API (endpoint may differ). Use the Case UI links instead.</div>`;
@@ -14786,7 +14786,7 @@ async function openDisruptionsPanel(laneKey, cptMs) {
   if (!overlay || !panel || !body) return;
 
   const __all = (laneKey === "__ALL__");
-  const laneLabel = __all ? "All lanes" : String(laneKey || "—");
+  const laneLabel = __all ? "All lanes" : String(laneKey || "�?"");
   const cptLabel = cptMs ? fmtTime(cptMs) : "";
   if (subEl) subEl.textContent = cptLabel ? `${laneLabel} (CPT ${cptLabel})` : laneLabel;
 
@@ -14818,7 +14818,7 @@ async function openDisruptionsPanel(laneKey, cptMs) {
   const kindLabel = (k) => (k === "LATE" ? "Driver Late" : k === "ARRIVED_LATE" ? "Arrived Late" : k === "ETA_SLIP" ? "ETA Slip" : String(k || "Issue"));
   const lateTxt = (r) => {
     const m = Number(r.minutes || 0);
-    if (!m) return "—";
+    if (!m) return "�?"";
     if (r.kind === "ARRIVED_LATE") return `${m}m late`;
     if (r.kind === "LATE") return `${m}m late`;
     if (r.kind === "ETA_SLIP") return `+${m}m`;
@@ -14856,17 +14856,17 @@ async function openDisruptionsPanel(laneKey, cptMs) {
     const inboundHtml = (inboundRows && inboundRows.length)
       ? (`<div style="font-weight:900;margin-bottom:6px;">Inbound (${inboundRows.length})</div>` + inboundRows.map((r, i) => {
           const vr = esc(r.vrid || "");
-          const sched = r.scheduledMs ? fmtTime(r.scheduledMs) : "—";
-          const eta = r.arrivalMs ? fmtTime(r.arrivalMs) : (r.etaMs ? fmtTime(r.etaMs) : "—");
-          const pk = (r.packages == null || Number.isNaN(Number(r.packages))) ? "—" : String(Number(r.packages));
-          const cn = (r.containers == null || Number.isNaN(Number(r.containers))) ? "—" : String(Number(r.containers));
+          const sched = r.scheduledMs ? fmtTime(r.scheduledMs) : "�?"";
+          const eta = r.arrivalMs ? fmtTime(r.arrivalMs) : (r.etaMs ? fmtTime(r.etaMs) : "�?"");
+          const pk = (r.packages == null || Number.isNaN(Number(r.packages))) ? "�?"" : String(Number(r.packages));
+          const cn = (r.containers == null || Number.isNaN(Number(r.containers))) ? "�?"" : String(Number(r.containers));
           const late = lateTxt(r);
           const href = (typeof buildRelayUrl === "function") ? buildRelayUrl(r.vrid || "") : "";
           const vrLink = href ? `<a href="${esc(href)}" target="_blank" rel="noopener" style="color:#2563eb;text-decoration:none;font-weight:900;">${vr}</a>` : `<span style="color:#2563eb;font-weight:900;">${vr}</span>`;
           return `
             <div class="ssp-disrupt-row-ib" data-vrid="${esc(r.vrid||"")}" style="padding:8px;margin-bottom:8px;border-radius:10px;background:#fff;border:1px solid #eef2ff;">
               <div style="font-size:13px;">${vrLink}</div>
-              <div style="color:#6b7280;font-size:11px;margin-top:4px;">Sched: ${sched} • ETA/Arr: ${eta} • C ${cn} • P ${pk}</div>
+              <div style="color:#6b7280;font-size:11px;margin-top:4px;">Sched: ${sched} �?� ETA/Arr: ${eta} �?� C ${cn} �?� P ${pk}</div>
               <div style="font-weight:900;color:#111827;margin-top:6px;">${esc(late)}</div>
             </div>
           `;
@@ -14894,7 +14894,7 @@ async function openDisruptionsPanel(laneKey, cptMs) {
       // Group by laneKey
       const lm = new Map();
       for (const r of outboundRows) {
-        const lane = String(r.laneKey || r.lane || "—");
+        const lane = String(r.laneKey || r.lane || "�?"");
         if (!lm.has(lane)) lm.set(lane, []);
         lm.get(lane).push(r);
       }
@@ -14907,14 +14907,14 @@ async function openDisruptionsPanel(laneKey, cptMs) {
       // Render lanes as stacked cards (highest severity first)
       outboundHtml = lanes.map((ln) => {
         const rows = ln.rows.slice().sort(byRowSort);
-        const laneHeader = `<div style="font-weight:900;margin-bottom:6px;">${esc(ln.lane)} — ${rows.length} VRID(s) — worst: ${rows.length?String(rows[0].minutes||0)+"m":"—"}</div>`;
+        const laneHeader = `<div style="font-weight:900;margin-bottom:6px;">${esc(ln.lane)} �?" ${rows.length} VRID(s) �?" worst: ${rows.length?String(rows[0].minutes||0)+"m":"�?""}</div>`;
         const vrs = rows.map((r) => {
           const vr = esc(r.vrid||"");
           const mins = Number(r.minutes||0);
-          const cn = (r.containers == null || Number.isNaN(Number(r.containers))) ? "—" : String(Number(r.containers));
-          const pk = (r.packages == null || Number.isNaN(Number(r.packages))) ? "—" : String(Number(r.packages));
-          const sched = r.scheduledMs ? fmtTime(r.scheduledMs) : "—";
-          const etaArr = r.arrivalMs ? fmtTime(r.arrivalMs) : (r.etaMs ? fmtTime(r.etaMs) : "—");
+          const cn = (r.containers == null || Number.isNaN(Number(r.containers))) ? "�?"" : String(Number(r.containers));
+          const pk = (r.packages == null || Number.isNaN(Number(r.packages))) ? "�?"" : String(Number(r.packages));
+          const sched = r.scheduledMs ? fmtTime(r.scheduledMs) : "�?"";
+          const etaArr = r.arrivalMs ? fmtTime(r.arrivalMs) : (r.etaMs ? fmtTime(r.etaMs) : "�?"");
           const sev = String(r.severity || "UNKNOWN");
           const kind = String(r.kind || "Disruption");
           const loadStatus = String(r.loadStatus || "");
@@ -14923,7 +14923,7 @@ async function openDisruptionsPanel(laneKey, cptMs) {
           const link = href ? `<a href="${esc(href)}" target="_blank" rel="noopener" style="color:#2563eb;text-decoration:none;font-weight:900;">${vr}</a>` : `<span style="color:#2563eb;font-weight:900;">${vr}</span>`;
           const caseBtn = r.caseUrl ? `<a href="${esc(r.caseUrl)}" target="_blank" rel="noopener" style="margin-left:8px;padding:4px 8px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;text-decoration:none;color:#111827;">Cases</a>` : "";
           return `<div class="ssp-disrupt-row-ob" data-lane="${esc(ln.lane)}" data-cpt="${String(Number(r.cptMs || 0))}" data-vrid="${esc(r.vrid||"")}" style="padding:8px;margin-bottom:6px;border-radius:8px;background:#fff;border:1px solid #f3f4f6;display:flex;justify-content:space-between;align-items:center;gap:8px;">
-                    <div style="min-width:0;">${link}${caseBtn}<div style="font-size:11px;color:#6b7280;margin-top:4px;">${esc(kind)} • ${esc(sev)}${loadStatus ? ` • ${esc(loadStatus)}` : ""}</div><div style="font-size:11px;color:#6b7280;margin-top:3px;">Sched: ${sched} • ETA/Arr: ${etaArr} • C ${cn} • P ${pk} • Hits ${disruptCount}</div></div>
+                    <div style="min-width:0;">${link}${caseBtn}<div style="font-size:11px;color:#6b7280;margin-top:4px;">${esc(kind)} �?� ${esc(sev)}${loadStatus ? ` �?� ${esc(loadStatus)}` : ""}</div><div style="font-size:11px;color:#6b7280;margin-top:3px;">Sched: ${sched} �?� ETA/Arr: ${etaArr} �?� C ${cn} �?� P ${pk} �?� Hits ${disruptCount}</div></div>
                     <div style="font-weight:900;color:#dc2626;white-space:nowrap;">${String(mins)}m</div>
                   </div>`;
         }).join("");
@@ -14942,7 +14942,7 @@ async function openDisruptionsPanel(laneKey, cptMs) {
         </div>
         <div style="flex:1;min-width:320px;">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;">
-            <div style="font-weight:900;">Outbound — grouped by lane</div>
+            <div style="font-weight:900;">Outbound �?" grouped by lane</div>
             <div style="margin-left:auto;display:flex;align-items:center;gap:6px;">
               <label for="ssp-disrupt-ob-sort" style="color:#6b7280;font-size:11px;font-weight:800;">Sort</label>
               <select id="ssp-disrupt-ob-sort" style="padding:4px 8px;border-radius:8px;border:1px solid #d1d5db;background:#fff;font-weight:800;font-size:11px;cursor:pointer;">
@@ -15068,11 +15068,11 @@ function openMergePanel(laneKey, cptMs, options = {}) {
 
   const runId = ++STATE.mergePanelRunId;
 
-  const key = String(laneKey || "—") + "::" + String(Number(cptMs || 0));
+  const key = String(laneKey || "�?"") + "::" + String(Number(cptMs || 0));
   const g = STATE.actionGroups ? STATE.actionGroups.get(key) : null;
 
   const __all = String(laneKey||"") === "__ALL__";
-  const laneTxt = __all ? "All lanes" : (laneKey || (g && g.lane) || "—");
+  const laneTxt = __all ? "All lanes" : (laneKey || (g && g.lane) || "�?"");
   const cptTxt = fmtTime(Number(cptMs || (g && g.cptMs) || 0));
   sub.textContent = __all ? `${laneTxt}` : `${laneTxt} (CPT ${cptTxt})`;
   let decisionActiveTab = _mergeNormalizeScenarioTab(options?.initialTab || "merge_pair");
@@ -15139,7 +15139,7 @@ function openMergePanel(laneKey, cptMs, options = {}) {
   // These values are also used by Current Units rendering, so they MUST be initialized before any renderCurrentUnits() call.
   const eligMap = STATE.inboundEligibleMap || {};
   const NL = (v) => String(v ?? "")
-    .trim().toUpperCase().replace(/\s+/g, "").replace(/[|]/g, "").replace(/→/g, "->");
+    .trim().toUpperCase().replace(/\s+/g, "").replace(/[|]/g, "").replace(/�?'/g, "->");
 
   const wantLane = NL(laneTxt);
   const wantCpt = Number(cptMs || 0);
@@ -15241,7 +15241,7 @@ if (!data) {
   return;
 }
 if (data && data.loading) {
-  current.innerHTML = '<div style="color:#6b7280;">Current Units: loading…</div>';
+  current.innerHTML = '<div style="color:#6b7280;">Current Units: loading�?�</div>';
   // Poll once or twice; coordinator resolves asynchronously and will populate shortly.
   setTimeout(() => { try { if (STATE.mergePanelRunId === runId) void renderCurrentUnits(); } catch (_) {} }, 450);
   return;
@@ -15307,14 +15307,14 @@ current.innerHTML = `
       const tip = `CART:${(cached.byType&&cached.byType.CART)||0}  PALLET:${(cached.byType&&cached.byType.PALLET)||0}  GAYLORD:${(cached.byType&&cached.byType.GAYLORD)||0}`;
       current.innerHTML = `
         <div style="font-size:18px;font-weight:900;" title="${tip}">${fmtUnits(cached.units)} units</div>
-        <div style="color:#6b7280;font-size:12px;">In facility${cached.meta?` • ${cached.meta.length} containers`:''}</div>
+        <div style="color:#6b7280;font-size:12px;">In facility${cached.meta?` �?� ${cached.meta.length} containers`:''}</div>
         ${cached.meta?renderContainerBucketsV2(cached.meta):''}
       `;
       return;
     }
 
     if (STATE.currentUnitsInflight.has(key)) {
-      current.innerHTML = `<div style="color:#6b7280;">Loading current units…</div>`;
+      current.innerHTML = `<div style="color:#6b7280;">Loading current units�?�</div>`;
       return;
     }
     // Need an OB anchor (planId+vrId) that belongs to this outbound loadGroupId.
@@ -15348,7 +15348,7 @@ current.innerHTML = `
 
     STATE.currentUnitsInflight.add(key);
   _step('inflight_add');
-    current.innerHTML = `<div style="color:#6b7280;">Loading current units…</div>`;
+    current.innerHTML = `<div style="color:#6b7280;">Loading current units�?�</div>`;
 
     try {
       const payload = {
@@ -15394,7 +15394,7 @@ if (!inboundSummary || inboundSummary.vrids.size === 0) {
     </div>
     ${[...inboundSummary.samples.entries()].map(([vrid, s]) => `
       <div style="margin-left:12px;margin-top:4px;">
-        <b>${esc(vrid)}</b> — ${s.count} container(s)
+        <b>${esc(vrid)}</b> �?" ${s.count} container(s)
         ${
           s.exampleContainers.length
             ? `<div style="color:#6b7280;font-size:12px;">
@@ -15429,10 +15429,10 @@ if (!inboundSummary || inboundSummary.vrids.size === 0) {
 
       STATE.currentUnitsCache[key] = { ts: Date.now(), ...totals, meta };
 
-      const tip = `CART:${totals.byType.CART||0}  PALLET:${totals.byType.PALLET||0}  GAYLORD:${totals.byType.GAYLORD||0}  BAG:${totals.byType.BAG||0}  CAGE:${totals.byType.CAGE||0}  •  Packages:${totals.packages||0}`;
+      const tip = `CART:${totals.byType.CART||0}  PALLET:${totals.byType.PALLET||0}  GAYLORD:${totals.byType.GAYLORD||0}  BAG:${totals.byType.BAG||0}  CAGE:${totals.byType.CAGE||0}  �?�  Packages:${totals.packages||0}`;
       current.innerHTML = `
         <div style="font-size:18px;font-weight:900;" title="${tip}">${fmtUnits(totals.units)} units</div>
-        <div style="color:#6b7280;font-size:12px;">Current • ${totals.containers} containers (Loaded: ${totals.loadedContainers}, In-facility: ${totals.inFacilityContainers}) • ${totals.packages||0} packages</div>
+        <div style="color:#6b7280;font-size:12px;">Current �?� ${totals.containers} containers (Loaded: ${totals.loadedContainers}, In-facility: ${totals.inFacilityContainers}) �?� ${totals.packages||0} packages</div>
         ${renderContainerBucketsV2(meta)}
       `;
 
@@ -15470,7 +15470,7 @@ if (!inboundSummary || inboundSummary.vrids.size === 0) {
   mergeable.innerHTML = lgIds.length
     ? `<div style="display:flex;justify-content:space-between;gap:10px;align-items:center;">
          <div>
-           <div style="font-weight:900;">Eligible containers (merge candidates in facility): —</div>
+           <div style="font-weight:900;">Eligible containers (merge candidates in facility): �?"</div>
            <div style="color:#6b7280;font-size:12px;">LoadGroupIds: ${lgIds.length}</div>
          </div>
        </div>` + mergeDebugHtml(dbgBase)
@@ -15478,7 +15478,7 @@ if (!inboundSummary || inboundSummary.vrids.size === 0) {
 
   if (STATE.mergePanelRunId !== runId) return;
   inb.innerHTML = lgIds.length
-    ? `<div style="color:#6b7280;">Resolving inbound VRIDs for ${lgIds.length} loadGroupId(s)…</div>`
+    ? `<div style="color:#6b7280;">Resolving inbound VRIDs for ${lgIds.length} loadGroupId(s)�?�</div>`
     : `<div style="color:#6b7280;">No inbound VRIDs detected for this route.</div>` + mergeDebugHtml(dbgBase);
 
   // Resolve inbound VRIDs + units via a SINGLE OB call (planId-first anchor), then attribute containers to parent LOAD (VRID).
@@ -15622,7 +15622,7 @@ if (!inboundSummary || inboundSummary.vrids.size === 0) {
               if (labs.length) {
                 const head = labs.slice(0, 15);
                 parts.push(...head);
-                if (labs.length > head.length) parts.push(`…+${labs.length - head.length} more`);
+                if (labs.length > head.length) parts.push(`�?�+${labs.length - head.length} more`);
               }
               return parts.join('\n');
             })(),
@@ -15691,7 +15691,7 @@ if (!inboundSummary || inboundSummary.vrids.size === 0) {
                 <div style="display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-top:1px solid #f3f4f6;">
                   <div style="flex:1;min-width:0;">
                     <div style="font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${esc(r.vrid)}">${esc(r.vrid)}</div>
-                    <div style="color:#6b7280;font-size:12px;">${esc(r.status || '—')}${timeLabel ? ` | ${timeLabel}` : ''}${locLabel}</div>
+                    <div style="color:#6b7280;font-size:12px;">${esc(r.status || '�?"')}${timeLabel ? ` | ${timeLabel}` : ''}${locLabel}</div>
                   </div>
                   <div style="text-align:right;white-space:nowrap;">
                     <div style="font-weight:900;"><span title="${esc(String(r.unitTip || ''))}" style="cursor:help;">${fmtUnits(r.units)}</span> <span style="color:#9ca3af;font-size:12px;font-weight:700;">units</span></div>
@@ -15736,7 +15736,7 @@ const __renderIb = () => {
         (r.loc ? `Loc: ${r.loc}` : ''),
         (r.status ? `Status: ${r.status}` : ''),
         (r.eta ? `ETA: ${r.eta}` : (r.sch ? `SCH: ${r.sch}` : (r.aat ? `AAT: ${r.aat}` : ''))),
-        (Array.isArray(r.labels) && r.labels.length ? `Labels: ${r.labels.slice(0, 12).join(', ')}${r.labels.length>12 ? ' …' : ''}` : '')
+        (Array.isArray(r.labels) && r.labels.length ? `Labels: ${r.labels.slice(0, 12).join(', ')}${r.labels.length>12 ? ' �?�' : ''}` : '')
       ].filter(Boolean).join('\n');
       return `<span title="${esc(tip)}" style="display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">${esc(r.vrid)}</span>`;
     }).join(' ');
@@ -15802,14 +15802,14 @@ const __renderIb = () => {
       e.stopPropagation();
       try { if (STATE.ibContribTsByLaneCpt) STATE.ibContribTsByLaneCpt[__ibKey] = 0; } catch (_) {}
       try { _enqueueIbContrib(wantLane, wantCpt); } catch (_) {}
-      inb.innerHTML = `<div style="color:#6b7280;">Refreshing inbound VRIDs…</div>` + mergeDebugHtml(Object.assign({}, dbgBase, { mpSteps: mpSteps }, { cacheKey: __ibKey, obMs: dtMs }));
+      inb.innerHTML = `<div style="color:#6b7280;">Refreshing inbound VRIDs�?�</div>` + mergeDebugHtml(Object.assign({}, dbgBase, { mpSteps: mpSteps }, { cacheKey: __ibKey, obMs: dtMs }));
       setTimeout(() => { if (STATE.mergePanelRunId === runId) __renderIb(); }, 750);
     };
   }
 };
 
 // Paint immediately with cache (or loading), then poll briefly for the async worker.
-inb.innerHTML = `<div style="color:#6b7280;">Loading inbound VRID contributions…</div>` + mergeDebugHtml(Object.assign({}, dbgBase, { mpSteps: mpSteps }, { cacheKey: __ibKey, obMs: dtMs }));
+inb.innerHTML = `<div style="color:#6b7280;">Loading inbound VRID contributions�?�</div>` + mergeDebugHtml(Object.assign({}, dbgBase, { mpSteps: mpSteps }, { cacheKey: __ibKey, obMs: dtMs }));
 (function __poll(attempt) {
   if (STATE.mergePanelRunId !== runId) return;
   const rows2 = (STATE.ibContribByLaneCpt && STATE.ibContribByLaneCpt[__ibKey]) ? STATE.ibContribByLaneCpt[__ibKey] : null;
@@ -16071,7 +16071,7 @@ function _hhmmToMinutes(hhmm) {
   const _SHIFT_MODAL_ID = 'ssp-util-shift-modal';
 
   function _formatDeltaNeed(v) {
-    if (!Number.isFinite(v)) return '—';
+    if (!Number.isFinite(v)) return '�?"';
     if (v === 0) return '0';
     return v > 0 ? `+${v}` : `${v}`;
   }
@@ -16186,7 +16186,7 @@ function diagDownload(filename, obj) {
         </div>
         <div id="sspShiftRows" style="margin-top:8px;display:flex;flex-direction:column;gap:8px;"></div>
         <div style="margin-top:10px;opacity:0.8;font-size:11px;">
-          Start/End Day are relative to Day 0. Use Current→Next for cross-midnight shifts (Wrap) and Next→Next for Mor2-style shifts.
+          Start/End Day are relative to Day 0. Use Current�?'Next for cross-midnight shifts (Wrap) and Next�?'Next for Mor2-style shifts.
         </div>
       </div>
     `;
@@ -16469,7 +16469,31 @@ const isLocation = (t) => (
 function renderContainerBucketsV2(meta) {
   const esc = s => String(s ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
   const rows = Array.isArray(meta) ? meta.slice() : [];
-  if (!rows.length) return '<div style="color:#6b7280;">—</div>';
+  if (!rows.length) return '<div style="color:#6b7280;">�?"</div>';
+
+  // Keep local fallback math so this renderer never crashes if a global helper is unavailable.
+  const _unitsFor = (contType) => {
+    try {
+      if (typeof unitsForContainerType === "function") return Number(unitsForContainerType(contType)) || 0;
+    } catch (_) {}
+    const t = String(contType || "").toUpperCase().trim();
+    if (!t) return 1;
+    if (
+      t === "PACKAGE" ||
+      t === "GENERAL_AREA" ||
+      t === "STACKING_AREA" ||
+      t === "STAGING_AREA" ||
+      t === "SORTER" ||
+      t === "DOCK_DOOR" ||
+      t === "TRAILER" ||
+      t === "LOAD"
+    ) return 0;
+    if (t === "PALLET") return Number(SETTINGS?.palletUnits) || 1.5;
+    if (t === "GAYLORD") return Number(SETTINGS?.gaylordUnits) || 1.5;
+    if (t === "BAG") return Number(SETTINGS?.bagUnits) || 0.25;
+    if (t === "CAGE") return 1;
+    return 1;
+  };
 
 
   const byBucket = rows.reduce((a,m) => {
@@ -16523,7 +16547,7 @@ function renderContainerBucketsV2(meta) {
   };
 
   const renderRawList = (items) => {
-    if (!items.length) return '—';
+    if (!items.length) return '�?"';
     return items
       .slice()
       .sort((a,b)=> String(a.label||'').localeCompare(String(b.label||'')))
@@ -16535,10 +16559,10 @@ function renderContainerBucketsV2(meta) {
     // Group by trailerId-like label (locationLabel on TRAILER context)
     const groups = groupByLoc(items);
     return groups.map(([loc, arr]) => {
-      const units = arr.reduce((s,x)=>s+unitsForContainerType(x.contType),0);
+      const units = arr.reduce((s,x)=>s+_unitsFor(x.contType),0);
       return `<details open style="margin-top:8px;">
         <summary style="cursor:pointer;font-weight:800;">
-          ${esc(loc)} — ${arr.length} ctrs • ${fmtUnits(units)} units
+          ${esc(loc)} �?" ${arr.length} ctrs �?� ${fmtUnits(units)} units
         </summary>
         <div style="margin-top:6px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;white-space:pre-wrap;">
           ${renderRawList(arr)}
@@ -16551,14 +16575,14 @@ function renderContainerBucketsV2(meta) {
     const groups = groupByLoc(items);
     // Clickable squares via <details> with a styled <summary>
     const cards = groups.map(([loc, arr]) => {
-      const units = arr.reduce((s,x)=>s+unitsForContainerType(x.contType),0);
+      const units = arr.reduce((s,x)=>s+_unitsFor(x.contType),0);
       const cts = arr.length;
-      const title = `${loc}\n${cts} ctrs • ${units} units`;
+      const title = `${loc}\n${cts} ctrs �?� ${units} units`;
       return `<details class="ssp-cu-card">
         <summary class="ssp-cu-card__summary">
           <div style="min-width:0;">
             <div style="font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px;">${esc(loc)}</div>
-            <div style="color:#6b7280;font-size:12px;">${cts} ctrs • ${fmtUnits(units)} units</div>
+            <div style="color:#6b7280;font-size:12px;">${cts} ctrs �?� ${fmtUnits(units)} units</div>
           </div>
           <div style="font-weight:900;color:#2563eb;">View</div>
         </summary>
@@ -16569,13 +16593,13 @@ function renderContainerBucketsV2(meta) {
     }).join('');
 
     return `<div class="ssp-cu-grid" style="margin-top:8px;">
-      ${cards || '<div style="color:#6b7280;">—</div>'}
+      ${cards || '<div style="color:#6b7280;">�?"</div>'}
     </div>`;
   };
 
   const sec = (name, items, renderer) => {
     if (!items || !items.length) return '';
-    const units = items.reduce((s,x)=>s+unitsForContainerType(x.contType),0);
+    const units = items.reduce((s,x)=>s+_unitsFor(x.contType),0);
     const c = colors[name] || '#9ca3af';
     const body = renderer ? renderer(items) : `<div style="margin-top:6px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;white-space:pre-wrap;">${renderRawList(items)}</div>`;
     const open = (name === 'Loaded' || name === 'Staged');
@@ -16583,7 +16607,7 @@ function renderContainerBucketsV2(meta) {
       <summary style="cursor:pointer;font-weight:900;display:flex;align-items:center;gap:8px;">
         <span style="width:10px;height:10px;border-radius:3px;background:${c};display:inline-block;"></span>
         <span>${esc(name)}</span>
-        <span style="color:#6b7280;font-weight:800;">(${items.length} ctrs • ${fmtUnits(units)} units)</span>
+        <span style="color:#6b7280;font-weight:800;">(${items.length} ctrs �?� ${fmtUnits(units)} units)</span>
       </summary>
       ${body}
     </details>`;
@@ -16636,7 +16660,7 @@ function renderContainerBuckets(meta = {}) {
       <details style="margin-top:10px;" ${name === 'Loaded' || name === 'Staged' ? 'open' : ''}>
         <summary style="cursor:pointer;font-weight:900;display:flex;align-items:center;gap:8px;">
           <span style="width:10px;height:10px;border-radius:3px;background:${color};display:inline-block;"></span>
-          ${name} — ${items.length} containers / ${fmtUnits(units)} units
+          ${name} �?" ${items.length} containers / ${fmtUnits(units)} units
         </summary>
         <div style="margin-top:6px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;white-space:pre-wrap;">
           ${renderRawList(items)}
@@ -16664,7 +16688,7 @@ function __sspSafeStringify(obj, maxLen=30000) {
   let s = "";
   try { s = JSON.stringify(obj, null, 2); }
   catch (e) { s = String(obj); }
-  if (s.length > maxLen) s = s.slice(0, maxLen) + "\n…(truncated)…";
+  if (s.length > maxLen) s = s.slice(0, maxLen) + "\n�?�(truncated)�?�";
   return s;
 }
 function __sspEnsureDebug() {
@@ -16739,12 +16763,12 @@ async function openRelayCasesPanel(laneKey, cptMs) {
   const body = document.getElementById('ssp-cases-body');
   if (!overlay || !body) return;
 
-  const laneLabel = String(laneKey || '—');
+  const laneLabel = String(laneKey || '�?"');
   const cptLabel = cptMs ? fmtTime(Number(cptMs || 0)) : '';
   if (subEl) subEl.textContent = cptLabel ? `${laneLabel} (CPT ${cptLabel})` : laneLabel;
 
   overlay.style.display = 'flex';
-  body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Loading cases from Relay…</div>`;
+  body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Loading cases from Relay�?�</div>`;
 
   // Resolve VRIDs for lane/cpt from the current Action Panel grouping.
   let group = null;
@@ -16799,14 +16823,14 @@ async function openRelayCasesPanel(laneKey, cptMs) {
       const st = c.status ? esc(c.status) : '';
       const tp = c.topic ? esc(c.topic) : '';
       const msg = c.message ? esc(c.message) : '';
-      const bits = [id, st, tp].filter(Boolean).join(' • ');
+      const bits = [id, st, tp].filter(Boolean).join(' �?� ');
       return `<div style="padding:6px 8px;border:1px solid #e5e7eb;border-radius:10px;background:#fff;">
         <div style="font-weight:900;">${bits || 'Case'}</div>
         ${msg ? `<div style="color:#6b7280;font-weight:800;font-size:11px;margin-top:2px;">${msg}</div>` : ''}
       </div>`;
     }).join('');
 
-    const more = (r.count > 12) ? `<div style="color:#6b7280;font-weight:800;font-size:11px;margin-top:6px;">+${r.count-12} more…</div>` : '';
+    const more = (r.count > 12) ? `<div style="color:#6b7280;font-weight:800;font-size:11px;margin-top:6px;">+${r.count-12} more�?�</div>` : '';
 
     return `<div style="padding:10px;border-radius:12px;${zebra}">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
@@ -16830,7 +16854,7 @@ async function openRelayCasesPanel(laneKey, cptMs) {
 
 
 /* =============================
- * PATCH v1.6.69 — Relay case details + badge click fix
+ * PATCH v1.6.69 �?" Relay case details + badge click fix
  * - Clicking C/D/N badges now always works (global capture handler)
  * - Cases: use caseId -> /api/v2/transport-views?module=issue&type[]=case&searchId[]=... to fetch case detail
  * - Correspondence: /api/cases/NA:CASE:<id>/correspondences
@@ -16920,8 +16944,8 @@ async function openRelayCasesPanel(laneKey, cptMs) {
       const body = host.body;
 
       overlay.style.display = "flex";
-      if (titleEl) titleEl.textContent = `Cases — ${v}`;
-      body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Loading case details…</div>`;
+      if (titleEl) titleEl.textContent = `Cases �?" ${v}`;
+      body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Loading case details�?�</div>`;
 
       let detail = null;
       try { detail = (typeof _sspRelayGetDetail === "function") ? await _sspRelayGetDetail(v, { allowFmcFallback: false }) : null; } catch (_) { detail = null; }
@@ -16982,7 +17006,7 @@ async function openRelayCasesPanel(laneKey, cptMs) {
             ${header}
             ${subj}
             <div class="ssp-case-correspondence" data-qid="${_esc(r.qid)}" style="display:none;margin-top:10px;border-top:1px solid #1f2937;padding-top:10px;">
-              <div style="color:#9ca3af;font-weight:800;">Loading correspondence…</div>
+              <div style="color:#9ca3af;font-weight:800;">Loading correspondence�?�</div>
             </div>
             <div class="ssp-case-rawbox" data-qid="${_esc(r.qid)}" style="display:none;margin-top:10px;">
               <pre style="white-space:pre-wrap;font-size:11px;max-height:280px;overflow:auto;background:#000;border:1px solid #1f2937;color:#e5e7eb;padding:10px;border-radius:12px;margin:0;">${_esc(_safeJson(r.raw))}</pre>
@@ -16995,7 +17019,7 @@ async function openRelayCasesPanel(laneKey, cptMs) {
         <div style="padding:10px;">
           <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
             <div style="font-weight:900;color:#e5e7eb;">${rows.length} case${rows.length===1?"":"s"}</div>
-            <div style="margin-left:auto;color:#9ca3af;font-weight:800;font-size:12px;">(Relay: issue→case + correspondences)</div>
+            <div style="margin-left:auto;color:#9ca3af;font-weight:800;font-size:12px;">(Relay: issue�?'case + correspondences)</div>
           </div>
           <div style="display:flex;flex-direction:column;gap:8px;">${render}</div>
         </div>
@@ -17065,7 +17089,7 @@ async function openRelayCasesPanel(laneKey, cptMs) {
         const titleEl = host.title;
         const body = host.body;
         overlay.style.display = "flex";
-        if (titleEl) titleEl.textContent = `${String(kind||"detail")} — ${String(vrid||"")}`;
+        if (titleEl) titleEl.textContent = `${String(kind||"detail")} �?" ${String(vrid||"")}`;
         let payload = null;
         if (k === "notes" && typeof _sspRelayGetNotes === "function") payload = await _sspRelayGetNotes(vrid);
         else if (typeof _sspRelayGetDetail === "function") payload = await _sspRelayGetDetail(vrid);
@@ -17080,7 +17104,7 @@ async function openRelayCasesPanel(laneKey, cptMs) {
   } catch (_) {}
 })();
 
-/* PATCH 1.6.70 — lane cases panel uses Relay issue APIs */
+/* PATCH 1.6.70 �?" lane cases panel uses Relay issue APIs */
 (function(){
   try {
     const _esc = (s)=> (typeof esc==='function') ? esc(s) : String(s||'').replace(/[&<>"']/g,(c)=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
@@ -17202,11 +17226,11 @@ async function openRelayCasesPanel(laneKey, cptMs) {
       const subEl=document.getElementById('ssp-cases-subtitle');
       const body=document.getElementById('ssp-cases-body');
       if (!overlay||!body) return;
-      const laneLabel=String(laneKey||'—');
+      const laneLabel=String(laneKey||'�?"');
       const cptLabel=cptMs?(typeof fmtTime==='function'?fmtTime(Number(cptMs||0)):''):'';
       if (subEl) subEl.textContent = cptLabel ? `${laneLabel} (CPT ${cptLabel})` : laneLabel;
       overlay.style.display='flex';
-      body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Loading lane cases from Relay…</div>`;
+      body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Loading lane cases from Relay�?�</div>`;
 
       // Search lane VRIDs (Relay)
       let rows=[]; try{ rows = await searchLaneViews(laneKey, cptMs); }catch(_){ rows=[]; }
@@ -17246,7 +17270,7 @@ async function openRelayCasesPanel(laneKey, cptMs) {
         (ids||[]).forEach((x)=>{ const id=String(x||'').replace(/^NA:CASE:/,'').trim(); if(!id||seen.has(id)) return; seen.add(id); uniq.push(id); });
       }
 
-      body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Fetching ${uniq.length} case(s)…</div>`;
+      body.innerHTML = `<div style="padding:10px;color:#6b7280;font-weight:800;">Fetching ${uniq.length} case(s)�?�</div>`;
 
       const issueRows = await mapLimit(uniq, 6, fetchIssueCase);
       const byId = new Map();
@@ -17265,7 +17289,7 @@ async function openRelayCasesPanel(laneKey, cptMs) {
           const queue = c.queue ? _esc(c.queue) : '';
           const subject = c.subject ? _esc(c.subject) : '';
           const sev = (c.severity!==undefined && c.severity!==null && String(c.severity)!=='') ? _esc(String(c.severity)) : '';
-          const top = [status, queue].filter(Boolean).join(' • ');
+          const top = [status, queue].filter(Boolean).join(' �?� ');
           return `<div style="padding:10px;border:1px solid #1f2937;border-radius:12px;background:#000;">
             <div style="display:flex;gap:10px;align-items:center;">
               <div style="font-weight:900;color:#e5e7eb;">#${_esc(cid)}</div>
@@ -17288,7 +17312,7 @@ async function openRelayCasesPanel(laneKey, cptMs) {
 
       body.innerHTML = `<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
         <div style="font-weight:900;">Lane Cases (Relay)</div>
-        <div style="margin-left:auto;color:#9ca3af;font-weight:800;font-size:12px;">${_esc(laneBase(laneKey))} • ${vrids.length} VRIDs</div>
+        <div style="margin-left:auto;color:#9ca3af;font-weight:800;font-size:12px;">${_esc(laneBase(laneKey))} �?� ${vrids.length} VRIDs</div>
       </div>
       <div style="max-height:70vh;overflow:auto;padding-right:6px;">${vrids.slice(0,120).map(vrSection).join('')}</div>`;
 
@@ -17313,7 +17337,7 @@ async function openRelayCasesPanel(laneKey, cptMs) {
           if (!open) return;
           if (box.getAttribute('data-loaded')==='1') return;
           box.setAttribute('data-loaded','1');
-          box.innerHTML = `<div style="color:#9ca3af;font-weight:800;">Loading correspondence…</div>`;
+          box.innerHTML = `<div style="color:#9ca3af;font-weight:800;">Loading correspondence�?�</div>`;
           const msgs = await fetchCorr(cid);
           if (!msgs.length){ box.innerHTML = `<div style="color:#9ca3af;font-weight:800;">No correspondence found.</div>`; return; }
           box.innerHTML = msgs.map((m)=>{
