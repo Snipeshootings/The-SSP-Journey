@@ -1340,9 +1340,12 @@ function getOpsWindow(nowMs = Date.now()) {
   // Expose a global alias for manual testing from the browser console.
   // Provide both plural and singular names to avoid ReferenceErrors when called interactively.
   try {
-    if (typeof window !== 'undefined') {
-      window.importInboundCsvEstimates = importInboundCsvEstimates;
-      window.importInboundCsvEstimate = importInboundCsvEstimates; // legacy/single-name alias
+    // When running as a userscript the script may be sandboxed; prefer `unsafeWindow`
+    // to expose functions into the page context, falling back to `window`.
+    const __ssp_page_global = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : (typeof window !== 'undefined' ? window : null);
+    if (__ssp_page_global) {
+      try { __ssp_page_global.importInboundCsvEstimates = importInboundCsvEstimates; } catch (_) {}
+      try { __ssp_page_global.importInboundCsvEstimate = importInboundCsvEstimates; } catch (_) {}
     }
   } catch (_) {}
 
