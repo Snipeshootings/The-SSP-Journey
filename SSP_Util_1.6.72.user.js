@@ -1,4 +1,4 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         SSP Util
 // @namespace    https://deicide.internal/ssp-util-2
 // @version 1.6.72
@@ -852,12 +852,12 @@ function getOpsWindow(nowMs = Date.now()) {
     try {
       const cache = STATE.ibRouteAvg || _ibAvgLoadFromStorage();
       if (!cache || !cache.routes) return null;
-      const r = cache.routes[String(route||"").trim()];
-      if (!r) return null;
-
-      // Prefer exact equipment bucket, fall back to "__all"
+      const routeKey = String(route || "").trim();
       const eKey = String(equipShortName||"").trim() || "__all";
-      return r[eKey] || r.__all || null;
+      const routeBuckets = routeKey ? cache.routes[routeKey] : null;
+      const globalBuckets = cache.routes.__GLOBAL__ || null;
+      if (routeBuckets) return routeBuckets[eKey] || routeBuckets.__all || (globalBuckets ? (globalBuckets[eKey] || globalBuckets.__all || null) : null);
+      return globalBuckets ? (globalBuckets[eKey] || globalBuckets.__all || null) : null;
     } catch { return null; }
   }
 
@@ -957,6 +957,8 @@ function getOpsWindow(nowMs = Date.now()) {
         if ((Number(c) || 0) > 0) {
           push(route, equipS, c, p);
           push(route, "__all", c, p);
+          push("__GLOBAL__", equipS, c, p);
+          push("__GLOBAL__", "__all", c, p);
         }
       }
 
@@ -1200,11 +1202,15 @@ function getOpsWindow(nowMs = Date.now()) {
       unmanifested_or_zero: 0
     };
     try {
-      const stats = {}; // route::loadType::equipment -> { samples: [...], n: count }
-      const globalStats = {}; // route -> { samples: [...], n: count }
+      const stats = {}; // key -> { samples: [...], n: count }
       const routes = new Set();
       let rowsTotal = 0;
       let rowsAccepted = 0;
+      const addSample = (key, c, p) => {
+        if (!stats[key]) stats[key] = { samples: [], n: 0 };
+        stats[key].samples.push({ c, p });
+        stats[key].n += 1;
+      };
 
       for (const row of (csvRows || [])) {
         rowsTotal += 1;
@@ -1230,14 +1236,12 @@ function getOpsWindow(nowMs = Date.now()) {
         routes.add(sortRoute);
         rowsAccepted += 1;
 
-        const key = `${sortRoute}::${loadType}::${equipShort}`;
-        if (!stats[key]) stats[key] = { samples: [], n: 0 };
-        stats[key].samples.push({ c: totalC, p: totalP });
-        stats[key].n += 1;
-
-        if (!globalStats[sortRoute]) globalStats[sortRoute] = { samples: [], n: 0 };
-        globalStats[sortRoute].samples.push({ c: totalC, p: totalP });
-        globalStats[sortRoute].n += 1;
+        addSample(`${sortRoute}::${loadType}::${equipShort}`, totalC, totalP);
+        addSample(`${sortRoute}::__all::${equipShort}`, totalC, totalP);
+        addSample(`${sortRoute}::__all::__all`, totalC, totalP);
+        addSample(`__GLOBAL__::${loadType}::${equipShort}`, totalC, totalP);
+        addSample(`__GLOBAL__::__all::${equipShort}`, totalC, totalP);
+        addSample(`__GLOBAL__::__all::__all`, totalC, totalP);
       }
 
       const estimates = {};
@@ -1250,17 +1254,6 @@ function getOpsWindow(nowMs = Date.now()) {
         const varC = cs.reduce((sum, c) => sum + Math.pow(c - avgC, 2), 0) / cs.length;
         const varP = ps.reduce((sum, p) => sum + Math.pow(p - avgP, 2), 0) / ps.length;
         estimates[key] = { n: data.n, avgC, avgP, stdDevC: Math.sqrt(varC), stdDevP: Math.sqrt(varP) };
-      }
-
-      for (const [route, data] of Object.entries(globalStats)) {
-        if (!data.samples.length) continue;
-        const cs = data.samples.map((s) => s.c);
-        const ps = data.samples.map((s) => s.p);
-        const avgC = cs.reduce((a, b) => a + b, 0) / cs.length;
-        const avgP = ps.reduce((a, b) => a + b, 0) / ps.length;
-        const varC = cs.reduce((sum, c) => sum + Math.pow(c - avgC, 2), 0) / cs.length;
-        const varP = ps.reduce((sum, p) => sum + Math.pow(p - avgP, 2), 0) / ps.length;
-        estimates[`${route}::__all::__all`] = { n: data.n, avgC, avgP, stdDevC: Math.sqrt(varC), stdDevP: Math.sqrt(varP) };
       }
 
       return {
@@ -1378,7 +1371,13 @@ function getOpsWindow(nowMs = Date.now()) {
 
   /**
    * Get estimate for a load using CSV-based statistics (with fallback to route averages).
-   * Lookup order: route::loadType::equipment -> route::__all::equipment -> route::__all::__all
+   * Lookup order:
+   * route::loadType::equipment ->
+   * route::__all::equipment ->
+   * route::__all::__all ->
+   * __GLOBAL__::loadType::equipment ->
+   * __GLOBAL__::__all::equipment ->
+   * __GLOBAL__::__all::__all
    */
   function _ibCsvEstGet(sortRoute, loadType, equipment) {
     try {
@@ -1404,6 +1403,18 @@ function getOpsWindow(nowMs = Date.now()) {
       const key3 = `${sr}::__all::__all`;
       if (est[key3]) return est[key3];
 
+      // Fall back to global loadType + equipment
+      const key4 = `__GLOBAL__::${lt}::${equipShort}`;
+      if (est[key4]) return est[key4];
+
+      // Fall back to global __all + equipment
+      const key5 = `__GLOBAL__::__all::${equipShort}`;
+      if (est[key5]) return est[key5];
+
+      // Fall back to global __all + __all
+      const key6 = `__GLOBAL__::__all::__all`;
+      if (est[key6]) return est[key6];
+
       return null;
     } catch { return null; }
   }
@@ -1413,13 +1424,18 @@ function getOpsWindow(nowMs = Date.now()) {
     const c = Number(totalContainers) || 0;
     const p = Number(totalPackages) || 0;
     if (c > 0 || p > 0) return null; // already manifested
+    const ceilPosInt = (v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n <= 0) return 0;
+      return Math.ceil(n);
+    };
 
     // Try CSV-based estimates first (higher priority)
     const csvEst = _ibCsvEstGet(sortRoute, loadType, equipmentType);
     if (csvEst && csvEst.n > 0) {
       return {
-        estC: Math.round((csvEst.avgC || 0) * 10) / 10,
-        estP: Math.round(csvEst.avgP || 0),
+        estC: ceilPosInt(csvEst.avgC),
+        estP: ceilPosInt(csvEst.avgP),
         source: `csv_${csvEst.n}`,
       };
     }
@@ -1428,8 +1444,8 @@ function getOpsWindow(nowMs = Date.now()) {
     const avg = _ibAvgGet(sortRoute, equipShort(equipmentType));
     if (!avg) return null;
     return {
-      estC: Math.round((avg.avgC || 0) * 10) / 10,
-      estP: Math.round(avg.avgP || 0),
+      estC: ceilPosInt(avg.avgC),
+      estP: ceilPosInt(avg.avgP),
       source: `avg_${avg.n || 0}`,
     };
   }
@@ -8214,11 +8230,13 @@ function renderPanel() {
           pushPart(`Remaining: ${sh.remaining}`, `<span><b>Remaining:</b> ${sh.remaining}</span>`);
         }
 
-        // HC from shift settings (no re-math), Need is delta vs plan
-        const hc = Number.isFinite(Number(sh.staffed)) ? Number(sh.staffed) : 0;
-        pushPart(`HC: ${hc}`, `<span><b>HC:</b> ${hc}</span>`);
+        // Hybrid HC view: recommendation + planned staffing + delta.
+        const hcRec = Number.isFinite(Number(sh.neededNow)) ? Number(sh.neededNow) : 0;
+        const hcPlan = Number.isFinite(Number(sh.staffed)) ? Number(sh.staffed) : 0;
+        pushPart(`HC Rec: ${hcRec}`, `<span><b>HC Rec:</b> ${hcRec}</span>`);
+        pushPart(`HC Plan: ${hcPlan}`, `<span><b>HC Plan:</b> ${hcPlan}</span>`);
 
-        const d = Number(sh.deltaNeed) || 0;
+        const d = Number.isFinite(Number(sh.deltaNeed)) ? Number(sh.deltaNeed) : (hcRec - hcPlan);
         const needColor = d > 0 ? "#dc2626" : (d < 0 ? "#2563eb" : "#16a34a");
         pushPart(`Need: ${formatDelta(d)}`, `<span><b>Need:</b> <span style="color:${needColor};font-weight:900;">${formatDelta(d)}</span></span>`);
       }
@@ -9134,10 +9152,12 @@ function _getLoadCountsForPlanningMath(l, opts = {}) {
     const allowEstimate = opts && opts.allowEstimate !== false;
     const isCompleted = String(l?.status || l?.loadStatus || "").toUpperCase().trim() === "COMPLETED";
     if (allowEstimate && !isCompleted) {
+      const cKnown = (C != null && C !== "" && Number.isFinite(Number(C))) ? Number(C) : 0;
+      const pKnown = (P != null && P !== "" && Number.isFinite(Number(P))) ? Number(P) : 0;
       const est = estimateInboundIfUnmanifested({
         sortRoute: String(l?.route || l?.lane || "").trim(),
-        totalContainers: Number.isFinite(Number(C)) ? Number(C) : 0,
-        totalPackages: Number.isFinite(Number(P)) ? Number(P) : 0,
+        totalContainers: cKnown,
+        totalPackages: pKnown,
         equipmentType: String(l?.equipmentType || l?.trailerEquipmentType || "").trim(),
         loadType: String(l?.shippingPurposeType || l?.loadType || l?.shippingPurpose || "").trim(),
       });
@@ -9156,9 +9176,13 @@ function _getLoadCountsForPlanningMath(l, opts = {}) {
   }
 
 function _getLoadContainersLeftForPlanning(l) {
-    const { C } = _getLoadCountsForPlanningMath(l, { allowEstimate: true });
+    const { C, source } = _getLoadCountsForPlanningMath(l, { allowEstimate: true });
+    if (C == null || C === "") return "";
     const n = Number(C);
     if (!Number.isFinite(n)) return "";
+    if (String(source || "").startsWith("csv_") || String(source || "").startsWith("avg_") || String(source || "") === "estimated") {
+      return String(Math.ceil(Math.max(0, n)));
+    }
     const rounded = Math.round(n * 10) / 10;
     return Number.isInteger(rounded) ? String(rounded) : String(rounded);
   }
@@ -11498,8 +11522,11 @@ function renderPlanningPanel() {
           }
           case "cntrsLeft": {
             const projected = _getLoadCountsForPlanningMath(l, { allowEstimate: true });
-            const projectedC = Number(projected?.C);
-            if (Number.isFinite(projectedC)) return projectedC;
+            const projectedRaw = projected?.C;
+            if (projectedRaw != null && projectedRaw !== "") {
+              const projectedC = Number(projectedRaw);
+              if (Number.isFinite(projectedC)) return projectedC;
+            }
             const nodeId = STATE?.nodeId || STATE?.nodeID || "";
             const inboundLoadId = _getInboundLoadIdForHierarchy(l);
             const cached = _getIbTrailerRemainingCached(nodeId, inboundLoadId);
@@ -11902,6 +11929,10 @@ function renderPlanningPanel() {
 
         // Build UI
         let html = "";
+        const shiftSummary = (typeof _getShiftSummary === "function") ? _getShiftSummary() : null;
+        const plannedHc = (shiftSummary && shiftSummary.ok && Number.isFinite(Number(shiftSummary.staffed))) ? Number(shiftSummary.staffed) : null;
+        const recHc = (hcTotal != null) ? Number(hcTotal) : ((shiftSummary && shiftSummary.ok && Number.isFinite(Number(shiftSummary.neededNow))) ? Number(shiftSummary.neededNow) : null);
+        const deltaVsPlan = (plannedHc != null && recHc != null) ? (recHc - plannedHc) : null;
         html += card(
           "Ops-to-Cutoff Headcount (Primary)",
           big(hcTotal == null ? "—" : String(hcTotal), "HC needed now→cutoff"),
@@ -11909,6 +11940,8 @@ function renderPlanningPanel() {
             kv("C due … cutoff", fmtInt(sumC_cut)),
             kv("Hours left", hrsLeft == null ? "—" : hrsLeft.toFixed(2)),
             kv("Target", `${targetCph} CPH`),
+            kv("HC planned", plannedHc == null ? "â€”" : String(plannedHc)),
+            kv("Delta vs plan", deltaVsPlan == null ? "â€”" : formatDelta(deltaVsPlan)),
             cutoffMs != null ? kv("Cutoff", fmtTime(cutoffMs)) : ""
           ].filter(Boolean).join(""),
         );
@@ -13388,7 +13421,7 @@ function detectNodeId() {
 /* ============================================================
    MERGE PANEL (Phase 2 UI)
    - Opened ONLY from the Action Panel by clicking the merge tag (MERGE NOW / MERGE SOON / OK).
-   - Displays dual charts: Underutilized outbound VRIDs (left) + Mergeable inbound VRIDs (right).
+   - Displays Current Units (left) + Mergeable inbound VRIDs (right).
    - Bottom: Inbound VRIDs for this route with eligible units (from getEligibleContainerCountsForLoads).
 ============================================================ */
 
@@ -13449,9 +13482,7 @@ function ensureMergePanel() {
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:12px;">
       <div>
         <div style="font-weight:900;margin-bottom:6px;">Current Units (System View)</div>
-        <div id="ssp-merge-current" style="border:1px solid #e5e7eb;border-radius:10px;padding:10px;margin-bottom:10px;"></div>
-        <div style="font-weight:900;margin-bottom:6px;">Underutilized (Outbound)</div>
-        <div id="ssp-merge-under" style="border:1px solid #e5e7eb;border-radius:10px;padding:10px;"></div>
+        <div id="ssp-merge-current" style="border:1px solid #e5e7eb;border-radius:10px;padding:10px;"></div>
       </div>
       <div>
         <div style="font-weight:900;margin-bottom:6px;">Mergeable (Inbound Eligible)</div>
@@ -13677,6 +13708,10 @@ function _renderMergeDecisionPanelSnapshot(snapshot, laneKey, cptMs, options = {
         <span style="font-weight:900;color:${String(b?.severity || "") === "critical" ? "#b91c1c" : "#92400e"};">${_mergeEsc(String(b?.severity || "warning").toUpperCase())}</span>
         <span style="margin-left:6px;color:#111827;">${_mergeEsc(b?.message || "")}</span>
         ${b?.vrid ? `<span style="margin-left:6px;color:#374151;font-weight:800;">VRID ${_mergeEsc(b.vrid)}</span>` : ""}
+        ${(() => {
+          const route = String(b?.lane || b?.route || snapshot?.lane || laneKey || "").trim();
+          return route ? `<span style="margin-left:6px;color:#374151;font-weight:800;">Route ${_mergeEsc(route)}</span>` : "";
+        })()}
         ${Number(b?.minutes || 0) ? `<span style="margin-left:6px;color:#6b7280;">${Number(b.minutes)}m</span>` : ""}
       </div>`).join("")
     : `<div style="color:#6b7280;">No blockers detected for this lane/CPT.</div>`;
@@ -13684,8 +13719,8 @@ function _renderMergeDecisionPanelSnapshot(snapshot, laneKey, cptMs, options = {
 
 
 // --- Disruptions (Inbound + Outbound) ---
-// Inbound disruptions: derived from inbound VRIDs that contribute to a given lane+CPT (STATE.ibContribByLaneCpt).
-// Outbound disruptions for panel rendering are Relay-only (transport-view search + detail disruptions).
+// Legacy inbound disruption derivation remains for non-panel tooling (dot indicators, exports, blockers).
+// Disruptions panel rendering uses Relay for both inbound and outbound lanes.
 // Legacy FMC outbound helpers remain below for non-panel tooling.
 const OUTBOUND_LATE_THRESHOLD_MIN = 15;
 
@@ -14105,6 +14140,193 @@ async function _sspRelayBuildOutboundDisruptionsForPanel(laneKey, cptMs) {
     String(a.vrid || "").localeCompare(String(b.vrid || ""))
   );
 
+  return { rows, error: firstErr, relayHitCount };
+}
+
+async function _sspRelayBuildInboundDisruptionsForPanel(laneKey, cptMs) {
+  const contexts = [];
+  if (String(laneKey || "") === "__ALL__") {
+    const groups = (STATE.actionGroups && STATE.actionGroups.values) ? Array.from(STATE.actionGroups.values()) : [];
+    for (const g of groups) {
+      const lane = String(g?.lane || "").trim();
+      const cpt = Number(g?.cptMs || 0);
+      if (!lane) continue;
+      contexts.push({ laneKey: lane, cptMs: cpt });
+    }
+  } else {
+    contexts.push({ laneKey: String(laneKey || "").trim(), cptMs: Number(cptMs || 0) });
+  }
+
+  const uniqCtx = [];
+  const seenCtx = new Set();
+  for (const c of contexts) {
+    const k = `${c.laneKey}::${String(c.cptMs || 0)}`;
+    if (!c.laneKey || seenCtx.has(k)) continue;
+    seenCtx.add(k);
+    uniqCtx.push(c);
+  }
+
+  const byVrid = new Map();
+  let firstErr = null;
+  let relayHitCount = 0;
+
+  const parseInboundMs = (v) => {
+    if (v == null) return null;
+    try {
+      if (typeof _parseInboundTs === "function") {
+        const t = _parseInboundTs(v);
+        if (Number.isFinite(t)) return t;
+      }
+    } catch (_) {}
+    const t2 = _msFromAny(v);
+    return Number.isFinite(t2) ? t2 : null;
+  };
+  const minutesFromDisruption = (d) => {
+    const n = Number(
+      d?.minutes ??
+      d?.minutesLate ??
+      d?.delayMinutes ??
+      d?.etaSlipMinutes ??
+      d?.impactMinutes ??
+      d?.impact?.minutes ??
+      d?.latenessMinutes ??
+      0
+    );
+    return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+  };
+  const pickTopDisruption = (arr) => {
+    const rows = Array.isArray(arr) ? arr.filter((x) => x && typeof x === "object") : [];
+    if (!rows.length) return null;
+    rows.sort((a, b) =>
+      (_sspRelaySeverityScore(b?.severity) - _sspRelaySeverityScore(a?.severity)) ||
+      (minutesFromDisruption(b) - minutesFromDisruption(a))
+    );
+    return rows[0] || null;
+  };
+  const readPlanCounts = (planId) => {
+    const out = { containers: null, packages: null };
+    const pid = String(planId || "").trim();
+    if (!pid) return out;
+    try {
+      const rec = STATE?.ibContainerCount?.[pid] || null;
+      const total = rec?.totalCount || rec?.total || null;
+      const c = total && typeof total.C === "number" ? Number(total.C) : null;
+      const p = total && typeof total.P === "number" ? Number(total.P) : null;
+      if (c != null) out.containers = c;
+      if (p != null) out.packages = p;
+    } catch (_) {}
+    try {
+      if (out.packages == null && STATE.__planPkgs && Object.prototype.hasOwnProperty.call(STATE.__planPkgs, pid)) {
+        const p2 = Number(STATE.__planPkgs[pid]);
+        if (Number.isFinite(p2)) out.packages = p2;
+      }
+    } catch (_) {}
+    return out;
+  };
+
+  for (const ctx of uniqCtx) {
+    const lane = String(ctx.laneKey || "").trim();
+    const cpt = Number(ctx.cptMs || 0);
+    const key = _ibContribKey(lane, cpt);
+    const contribRows = (STATE.ibContribByLaneCpt && Array.isArray(STATE.ibContribByLaneCpt[key])) ? STATE.ibContribByLaneCpt[key] : [];
+    if (!contribRows.length) continue;
+
+    const metaByVrid = new Map();
+    for (const r of contribRows) {
+      const vrid = String(r?.vrid || "").trim();
+      if (!vrid) continue;
+      const planId = String(r?.planId || "").trim();
+      const planCounts = readPlanCounts(planId);
+      const cRaw = Number(r?.containers);
+      const pRaw = Number(r?.packages);
+      const entry = {
+        vrid,
+        laneKey: lane,
+        cptMs: cpt || 0,
+        planId,
+        scheduledMs: parseInboundMs(r?.sch),
+        etaMs: parseInboundMs(r?.eta),
+        arrivalMs: parseInboundMs(r?.aat),
+        containers: Number.isFinite(cRaw) ? cRaw : planCounts.containers,
+        packages: Number.isFinite(pRaw) ? pRaw : planCounts.packages,
+      };
+      const cur = metaByVrid.get(vrid);
+      if (!cur) {
+        metaByVrid.set(vrid, entry);
+      } else {
+        if (!cur.scheduledMs && entry.scheduledMs) cur.scheduledMs = entry.scheduledMs;
+        if (!cur.etaMs && entry.etaMs) cur.etaMs = entry.etaMs;
+        if (!cur.arrivalMs && entry.arrivalMs) cur.arrivalMs = entry.arrivalMs;
+        if ((cur.containers == null) && entry.containers != null) cur.containers = entry.containers;
+        if ((cur.packages == null) && entry.packages != null) cur.packages = entry.packages;
+      }
+    }
+
+    for (const vrid of Array.from(metaByVrid.keys()).slice(0, 140)) {
+      try {
+        const detail = await _sspRelayGetDetail(vrid, { allowFmcFallback: false });
+        relayHitCount += 1;
+        const disruptions = _sspRelayExtractDisruptions(detail) || [];
+        if (!disruptions.length) continue;
+
+        const rec = metaByVrid.get(vrid) || { vrid, laneKey: lane, cptMs: cpt || 0 };
+        try {
+          const node = (STATE && (STATE.nodeId || STATE.nodeID)) || "";
+          const t = _sspRelayTimesForNode(detail, node);
+          const sched = _msFromAny(t?.planned);
+          const eta = _msFromAny(t?.eta);
+          const arr = _msFromAny(t?.aat);
+          if (!rec.scheduledMs && sched) rec.scheduledMs = sched;
+          if (!rec.etaMs && eta) rec.etaMs = eta;
+          if (!rec.arrivalMs && arr) rec.arrivalMs = arr;
+        } catch (_) {}
+
+        const top = pickTopDisruption(disruptions);
+        const candidate = {
+          direction: "inbound",
+          vrid: rec.vrid,
+          laneKey: rec.laneKey || lane,
+          cptMs: rec.cptMs || cpt || 0,
+          scheduledMs: rec.scheduledMs || null,
+          etaMs: rec.etaMs || null,
+          arrivalMs: rec.arrivalMs || null,
+          containers: rec.containers,
+          packages: rec.packages,
+          kind: String(top?.type || top?.disruptionType || top?.id || "Disruption"),
+          severity: String(top?.severity || "UNKNOWN"),
+          status: String(top?.status || top?.state || top?.disposition || ""),
+          minutes: minutesFromDisruption(top),
+          disruptionCount: disruptions.length,
+        };
+
+        const cur = byVrid.get(candidate.vrid);
+        if (!cur) {
+          byVrid.set(candidate.vrid, candidate);
+          continue;
+        }
+        const curScore = _sspRelaySeverityScore(cur.severity);
+        const nextScore = _sspRelaySeverityScore(candidate.severity);
+        if (nextScore > curScore || (nextScore === curScore && Number(candidate.minutes || 0) > Number(cur.minutes || 0))) {
+          byVrid.set(candidate.vrid, { ...cur, ...candidate });
+        } else {
+          cur.disruptionCount = Math.max(Number(cur.disruptionCount || 0), Number(candidate.disruptionCount || 0));
+          if (!cur.scheduledMs || (candidate.scheduledMs && candidate.scheduledMs < cur.scheduledMs)) cur.scheduledMs = candidate.scheduledMs;
+          if (!cur.etaMs || (candidate.etaMs && candidate.etaMs < cur.etaMs)) cur.etaMs = candidate.etaMs;
+          if (!cur.arrivalMs || (candidate.arrivalMs && candidate.arrivalMs < cur.arrivalMs)) cur.arrivalMs = candidate.arrivalMs;
+        }
+      } catch (e) {
+        if (!firstErr) firstErr = e;
+      }
+    }
+  }
+
+  const rows = Array.from(byVrid.values());
+  rows.sort((a, b) =>
+    (_sspRelaySeverityScore(b.severity) - _sspRelaySeverityScore(a.severity)) ||
+    (Number(b.minutes || 0) - Number(a.minutes || 0)) ||
+    (Number(a.scheduledMs || 0) - Number(b.scheduledMs || 0)) ||
+    String(a.vrid || "").localeCompare(String(b.vrid || ""))
+  );
   return { rows, error: firstErr, relayHitCount };
 }
 
@@ -14797,11 +15019,11 @@ async function openDisruptionsPanel(laneKey, cptMs) {
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
       <div style="font-weight:900;color:#111827;">Inbound + Outbound disruptions</div>
       <div style="flex:1"></div>
-      <div style="color:#6b7280;font-weight:800;font-size:12px;">Threshold: &gt;${OUTBOUND_LATE_THRESHOLD_MIN}m late (Outbound)</div>
+      <div style="color:#6b7280;font-weight:800;font-size:12px;">Source: Relay only</div>
     </div>
     <div id="ssp-disrupt-all"></div>
     <div style="margin-top:8px;color:#6b7280;font-size:11px;">
-      Outbound: Relay transport-view search + detail disruptions. Inbound: SSP inbound contrib (IB4CPT) + arrival/ETA slip.
+      Both sections are Relay-derived and grouped by lane.
     </div>
   `;
 
@@ -14815,29 +15037,20 @@ async function openDisruptionsPanel(laneKey, cptMs) {
       .replace(/"/g, "&quot;")
       .replace(/'/g, "&#39;");
 
-  const kindLabel = (k) => (k === "LATE" ? "Driver Late" : k === "ARRIVED_LATE" ? "Arrived Late" : k === "ETA_SLIP" ? "ETA Slip" : String(k || "Issue"));
-  const lateTxt = (r) => {
-    const m = Number(r.minutes || 0);
-    if (!m) return "—";
-    if (r.kind === "ARRIVED_LATE") return `${m}m late`;
-    if (r.kind === "LATE") return `${m}m late`;
-    if (r.kind === "ETA_SLIP") return `+${m}m`;
-    return `${m}m`;
-  };
-
   // Build rows
   let inboundRows = [];
   let outboundRows = [];
-
+  let inboundErr = null;
+  let outboundErr = null;
   try {
-    inboundRows = __all
-      ? (computeDisruptionsAll() || [])
-      : (computeDisruptionsForLaneCpt(laneKey, cptMs) || []);
-  } catch (_) {
+    const relayIn = await _sspRelayBuildInboundDisruptionsForPanel(laneKey, cptMs);
+    inboundRows = Array.isArray(relayIn?.rows) ? relayIn.rows : [];
+    inboundErr = relayIn?.error || null;
+  } catch (e) {
     inboundRows = [];
+    inboundErr = e || new Error("Relay inbound disruptions unavailable");
   }
 
-  let outboundErr = null;
   try {
     const relayOut = await _sspRelayBuildOutboundDisruptionsForPanel(laneKey, cptMs);
     outboundRows = relayOut?.rows || [];
@@ -14847,31 +15060,66 @@ async function openDisruptionsPanel(laneKey, cptMs) {
     outboundErr = e || new Error("Relay outbound disruptions unavailable");
   }
 
+  inboundRows = inboundRows.map((r) => ({ ...r, direction: "inbound" }));
+  outboundRows = outboundRows.map((r) => ({ ...r, direction: "outbound" }));
+
   let outboundSort = String(STATE.__disruptOutboundSort || "lane_worst");
 
   const renderAll = () => {
-    if (!allBox) return;
+    if (!allBox) return;    // Build inbound grouped-by-lane column
+    let inboundHtml = "";
+    if (inboundRows && inboundRows.length) {
+      const byInboundSort = (a, b) =>
+        (_sspRelaySeverityScore(b.severity) - _sspRelaySeverityScore(a.severity)) ||
+        (Number(b.minutes || 0) - Number(a.minutes || 0)) ||
+        (Number(a.scheduledMs || 0) - Number(b.scheduledMs || 0)) ||
+        String(a.vrid || "").localeCompare(String(b.vrid || ""));
 
-    // Build inbound column (show all inbound disruptions)
-    const inboundHtml = (inboundRows && inboundRows.length)
-      ? (`<div style="font-weight:900;margin-bottom:6px;">Inbound (${inboundRows.length})</div>` + inboundRows.map((r, i) => {
+      const lmIn = new Map();
+      for (const r of inboundRows) {
+        const lane = String(r.laneKey || r.lane || "-");
+        if (!lmIn.has(lane)) lmIn.set(lane, []);
+        lmIn.get(lane).push(r);
+      }
+      const inLanes = Array.from(lmIn.entries()).map(([lane, rows]) => ({ lane, rows }));
+      for (const entry of inLanes) entry.maxMin = Math.max(...entry.rows.map((x) => Number(x.minutes || 0) || 0));
+      inLanes.sort((a, b) => Number(b.maxMin || 0) - Number(a.maxMin || 0));
+
+      inboundHtml = inLanes.map((ln) => {
+        const rows = ln.rows.slice().sort(byInboundSort);
+        const laneHeader = `<div style="font-weight:900;margin-bottom:6px;">${esc(ln.lane)} - ${rows.length} VRID(s) - worst: ${rows.length ? String(rows[0].minutes || 0) + "m" : "-"}</div>`;
+        const vrs = rows.map((r) => {
           const vr = esc(r.vrid || "");
-          const sched = r.scheduledMs ? fmtTime(r.scheduledMs) : "—";
-          const eta = r.arrivalMs ? fmtTime(r.arrivalMs) : (r.etaMs ? fmtTime(r.etaMs) : "—");
-          const pk = (r.packages == null || Number.isNaN(Number(r.packages))) ? "—" : String(Number(r.packages));
-          const cn = (r.containers == null || Number.isNaN(Number(r.containers))) ? "—" : String(Number(r.containers));
-          const late = lateTxt(r);
+          const mins = Number(r.minutes || 0);
+          const cn = (r.containers == null || Number.isNaN(Number(r.containers))) ? "-" : String(Number(r.containers));
+          const pk = (r.packages == null || Number.isNaN(Number(r.packages))) ? "-" : String(Number(r.packages));
+          const sched = r.scheduledMs ? fmtTime(r.scheduledMs) : "-";
+          const etaArr = r.arrivalMs ? fmtTime(r.arrivalMs) : (r.etaMs ? fmtTime(r.etaMs) : "-");
+          const sev = String(r.severity || "UNKNOWN");
+          const kind = String(r.kind || "Disruption");
+          const status = String(r.status || r.loadStatus || "");
+          const disruptCount = Number(r.disruptionCount || 0);
           const href = (typeof buildRelayUrl === "function") ? buildRelayUrl(r.vrid || "") : "";
-          const vrLink = href ? `<a href="${esc(href)}" target="_blank" rel="noopener" style="color:#2563eb;text-decoration:none;font-weight:900;">${vr}</a>` : `<span style="color:#2563eb;font-weight:900;">${vr}</span>`;
-          return `
-            <div class="ssp-disrupt-row-ib" data-vrid="${esc(r.vrid||"")}" style="padding:8px;margin-bottom:8px;border-radius:10px;background:#fff;border:1px solid #eef2ff;">
-              <div style="font-size:13px;">${vrLink}</div>
-              <div style="color:#6b7280;font-size:11px;margin-top:4px;">Sched: ${sched} … ETA/Arr: ${eta} … C ${cn} … P ${pk}</div>
-              <div style="font-weight:900;color:#111827;margin-top:6px;">${esc(late)}</div>
-            </div>
-          `;
-        }).join("") )
-      : `<div style="color:#6b7280;padding:10px;border-radius:8px;">No inbound disruptions</div>`;
+          const link = href ? `<a href="${esc(href)}" target="_blank" rel="noopener" style="color:#2563eb;text-decoration:none;font-weight:900;">${vr}</a>` : `<span style="color:#2563eb;font-weight:900;">${vr}</span>`;
+          return `<div class="ssp-disrupt-row-ib" data-direction="inbound" data-lane="${esc(ln.lane)}" data-cpt="${String(Number(r.cptMs || 0))}" data-vrid="${esc(r.vrid || "")}" style="padding:8px;margin-bottom:6px;border-radius:8px;background:#fff;border:1px solid #f3f4f6;display:flex;justify-content:space-between;align-items:center;gap:8px;">
+                    <div style="min-width:0;">
+                      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                        ${link}
+                        <span style="padding:1px 8px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-size:10px;font-weight:900;color:#374151;">INBOUND</span>
+                      </div>
+                      <div style="font-size:11px;color:#6b7280;margin-top:4px;">${esc(kind)} ... ${esc(sev)}${status ? ` ... ${esc(status)}` : ""}</div>
+                      <div style="font-size:11px;color:#6b7280;margin-top:3px;">Sched: ${sched} ... ETA/Arr: ${etaArr} ... C ${cn} ... P ${pk} ... Hits ${disruptCount}</div>
+                    </div>
+                    <div style="font-weight:900;color:#dc2626;white-space:nowrap;">${String(mins)}m</div>
+                  </div>`;
+        }).join("");
+        return `<div style="margin-bottom:12px;padding:10px;border-radius:10px;background:#f9fafb;border:1px solid #eef2ff;">${laneHeader}${vrs}</div>`;
+      }).join("");
+    } else if ((typeof _sspGetTrackAuthHeader === "function" && !_sspGetTrackAuthHeader()) || inboundErr) {
+      inboundHtml = _sspRelayPanelUnavailableHtml(inboundErr || new Error("NO_TRACK_AUTH"), "Inbound disruptions");
+    } else {
+      inboundHtml = `<div style="color:#6b7280;padding:10px;border-radius:8px;">No inbound disruptions</div>`;
+    }
 
     // Build outbound grouped-by-lane column
     let outboundHtml = "";
@@ -14922,8 +15170,10 @@ async function openDisruptionsPanel(laneKey, cptMs) {
           const href = (typeof buildRelayUrl === "function") ? buildRelayUrl(r.vrid || "") : "";
           const link = href ? `<a href="${esc(href)}" target="_blank" rel="noopener" style="color:#2563eb;text-decoration:none;font-weight:900;">${vr}</a>` : `<span style="color:#2563eb;font-weight:900;">${vr}</span>`;
           const caseBtn = r.caseUrl ? `<a href="${esc(r.caseUrl)}" target="_blank" rel="noopener" style="margin-left:8px;padding:4px 8px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;text-decoration:none;color:#111827;">Cases</a>` : "";
-          return `<div class="ssp-disrupt-row-ob" data-lane="${esc(ln.lane)}" data-cpt="${String(Number(r.cptMs || 0))}" data-vrid="${esc(r.vrid||"")}" style="padding:8px;margin-bottom:6px;border-radius:8px;background:#fff;border:1px solid #f3f4f6;display:flex;justify-content:space-between;align-items:center;gap:8px;">
-                    <div style="min-width:0;">${link}${caseBtn}<div style="font-size:11px;color:#6b7280;margin-top:4px;">${esc(kind)} … ${esc(sev)}${loadStatus ? ` … ${esc(loadStatus)}` : ""}</div><div style="font-size:11px;color:#6b7280;margin-top:3px;">Sched: ${sched} … ETA/Arr: ${etaArr} … C ${cn} … P ${pk} … Hits ${disruptCount}</div></div>
+          return `<div class="ssp-disrupt-row-ob" data-direction="outbound" data-lane="${esc(ln.lane)}" data-cpt="${String(Number(r.cptMs || 0))}" data-vrid="${esc(r.vrid||"")}" style="padding:8px;margin-bottom:6px;border-radius:8px;background:#fff;border:1px solid #f3f4f6;display:flex;justify-content:space-between;align-items:center;gap:8px;">
+                    <div style="min-width:0;">
+                      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">${link}${caseBtn}<span style="padding:1px 8px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-size:10px;font-weight:900;color:#374151;">OUTBOUND</span></div>
+                      <div style="font-size:11px;color:#6b7280;margin-top:4px;">${esc(kind)} … ${esc(sev)}${loadStatus ? ` … ${esc(loadStatus)}` : ""}</div><div style="font-size:11px;color:#6b7280;margin-top:3px;">Sched: ${sched} … ETA/Arr: ${etaArr} … C ${cn} … P ${pk} … Hits ${disruptCount}</div></div>
                     <div style="font-weight:900;color:#dc2626;white-space:nowrap;">${String(mins)}m</div>
                   </div>`;
         }).join("");
@@ -14938,11 +15188,12 @@ async function openDisruptionsPanel(laneKey, cptMs) {
     allBox.innerHTML = `
       <div style="display:flex;gap:16px;align-items:flex-start;max-height:62vh;overflow:auto;padding-right:8px;">
         <div style="flex:0 0 46%;min-width:260px;">
+          <div style="font-weight:900;margin-bottom:6px;">Inbound — grouped by lane (${inboundRows.length})</div>
           ${inboundHtml}
         </div>
         <div style="flex:1;min-width:320px;">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;">
-            <div style="font-weight:900;">Outbound — grouped by lane</div>
+            <div style="font-weight:900;">Outbound — grouped by lane (${outboundRows.length})</div>
             <div style="margin-left:auto;display:flex;align-items:center;gap:6px;">
               <label for="ssp-disrupt-ob-sort" style="color:#6b7280;font-size:11px;font-weight:800;">Sort</label>
               <select id="ssp-disrupt-ob-sort" style="padding:4px 8px;border-radius:8px;border:1px solid #d1d5db;background:#fff;font-weight:800;font-size:11px;cursor:pointer;">
@@ -15035,20 +15286,6 @@ function ensureDisruptionsPanel() {
 
 function ensureObDetailsProbeWidget_v198_removed(){}
 
-function barRow(labelLeft, valueRight, pct, accent) {
-  const p = Math.max(0, Math.min(100, Number(pct || 0)));
-  const a = accent || "#2563eb";
-  return `
-    <div style="display:flex;align-items:center;gap:10px;margin:6px 0;">
-      <div style="min-width:120px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(labelLeft)}</div>
-      <div style="flex:1;height:10px;background:#f3f4f6;border-radius:999px;overflow:hidden;">
-        <div style="height:10px;width:${p}%;background:${a};"></div>
-      </div>
-      <div style="min-width:70px;text-align:right;font-variant-numeric:tabular-nums;">${esc(valueRight)}</div>
-    </div>
-  `;
-}
-
 function openMergePanel(laneKey, cptMs, options = {}) {
   STATE.mergePanelOpen = true;
   ensureMergePanel();
@@ -15057,7 +15294,6 @@ function openMergePanel(laneKey, cptMs, options = {}) {
   if (overlay) overlay.style.display = "flex";
   const sub = document.getElementById("ssp-merge-subtitle");
   const current = document.getElementById("ssp-merge-current");
-  const under = document.getElementById("ssp-merge-under");
   const mergeable = document.getElementById("ssp-merge-mergeable");
   const inb = document.getElementById("ssp-merge-inb");
   const outRecv = document.getElementById("ssp-merge-outbound-recv");
@@ -15445,28 +15681,6 @@ if (!inboundSummary || inboundSummary.vrids.size === 0) {
 
   // kick once on open; later inbound resolution will refresh it when anchor is available
   void renderCurrentUnits();
-  // --- Underutilized outbound VRIDs (simple view)
-  const vrids = (g && g.vrids) ? g.vrids.slice() : [];
-  vrids.sort((a, b) => {
-    const pa = (a.capacity ? (a.loadedUnits || 0) / a.capacity : 0);
-    const pb = (b.capacity ? (b.loadedUnits || 0) / b.capacity : 0);
-    return pa - pb;
-  });
-
-  if (!vrids.length) {
-    under.innerHTML = `<div style="color:#6b7280;">No outbound VRIDs found for this route/CPT.</div>`;
-  } else {
-    under.innerHTML = vrids
-      .map((v) => {
-        const cap = Number(v.capacity || 0);
-        const loaded = Number(v.loadedUnits || 0);
-        const pct = cap > 0 ? Math.round((loaded / cap) * 100) : 0;
-        const accent = pct < 50 ? "#dc2626" : pct < 80 ? "#f59e0b" : "#16a34a";
-        return barRow(v.vrid, `${loaded}/${cap}`, pct, accent);
-      })
-      .join("");
-  }
-
   mergeable.innerHTML = lgIds.length
     ? `<div style="display:flex;justify-content:space-between;gap:10px;align-items:center;">
          <div>
@@ -15999,7 +16213,7 @@ function _hhmmToMinutes(hhmm) {
       });
       if (est && Number(est.estC) > 0) return Number(est.estC);
     }
-    if (Number.isFinite(Number(resolved)) && Number(resolved) >= 0) return Number(resolved);
+    if (resolved != null && resolved !== "" && Number.isFinite(Number(resolved)) && Number(resolved) >= 0) return Number(resolved);
     return 1;
   }
 
@@ -17669,3 +17883,4 @@ async function openRelayCasesPanel(laneKey, cptMs) {
 
   } catch (_) {}
 })();
+
