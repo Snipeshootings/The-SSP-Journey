@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         SSP Util
 // @namespace    https://deicide.internal/ssp-util-2
-// @version 1.6.72
+// @version 1.6.73
 // ===============================
 // VERSION HISTORY
 // ===============================
@@ -4204,6 +4204,7 @@ const DEBUG = {
   laneGroupsFull: true, // logs every group + every vrid in it
   loadLoop: false,      // very noisy: logs each outbound load while building CPT map
   clickActions: true,
+  planning: false,
 };
 
 /**
@@ -9112,48 +9113,68 @@ if (chip) {
     }
   }
 
+function _isPlanningLoadCompleted(l) {
+    return String(l?.status || l?.loadStatus || "").toUpperCase().trim() === "COMPLETED";
+  }
+
+function _firstNonNegativeNumber(values) {
+    for (const v of (values || [])) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n >= 0) return n;
+    }
+    return null;
+  }
+
+function _countSourceClass(source) {
+    const s = String(source || "").trim().toLowerCase();
+    if (!s || s === "unknown") return "unknown";
+    if (s === "manifest") return "manifest";
+    if (s === "fallback" || s === "load") return "fallback";
+    if (s.startsWith("estimate_") || s.startsWith("csv_") || s.startsWith("avg_")) return "estimate";
+    return "unknown";
+  }
+
 function _getLoadCountsForPlanningMath(l, opts = {}) {
+    const allowEstimate = opts && opts.allowEstimate !== false;
+    const allowFallbackOne = opts && opts.fallbackToOne !== false;
+    const isCompleted = _isPlanningLoadCompleted(l);
+
     const planId = String(l?.planId || "").trim();
     const m = planId ? (STATE?.ibContainerCount?.[planId]) : null;
     const it = m?.inTrailerCount || {};
     const total = m?.totalCount || m?.total || {};
 
-    let C = (typeof it?.C === "number") ? it.C : null;
-    const pTotal = (typeof total?.P === "number") ? total.P : null;
-    const pInTrailer = (typeof it?.P === "number") ? it.P : null;
-    let P = (pTotal != null) ? pTotal : pInTrailer;
+    let C = _firstNonNegativeNumber([it?.C]);
+    let P = _firstNonNegativeNumber([total?.P, it?.P]);
     let source = (C != null || P != null) ? "manifest" : "";
 
-    // Fallbacks from load-level fields if count service has not populated yet.
     if (C == null) {
-      const cCandidates = [l?.inTrailerCount?.C, l?.inTrailerCountC, l?.containerCountInTrailer];
-      for (const v of cCandidates) {
-        const n = Number(v);
-        if (Number.isFinite(n) && n >= 0) {
-          C = n;
-          source = source || "load";
-          break;
-        }
-      }
+      C = _firstNonNegativeNumber([
+        l?.inTrailerCount?.C,
+        l?.inTrailerCountC,
+        l?.containerCountInTrailer,
+        l?.containerCount,
+        l?.totalContainers,
+        l?.containers,
+        l?.container_count,
+      ]);
+      if (C != null) source = source || "fallback";
     }
     if (P == null) {
-      const pCandidates = [l?.totalPackages, l?.packageCount, l?.packages];
-      for (const v of pCandidates) {
-        const n = Number(v);
-        if (Number.isFinite(n) && n >= 0) {
-          P = n;
-          source = source || "load";
-          break;
-        }
-      }
+      P = _firstNonNegativeNumber([
+        l?.totalPackages,
+        l?.packageCount,
+        l?.packages,
+        l?.totalPackageCount,
+        l?.inTrailerCount?.P,
+        l?.inTrailerCountP,
+      ]);
+      if (P != null) source = source || "fallback";
     }
 
-    // For unmanifested/zero rows, use imported 2wk CSV lane stats first.
-    const allowEstimate = opts && opts.allowEstimate !== false;
-    const isCompleted = String(l?.status || l?.loadStatus || "").toUpperCase().trim() === "COMPLETED";
     if (allowEstimate && !isCompleted) {
-      const cKnown = (C != null && C !== "" && Number.isFinite(Number(C))) ? Number(C) : 0;
-      const pKnown = (P != null && P !== "" && Number.isFinite(Number(P))) ? Number(P) : 0;
+      const cKnown = Number.isFinite(Number(C)) ? Number(C) : 0;
+      const pKnown = Number.isFinite(Number(P)) ? Number(P) : 0;
       const est = estimateInboundIfUnmanifested({
         sortRoute: String(l?.route || l?.lane || "").trim(),
         totalContainers: cKnown,
@@ -9162,25 +9183,39 @@ function _getLoadCountsForPlanningMath(l, opts = {}) {
         loadType: String(l?.shippingPurposeType || l?.loadType || l?.shippingPurpose || "").trim(),
       });
       if (est && Number(est.estC) > 0) {
-        if (!(Number(C) > 0)) C = Number(est.estC);
-        if (!(Number(P) > 0) && Number.isFinite(Number(est.estP))) P = Number(est.estP);
-        source = String(est.source || "estimated");
+        if (!(Number(C) > 0)) C = Math.ceil(Math.max(0, Number(est.estC)));
+        if (!(Number(P) > 0) && Number.isFinite(Number(est.estP)) && Number(est.estP) > 0) {
+          P = Math.ceil(Math.max(0, Number(est.estP)));
+        }
+        const estTag = String(est.source || "avg_0").replace(/[^\w-]/g, "_");
+        source = `estimate_${estTag}`;
       }
     }
+
+    // Absolute last-resort fallback for open loads when counts are still unknown/zero.
+    if (!isCompleted && allowFallbackOne && !(Number(C) > 0)) {
+      C = 1;
+      source = "unknown";
+    }
+
+    if (!source) source = "unknown";
+    const sourceClass = _countSourceClass(source);
+    const missing = (sourceClass === "unknown");
+    const estimated = (sourceClass === "estimate");
 
     if (P != null && planId) {
       STATE.__planPkgs = STATE.__planPkgs || {};
       STATE.__planPkgs[planId] = P;
     }
-    return { planId, C, P, source };
+    return { planId, C, P, source, countSource: source, sourceClass, estimated, missing };
   }
 
 function _getLoadContainersLeftForPlanning(l) {
-    const { C, source } = _getLoadCountsForPlanningMath(l, { allowEstimate: true });
+    const { C, source } = _getLoadCountsForPlanningMath(l, { allowEstimate: true, fallbackToOne: true });
     if (C == null || C === "") return "";
     const n = Number(C);
     if (!Number.isFinite(n)) return "";
-    if (String(source || "").startsWith("csv_") || String(source || "").startsWith("avg_") || String(source || "") === "estimated") {
+    if (String(source || "").startsWith("estimate_")) {
       return String(Math.ceil(Math.max(0, n)));
     }
     const rounded = Math.round(n * 10) / 10;
@@ -11084,13 +11119,13 @@ document.body.appendChild(p);
         const statusBucket = (st) => isInFacility(st) ? "ON_DOOR" : (isTransit(st) ? "ON_SCHEDULE" : "OTHER");
 
         const getCounts = (l) => {
-          const planId = String(l?.planId || "").trim();
-          const m = planId ? (STATE?.ibContainerCount?.[planId]) : null;
-          const it = m?.inTrailerCount || {};
-          const C = (typeof it?.C === "number") ? it.C : 0;
-          const P = (typeof it?.P === "number") ? it.P : 0;
-          const missing = (!m || (!it || (typeof it?.C !== "number" && typeof it?.P !== "number")));
-          return { C, P, missing };
+          const resolved = _getLoadCountsForPlanningMath(l, { allowEstimate: true, fallbackToOne: true });
+          const C = Number.isFinite(Number(resolved?.C)) ? Number(resolved.C) : 0;
+          const P = Number.isFinite(Number(resolved?.P)) ? Number(resolved.P) : 0;
+          const countSource = String(resolved?.countSource || resolved?.source || "unknown");
+          const sourceClass = _countSourceClass(countSource);
+          const missing = !!resolved?.missing;
+          return { C, P, missing, countSource, sourceClass };
         };
 
         // Build responsibility buckets (gap-safe: bucket starts at previous bucket end)
@@ -11098,11 +11133,13 @@ document.body.appendChild(p);
         const shiftWindows = (shifts || [])
           .map(s => {
             const w = _shiftToWindowMs(s, baseDay0Ms);
+            if (!w) return null;
             return {
               name: String(s.name || s.label || s.key || "Shift"),
               endClipped: Math.min(w.endMs, ops.endMs),
             };
           })
+          .filter(Boolean)
           .filter(x => x.endClipped > ops.startMs)
           .sort((a,b) => a.endClipped - b.endClipped);
 
@@ -11140,14 +11177,33 @@ document.body.appendChild(p);
 
           const hb = hourBucket(t);
           const sb = statusBucket(l?.status || l?.loadStatus);
-          const { C, P, missing } = getCounts(l);
+          const { C, P, missing, countSource, sourceClass } = getCounts(l);
 
           const k = `${shiftName}||${hb}||${sb}`;
-          const r = agg.get(k) || { shift: shiftName, hourBucket: hb, statusBucket: sb, loads: 0, carts: 0, packages: 0, missingCounts: 0, disruptedVrids: [] };
+          const r = agg.get(k) || {
+            shift: shiftName,
+            hourBucket: hb,
+            statusBucket: sb,
+            loads: 0,
+            carts: 0,
+            packages: 0,
+            missingCounts: 0,
+            manifestLoads: 0,
+            fallbackLoads: 0,
+            estimatedLoads: 0,
+            unknownLoads: 0,
+            countSources: {},
+            disruptedVrids: []
+          };
           r.loads += 1;
           r.carts += (C || 0);
           r.packages += (P || 0);
           if (missing) r.missingCounts += 1;
+          if (sourceClass === "manifest") r.manifestLoads += 1;
+          else if (sourceClass === "fallback") r.fallbackLoads += 1;
+          else if (sourceClass === "estimate") r.estimatedLoads += 1;
+          else r.unknownLoads += 1;
+          r.countSources[countSource] = Number(r.countSources[countSource] || 0) + 1;
 
           // Check for disruptions for this load
           const lane = String(l?.route || l?.lane || "");
@@ -11169,11 +11225,32 @@ document.body.appendChild(p);
         const byHour = new Map(); // shift||hour -> total row
         for (const r of rows) {
           const hk = `${r.shift}||${r.hourBucket}`;
-          const t = byHour.get(hk) || { shift: r.shift, hourBucket: r.hourBucket, statusBucket: 'SUM_HOUR', loads: 0, carts: 0, packages: 0, missingCounts: 0, disruptedVrids: [] };
+          const t = byHour.get(hk) || {
+            shift: r.shift,
+            hourBucket: r.hourBucket,
+            statusBucket: 'SUM_HOUR',
+            loads: 0,
+            carts: 0,
+            packages: 0,
+            missingCounts: 0,
+            manifestLoads: 0,
+            fallbackLoads: 0,
+            estimatedLoads: 0,
+            unknownLoads: 0,
+            countSources: {},
+            disruptedVrids: []
+          };
           t.loads += Number(r.loads || 0);
           t.carts += Number(r.carts || 0);
           t.packages += Number(r.packages || 0);
           t.missingCounts += Number(r.missingCounts || 0);
+          t.manifestLoads += Number(r.manifestLoads || 0);
+          t.fallbackLoads += Number(r.fallbackLoads || 0);
+          t.estimatedLoads += Number(r.estimatedLoads || 0);
+          t.unknownLoads += Number(r.unknownLoads || 0);
+          for (const [src, n] of Object.entries(r.countSources || {})) {
+            t.countSources[src] = Number(t.countSources[src] || 0) + Number(n || 0);
+          }
           // Aggregate disrupted VRIDs across status buckets for this hour
           for (const vrid of (r.disruptedVrids || [])) {
             if (!t.disruptedVrids.includes(vrid)) {
@@ -11192,6 +11269,15 @@ document.body.appendChild(p);
         const exportRows = rows.concat(
           Array.from(byHour.values()).sort((a,b) => String(a.shift).localeCompare(String(b.shift)) || String(a.hourBucket).localeCompare(String(b.hourBucket)))
         ).map(r => ({
+          ...(() => {
+            const sourceEntries = Object.entries(r.countSources || {})
+              .filter(([, n]) => Number(n) > 0)
+              .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+            const countSource = sourceEntries.length === 1 ? sourceEntries[0][0] : (sourceEntries.length > 1 ? "mixed" : "unknown");
+            const countSourceBreakdown = sourceEntries.map(([k, v]) => `${k}:${v}`).join("|");
+            const estimated = Number(r.estimatedLoads || 0) > 0 ? "Y" : "N";
+            return { countSource, estimated, countSourceBreakdown };
+          })(),
           shift: r.shift,
           hourBucket: r.hourBucket,
           statusBucket: r.statusBucket,
@@ -11199,10 +11285,44 @@ document.body.appendChild(p);
           carts: r.carts,
           packages: r.packages,
           missingCounts: r.missingCounts,
-          disruptions: formatDisruptions(r.disruptedVrids)
+          disruptions: formatDisruptions(r.disruptedVrids),
+          manifestLoads: r.manifestLoads,
+          fallbackLoads: r.fallbackLoads,
+          estimatedLoads: r.estimatedLoads,
+          unknownLoads: r.unknownLoads,
         }));
 
-        const headers = ["shift","hourBucket","statusBucket","loads","carts","packages","missingCounts","disruptions"];
+        const headers = [
+          "shift",
+          "hourBucket",
+          "statusBucket",
+          "loads",
+          "carts",
+          "packages",
+          "missingCounts",
+          "disruptions",
+          "manifestLoads",
+          "fallbackLoads",
+          "estimatedLoads",
+          "unknownLoads",
+          "countSource",
+          "estimated",
+          "countSourceBreakdown"
+        ];
+
+        if (DEBUG.enabled && DEBUG.planning) {
+          try {
+            const summary = rows.reduce((acc, r) => {
+              acc.loads += Number(r.loads || 0);
+              acc.manifest += Number(r.manifestLoads || 0);
+              acc.fallback += Number(r.fallbackLoads || 0);
+              acc.estimate += Number(r.estimatedLoads || 0);
+              acc.unknown += Number(r.unknownLoads || 0);
+              return acc;
+            }, { loads: 0, manifest: 0, fallback: 0, estimate: 0, unknown: 0 });
+            console.log("[SSP Util][Planning/XD CSV]", summary);
+          } catch {}
+        }
 
         downloadTextFile(
           `XD_GRAPH_${STATE.nodeId || "NODE"}_${new Date().toISOString().slice(0,10)}.csv`,
@@ -11574,38 +11694,54 @@ function renderPlanningPanel() {
       const mor2W = mor2 ? _shiftToWindowMs(mor2, baseDay0Ms) : null;
       const cutoffMs = mor2W ? (mor2W.endMs - 30 * 60 * 1000) : null;
 
-      // Helper: carts (C) + pkgs (P) remaining for a load (in trailer), with CSV estimate fallback.
-      const getCounts = (l) => _getLoadCountsForPlanningMath(l, { allowEstimate: true });
+      // Helper: carts (C) + pkgs (P) remaining for a load (in trailer), with estimate fallback.
+      const getCounts = (l) => _getLoadCountsForPlanningMath(l, { allowEstimate: true, fallbackToOne: true });
+      const isCompleted = (l) => _isPlanningLoadCompleted(l);
 
-      const isCompleted = (l) => String(l?.status || l?.loadStatus || "").toUpperCase() === "COMPLETED";
+      // Pre-resolve counts for ops-window loads once so all planning math uses the same source decision.
+      const opsLoadsResolved = [];
+      const sourceStats = { manifest: 0, fallback: 0, estimate: 0, unknown: 0, bySource: {} };
+      for (const l of (Array.isArray(STATE?.inboundLoads) ? STATE.inboundLoads : [])) {
+        const t = _getLoadTimeForPlanning(l);
+        if (!t) continue;
+        if (t < ops.startMs || t >= ops.endMs) continue;
+        const counts = getCounts(l);
+        const src = String(counts?.countSource || counts?.source || "unknown");
+        const srcClass = _countSourceClass(src);
+        if (srcClass === "manifest") sourceStats.manifest += 1;
+        else if (srcClass === "fallback") sourceStats.fallback += 1;
+        else if (srcClass === "estimate") sourceStats.estimate += 1;
+        else sourceStats.unknown += 1;
+        sourceStats.bySource[src] = Number(sourceStats.bySource[src] || 0) + 1;
+        opsLoadsResolved.push({
+          l,
+          t,
+          completed: isCompleted(l),
+          counts,
+        });
+      }
 
       // 1) Window totals (selected window only)
       let sumC_window = 0, sumP_window = 0, missing_window = 0;
       for (const l of rows) {
-        const { C, P } = getCounts(l);
-        if (C == null && P == null) { missing_window++; continue; }
+        const { C, P, missing } = getCounts(l);
+        if (missing) missing_window++;
         if (!isCompleted(l)) {
-          if (C != null) sumC_window += C;
-          if (P != null) sumP_window += P;
+          if (Number.isFinite(Number(C))) sumC_window += Number(C);
+          if (Number.isFinite(Number(P))) sumP_window += Number(P);
         }
       }
 
       // 2) Ops-to-cutoff totals (ops start -> cutoffMs), remaining only
       let sumC_cut = 0, sumP_cut = 0, missing_cut = 0, loads_cut = 0;
       if (cutoffMs != null) {
-        const opsLoads = Array.isArray(STATE?.inboundLoads) ? STATE.inboundLoads : [];
-        for (const l of opsLoads) {
-          const t = _getLoadTimeForPlanning(l);
-          if (!t) continue;
-          if (t < ops.startMs || t >= ops.endMs) continue;
-          if (t > cutoffMs) continue;
+        for (const rec of opsLoadsResolved) {
+          if (rec.t > cutoffMs) continue;
+          if (rec.completed) continue;
           loads_cut++;
-          const { C, P } = getCounts(l);
-          if (C == null && P == null) { missing_cut++; continue; }
-          if (!isCompleted(l)) {
-            if (C != null) sumC_cut += C;
-            if (P != null) sumP_cut += P;
-          }
+          if (rec.counts?.missing) missing_cut++;
+          if (Number.isFinite(Number(rec.counts?.C))) sumC_cut += Number(rec.counts.C);
+          if (Number.isFinite(Number(rec.counts?.P))) sumP_cut += Number(rec.counts.P);
         }
       }
 
@@ -11620,6 +11756,7 @@ function renderPlanningPanel() {
       const _shiftWindows = (shifts || [])
         .map(s => {
           const w = _shiftToWindowMs(s, baseDay0Ms);
+          if (!w) return null;
           return {
             s,
             startMs: w.startMs,
@@ -11627,6 +11764,7 @@ function renderPlanningPanel() {
             endClipped: Math.min(w.endMs, ops.endMs),
           };
         })
+        .filter(Boolean)
         .filter(x => x.endClipped > ops.startMs)
         .sort((a, b) => (a.endClipped - b.endClipped));
 
@@ -11641,48 +11779,31 @@ function renderPlanningPanel() {
         if (b <= a) { _prevEnd = Math.max(_prevEnd, item.endClipped); continue; }
 
         let sumC = 0, sumP = 0, missing = 0, loads = 0;
-        const opsLoads = Array.isArray(STATE?.inboundLoads) ? STATE.inboundLoads : [];
-        for (const l of opsLoads) {
-          const t = _getLoadTimeForPlanning(l);
-          if (!t) continue;
-          if (t < a || t >= b) continue;
+        for (const rec of opsLoadsResolved) {
+          if (rec.t < a || rec.t >= b) continue;
           loads++;
-          const { C, P } = getCounts(l);
-          if (C == null && P == null) { missing++; continue; }
-          if (!isCompleted(l)) {
-            if (C != null) sumC += C;
-            if (P != null) sumP += P;
-          }
+          if (rec.completed) continue;
+          if (rec.counts?.missing) missing++;
+          if (Number.isFinite(Number(rec.counts?.C))) sumC += Number(rec.counts.C);
+          if (Number.isFinite(Number(rec.counts?.P))) sumP += Number(rec.counts.P);
         }
 
         const durHrs = Math.max(0.0001, (b - a) / 3600000);
-        const hc = Math.max(0, Math.ceil(sumC / (durHrs * targetCph)));
+        const hcInterval = Math.max(0, Math.ceil(sumC / (durHrs * targetCph)));
 
-        // Active shift headcount (moment-in-time) if now is inside this responsibility bucket.
-        // IMPORTANT: include backlog + all remaining loads due by bucket end (b) within ops window.
-        let hcNow = null;
-        let hcNowDueC = null, hcNowDueP = null, hcNowBacklogC = null, hcNowHrs = null;
-        if (nowMs >= a && nowMs < b) {
-          const remainingHrs = Math.max(0.0001, (b - nowMs) / 3600000);
-          // Due-by-bucket-end totals: all remaining loads with loadTime < bucket end.
-          let dueC = 0, dueP = 0;
-          const opsLoads2 = Array.isArray(STATE?.inboundLoads) ? STATE.inboundLoads : [];
-          for (const l2 of opsLoads2) {
-            const t2 = _getLoadTimeForPlanning(l2);
-            if (!t2) continue;
-            if (t2 < ops.startMs || t2 >= ops.endMs) continue;
-            if (t2 >= b) continue; // not due yet by this bucket end
-            if (isCompleted(l2)) continue;
-            const { C: c2, P: p2 } = getCounts(l2);
-            if (c2 != null) dueC += c2;
-            if (p2 != null) dueP += p2;
-          }
-          hcNowDueC = dueC;
-          hcNowDueP = dueP;
-          hcNowBacklogC = Math.max(0, dueC - sumC);
-          hcNowHrs = remainingHrs;
-          hcNow = Math.max(0, Math.ceil(dueC / (remainingHrs * targetCph)));
+        // Due-by-end staffing: include backlog + all remaining loads due before bucket end.
+        let dueC = 0, dueP = 0, dueMissing = 0, dueLoads = 0;
+        for (const rec of opsLoadsResolved) {
+          if (rec.t >= b) continue;
+          if (rec.completed) continue;
+          dueLoads++;
+          if (rec.counts?.missing) dueMissing++;
+          if (Number.isFinite(Number(rec.counts?.C))) dueC += Number(rec.counts.C);
+          if (Number.isFinite(Number(rec.counts?.P))) dueP += Number(rec.counts.P);
         }
+        const hoursRemaining = Math.max(0.0001, (b - nowMs) / 3600000);
+        const hcDueByEnd = Math.max(0, Math.ceil(dueC / (targetCph * hoursRemaining)));
+        const isActiveBucket = (nowMs >= a && nowMs < b);
 
         const key = String(s.key || "").trim() || String(s.name || s.label || "").trim();
         const label = String(s.name || s.label || key || "Shift").trim();
@@ -11693,12 +11814,40 @@ function renderPlanningPanel() {
           loads, missing,
           C: sumC, P: sumP,
           durHrs,
-          hc, hcNow,
-          hcNowDueC, hcNowDueP, hcNowBacklogC, hcNowHrs
+          hc: hcInterval, // interval-only metric
+          hcInterval,
+          hcDueByEnd,
+          hcNow: isActiveBucket ? hcDueByEnd : null,
+          hcNowDueC: dueC,
+          hcNowDueP: dueP,
+          hcNowDueLoads: dueLoads,
+          hcNowDueMissing: dueMissing,
+          hcNowBacklogC: Math.max(0, dueC - sumC),
+          hcNowHrs: hoursRemaining,
+          isActiveBucket,
         });
 
         // Advance responsibility boundary to this shift end.
         _prevEnd = Math.max(_prevEnd, item.endClipped);
+      }
+
+      const activeBucket = perShift.find(ps => ps && ps.isActiveBucket) || null;
+      if (DEBUG.enabled && DEBUG.planning) {
+        try {
+          console.log("[SSP Util][Planning HC]", {
+            totalLoadsConsidered: opsLoadsResolved.length,
+            sourceUsage: sourceStats,
+            activeBucket: activeBucket ? {
+              label: activeBucket.label,
+              start: new Date(activeBucket.start).toISOString(),
+              end: new Date(activeBucket.end).toISOString(),
+              dueC: activeBucket.hcNowDueC,
+              dueP: activeBucket.hcNowDueP,
+              hoursRemaining: activeBucket.hcNowHrs,
+              hcNow: activeBucket.hcNow,
+            } : null,
+          });
+        } catch {}
       }
 // Render: top-right container math (algorithm first, then numbers)
       if (mathMeta) {
@@ -11734,24 +11883,20 @@ function renderPlanningPanel() {
         }
 
         // Distribute all due-before-cutoff loads into intervals; anything that doesn't fit becomes "unbucketed"
-        const opsLoads3 = Array.isArray(STATE?.inboundLoads) ? STATE.inboundLoads : [];
-        for (const l3 of opsLoads3) {
-          const t3 = _getLoadTimeForPlanning(l3);
-          if (!t3) continue;
-          if (t3 < ops.startMs || t3 >= ops.endMs) continue;
-          if (t3 > cutoffMs) continue;
-          if (isCompleted(l3)) continue;
-
-          const { C: c3, P: p3 } = getCounts(l3);
-          const isMissing = (c3 == null && p3 == null);
+        for (const rec of opsLoadsResolved) {
+          if (rec.t > cutoffMs) continue;
+          if (rec.completed) continue;
+          const c3 = rec.counts?.C;
+          const p3 = rec.counts?.P;
+          const isMissing = !!rec.counts?.missing;
 
           let placed = false;
           for (const iv of intervals) {
-            if (t3 >= iv.start && t3 < iv.end) {
+            if (rec.t >= iv.start && rec.t < iv.end) {
               iv.loads++;
-              if (isMissing) { iv.missing++; placed = true; break; }
-              if (c3 != null) iv.C += c3;
-              if (p3 != null) iv.P += p3;
+              if (isMissing) iv.missing++;
+              if (Number.isFinite(Number(c3))) iv.C += Number(c3);
+              if (Number.isFinite(Number(p3))) iv.P += Number(p3);
               placed = true;
               break;
             }
@@ -11759,9 +11904,9 @@ function renderPlanningPanel() {
 
           if (!placed) {
             loads_cut_unbucketed++;
-            if (isMissing) { missing_cut_unbucketed++; continue; }
-            if (c3 != null) sumC_cut_unbucketed += c3;
-            if (p3 != null) sumP_cut_unbucketed += p3;
+            if (isMissing) missing_cut_unbucketed++;
+            if (Number.isFinite(Number(c3))) sumC_cut_unbucketed += Number(c3);
+            if (Number.isFinite(Number(p3))) sumP_cut_unbucketed += Number(p3);
           }
         }
 
@@ -11779,8 +11924,9 @@ function renderPlanningPanel() {
 
       // Build DETAILS text (shown when user clicks "Details")
       const lines = [];
-      lines.push("Algorithm (moment-in-time headcount):");
-      lines.push("  HC_now = ceil( C_remaining_in_shift / (hours_remaining_in_shift * target_CPH) )");
+      lines.push("Algorithm (due-by-bucket-end headcount):");
+      lines.push("  HC_now(bucket) = ceil( C_due_before_bucket_end / (hours_until_bucket_end * target_CPH) )");
+      lines.push("  HC_interval(bucket) = ceil( C_in_bucket_interval / (bucket_duration_hours * target_CPH) )");
       lines.push("");
       lines.push("Selected Window Totals (Remaining only):");
       lines.push(`  C (containers): ${sumC_window.toLocaleString()}   |   P (pkgs): ${sumP_window.toLocaleString()}   |   missingCounts: ${missing_window}`);
@@ -11799,7 +11945,7 @@ function renderPlanningPanel() {
       if (cutoffMs != null) {
         const hrsLeft = (cutRemainingHrs != null) ? cutRemainingHrs : ((cutoffMs > nowMs) ? ((cutoffMs - nowMs) / 3600000) : 0);
         const hcTotal = (hc_cut_total != null) ? hc_cut_total : null;
-        lines.push("Ops-to-Cutoff Staffing (Primary):");
+        lines.push("Ops-to-Cutoff Staffing (Horizon):");
         lines.push(`  Horizon: now→cutoff  (hrsLeft: ${Math.max(0, hrsLeft).toFixed(2)} | target: ${targetCph} CPH)`);
         lines.push(`  C_total_due: ${sumC_cut.toLocaleString()}  |  P_total_due: ${sumP_cut.toLocaleString()}  |  HC_total_now_to_cutoff: ${hcTotal == null ? "n/a" : hcTotal}`);
         if (perShiftCut && perShiftCut.length) {
@@ -11848,7 +11994,7 @@ function renderPlanningPanel() {
           hcNowTxt = ` | HC_now: ${ps.hcNow} (due<=shiftEnd C=${dueC.toLocaleString()} P=${dueP.toLocaleString()}; priorBucketed C=${priorC.toLocaleString()} P=${priorP.toLocaleString()}; unbucketed C=${unbucketedC.toLocaleString()} P=${unbucketedP.toLocaleString()}; hrsLeft=${hrsLeft.toFixed(2)})`;
         }
         lines.push(`  ${ps.label}  ${span}`);
-        lines.push(`    Remaining: C=${ps.C.toLocaleString()} P=${ps.P.toLocaleString()} | loads=${ps.loads} missing=${ps.missing} | HC_shift: ${ps.hc}${hcNowTxt}`);
+        lines.push(`    Remaining: C=${ps.C.toLocaleString()} P=${ps.P.toLocaleString()} | loads=${ps.loads} missing=${ps.missing} | HC_interval: ${ps.hcInterval}${hcNowTxt}`);
       }
 
       if (mathPre) mathPre.textContent = lines.join("\n");
@@ -11931,18 +12077,25 @@ function renderPlanningPanel() {
         let html = "";
         const shiftSummary = (typeof _getShiftSummary === "function") ? _getShiftSummary() : null;
         const plannedHc = (shiftSummary && shiftSummary.ok && Number.isFinite(Number(shiftSummary.staffed))) ? Number(shiftSummary.staffed) : null;
-        const recHc = (hcTotal != null) ? Number(hcTotal) : ((shiftSummary && shiftSummary.ok && Number.isFinite(Number(shiftSummary.neededNow))) ? Number(shiftSummary.neededNow) : null);
+        const primaryHc = (active && Number.isFinite(Number(active.hcNow))) ? Number(active.hcNow) : (hcTotal != null ? Number(hcTotal) : null);
+        const recHc = (primaryHc != null) ? Number(primaryHc) : ((shiftSummary && shiftSummary.ok && Number.isFinite(Number(shiftSummary.neededNow))) ? Number(shiftSummary.neededNow) : null);
         const deltaVsPlan = (plannedHc != null && recHc != null) ? (recHc - plannedHc) : null;
+        const dueLabel = active ? "C due … bucket end" : "C due … cutoff";
+        const dueValue = active ? active.hcNowDueC : sumC_cut;
+        const hoursLabel = active ? "Hours left in bucket" : "Hours left";
+        const hoursValue = active ? Math.max(0, Number(active.hcNowHrs || 0)) : hrsLeft;
+        const cutoffOrBucketLabel = active ? "Bucket end" : "Cutoff";
+        const cutoffOrBucketValue = active ? fmtTime(active.end) : (cutoffMs != null ? fmtTime(cutoffMs) : "");
         html += card(
-          "Ops-to-Cutoff Headcount (Primary)",
-          big(hcTotal == null ? "—" : String(hcTotal), "HC needed now→cutoff"),
+          "Due-by-End Headcount (Primary)",
+          big(primaryHc == null ? "—" : String(primaryHc), active ? `HC due by ${active.label} end` : "HC needed now→cutoff"),
           [
-            kv("C due … cutoff", fmtInt(sumC_cut)),
-            kv("Hours left", hrsLeft == null ? "—" : hrsLeft.toFixed(2)),
+            kv(dueLabel, fmtInt(dueValue)),
+            kv(hoursLabel, hoursValue == null ? "—" : Number(hoursValue).toFixed(2)),
             kv("Target", `${targetCph} CPH`),
-            kv("HC planned", plannedHc == null ? "â€”" : String(plannedHc)),
-            kv("Delta vs plan", deltaVsPlan == null ? "â€”" : formatDelta(deltaVsPlan)),
-            cutoffMs != null ? kv("Cutoff", fmtTime(cutoffMs)) : ""
+            kv("HC planned", plannedHc == null ? "—" : String(plannedHc)),
+            kv("Delta vs plan", deltaVsPlan == null ? "—" : formatDelta(deltaVsPlan)),
+            cutoffOrBucketValue ? kv(cutoffOrBucketLabel, cutoffOrBucketValue) : ""
           ].filter(Boolean).join(""),
         );
         html += progressBar(prog);
@@ -11953,6 +12106,7 @@ function renderPlanningPanel() {
             big(String(active.hcNow != null ? active.hcNow : active.hc), `${active.label}`),
             [
               kv("Due … bucket end (C)", fmtInt(active.hcNowDueC)),
+              kv("HC interval", fmtInt(active.hcInterval)),
               kv("Bucket end", fmtTime(active.end)),
               kv("Hours left in bucket", (active.hcNowHrs != null ? active.hcNowHrs.toFixed(2) : "—"))
             ].join("")
