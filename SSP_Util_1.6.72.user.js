@@ -315,6 +315,23 @@ const toMs = (v) => (v ? new Date(v).getTime() : 0);
 const fmtTime = (ms) =>
   new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
+function formatLocalIsoTimestamp(input) {
+  const d = input instanceof Date ? input : new Date(input || Date.now());
+  if (!Number.isFinite(d.getTime())) return "";
+  const pad = (n) => String(Math.trunc(Math.abs(Number(n) || 0))).padStart(2, "0");
+  const y = d.getFullYear();
+  const m = pad(d.getMonth() + 1);
+  const day = pad(d.getDate());
+  const h = pad(d.getHours());
+  const min = pad(d.getMinutes());
+  const s = pad(d.getSeconds());
+  const tzMinutes = -d.getTimezoneOffset();
+  const sign = tzMinutes >= 0 ? "+" : "-";
+  const tzH = pad(Math.floor(Math.abs(tzMinutes) / 60));
+  const tzM = pad(Math.abs(tzMinutes) % 60);
+  return `${y}-${m}-${day}T${h}:${min}:${s}${sign}${tzH}:${tzM}`;
+}
+
 // Parse SSP date-time strings like "12-Jan-26 05:00" into epoch ms.
 // Returns 0 when parsing fails.
 /**
@@ -2152,7 +2169,7 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
       late_package_count: Number(ctx.late_package_count || 0) || 0,
       cpt: String(ctx.cpt || "").trim(),
       utilization_pct: Number(ctx.utilization_pct || 0) || 0,
-      timestamp_iso: String(ctx.timestamp_iso || new Date().toISOString()),
+      timestamp_iso: String(ctx.timestamp_iso || formatLocalIsoTimestamp()),
       message,
       text: String(ctx.text || message),
     };
@@ -2679,7 +2696,7 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
     ];
     if (hidden > 0) lines.push(`- +${hidden} more`);
     lines.push(`Node: ${String(STATE?.nodeId || "-")}`);
-    lines.push(`Detected: ${new Date().toISOString()}`);
+    lines.push(`Detected: ${formatLocalIsoTimestamp()}`);
     return lines.join("\n");
   }
 
