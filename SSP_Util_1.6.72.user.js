@@ -432,6 +432,42 @@ function getOutboundEquipmentTypeRaw(load) {
   );
 }
 
+
+
+function getOutboundLoadCrId(load) {
+  try {
+    return String(
+      load?.crId ??
+      load?.crid ??
+      load?.CRID ??
+      load?.caseReferenceId ??
+      load?.caseRefId ??
+      ''
+    ).trim();
+  } catch (_) {
+    return '';
+  }
+}
+
+function getBackupOriginalVridFromCrId(crId) {
+  const txt = String(crId || '').trim();
+  if (!txt) return '';
+  const up = txt.toUpperCase();
+  if (!up.includes('BACKUP') || !up.includes('VEHICLE_RUN##')) return '';
+  const tail = txt.split(/VEHICLE_RUN##/i)[1] || '';
+  const m = tail.match(/([A-Za-z0-9_]+)/);
+  return m ? String(m[1] || '').trim() : '';
+}
+
+function getExcludedOriginalVridsFromBackups(loads) {
+  const out = new Set();
+  const arr = Array.isArray(loads) ? loads : [];
+  for (const l of arr) {
+    const og = getBackupOriginalVridFromCrId(getOutboundLoadCrId(l));
+    if (og) out.add(og);
+  }
+  return out;
+}
 function getFilteredOutboundLoadsForMode(modeInput, options = {}) {
   const mode = normalizeObLoadType(modeInput || "all");
   const srcLoads = Array.isArray(options.loads)
@@ -5803,8 +5839,13 @@ function scheduleDriverPrefetch(reason = "") {
 
     const mode = normalizeObLoadType(SETTINGS.obLoadType || "all");
     const rawOutbound = Array.isArray(STATE.outboundLoads) ? STATE.outboundLoads : [];
+    const excludedOriginalVrids = getExcludedOriginalVridsFromBackups(rawOutbound);
     const filteredOutbound = getFilteredOutboundLoadsForMode(mode, {
       loads: rawOutbound,
+      basePredicate: (l) => {
+        const vr = String(l?.vrId || l?.vrid || '').trim();
+        return !(vr && excludedOriginalVrids.has(vr));
+      },
       debugKey: "merge-group-building",
     });
 
@@ -7418,7 +7459,12 @@ if (r) STATE._lastBulkFmc = { at: Date.now(), ids, resp: r };
     const capTotal = Math.max(0, _mergeNum(mm?.capTotal, _mergeNum(g?.capacityTotal, 0)));
     const capPer = Math.max(1, _mergeNum(mm?.capPer, capTotal && loads ? (capTotal / loads) : ((Number(SETTINGS.cap53ftCarts) || 36))));
     const loaded = Math.max(0, _mergeNum(mm?.loaded, _mergeNum(g?.loadedUnits, 0)));
-    const current = Math.max(0, _mergeNum(mm?.current, _mergeNum(g?.currentUnits, 0)));
+    let current = Math.max(0, _mergeNum(mm?.current, _mergeNum(g?.currentUnits, 0)));
+    // Keep fallback baseline aligned with lane-card math: if current already includes loaded units,
+    // only count the non-loaded in-facility remainder to avoid double counting.
+    if (!mm && loaded > 0 && current >= loaded && (current - loaded) <= capTotal) {
+      current = Math.max(0, current - loaded);
+    }
     const upstream = Math.max(0, _mergeNum(mm?.upstream, _mergeNum(g?.inboundUnits, 0)));
     const inboundW = Math.max(0, Math.min(1, _mergeNum(mm?.inboundW, Number(SETTINGS.mergeInboundWeight) || 0.35)));
     const metrics = _mergeScenarioMetrics({ capTotal, capPer, loaded, current, upstream, inboundW });
@@ -8449,11 +8495,16 @@ function renderPanel() {
 
       const { startMs: opsStartMs, endMs: opsEndMs } = getOpsWindow(nowMs);
 
-      const rawOutbound = (STATE.outboundLoads || [])
+      const rawOutboundAll = (STATE.outboundLoads || []);
+      const excludedOriginalVrids = getExcludedOriginalVridsFromBackups(rawOutboundAll);
+      const rawOutbound = rawOutboundAll
         // Visibility rule (Action Panel): include all outbound loads except those that are truly gone.
         // Keep "COMPLETED" / "FINISHED_LOADING" visible so leadership can still see what's on deck.
+        // Also drop originals when a BACKUP-linked replacement exists, to avoid double-counting capacity.
         .filter((l) => {
           const st = String((l?.loadStatus ?? l?.status ?? "")).toUpperCase();
+          const vr = String(l?.vrId || l?.vrid || '').trim();
+          if (vr && excludedOriginalVrids.has(vr)) return false;
           if (!st) return true;
           if (st.includes("CANCEL")) return false;
           if (st.includes("DEPART")) return false;
@@ -8851,9 +8902,28 @@ if (DEBUG.laneGroups) {
           // Display utilization as (Loaded + Current + Inbound*w) / Capacity when mergeMeta is available.
           const __mm = g && g.mergeMeta ? g.mergeMeta : null;
           const __utilDen = (__mm && Number.isFinite(__mm.capTotal) && __mm.capTotal > 0) ? Number(__mm.capTotal) : (capTotal > 0 ? Number(capTotal) : 0);
+          const __fallbackW = (() => {
+            const minsToCpt = Number.isFinite(Number(g?.cptMs))
+              ? Math.round((Number(g.cptMs) - Date.now()) / 60000)
+              : NaN;
+            const baseWRaw = Number(SETTINGS.mergeInboundWeight);
+            let w = Number.isFinite(baseWRaw) ? Math.max(0, Math.min(baseWRaw, 0.50)) : 0.35;
+            if (!Number.isFinite(minsToCpt)) return w;
+            if (minsToCpt > 180) return Math.min(w, 0.15);
+            if (minsToCpt > 90) return Math.min(w, 0.25);
+            if (minsToCpt > 45) return w;
+            return Math.max(w, 0.50);
+          })();
+          const __fallbackCurrent = (() => {
+            if (curNum === null || Number.isNaN(curNum)) return 0;
+            const raw = Number(curNum || 0);
+            const ld = Number(g.loadedUnits || 0);
+            if (ld > 0 && raw >= ld && (raw - ld) <= capTotal) return Math.max(0, raw - ld);
+            return raw;
+          })();
           const __utilNum = (__mm && __utilDen)
             ? (Number(__mm.loaded || 0) + Number(__mm.current || 0) + (Number(__mm.inboundW || 0) * Number(__mm.upstream || 0)))
-            : (Number(g.loadedUnits || 0) + (curNum === null ? 0 : Number(curNum || 0)));
+            : (Number(g.loadedUnits || 0) + __fallbackCurrent + (__fallbackW * Number(g.inboundUnits || 0)));
           const __utilPct = (__utilDen > 0) ? Math.round((__utilNum / __utilDen) * 100) : 0;
           const __utilFactorDisp = (__utilDen > 0 && Number.isFinite(__utilNum))
             ? `${__utilNum.toFixed(1)}/${__utilDen} (${__utilPct}%)`
