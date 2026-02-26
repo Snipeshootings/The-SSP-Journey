@@ -449,6 +449,42 @@ function getOutboundEquipmentTypeRaw(load) {
   );
 }
 
+
+
+function getOutboundLoadCrId(load) {
+  try {
+    return String(
+      load?.crId ??
+      load?.crid ??
+      load?.CRID ??
+      load?.caseReferenceId ??
+      load?.caseRefId ??
+      ''
+    ).trim();
+  } catch (_) {
+    return '';
+  }
+}
+
+function getBackupOriginalVridFromCrId(crId) {
+  const txt = String(crId || '').trim();
+  if (!txt) return '';
+  const up = txt.toUpperCase();
+  if (!up.includes('BACKUP') || !up.includes('VEHICLE_RUN##')) return '';
+  const tail = txt.split(/VEHICLE_RUN##/i)[1] || '';
+  const m = tail.match(/([A-Za-z0-9_]+)/);
+  return m ? String(m[1] || '').trim() : '';
+}
+
+function getExcludedOriginalVridsFromBackups(loads) {
+  const out = new Set();
+  const arr = Array.isArray(loads) ? loads : [];
+  for (const l of arr) {
+    const og = getBackupOriginalVridFromCrId(getOutboundLoadCrId(l));
+    if (og) out.add(og);
+  }
+  return out;
+}
 function getFilteredOutboundLoadsForMode(modeInput, options = {}) {
   const mode = normalizeObLoadType(modeInput || "all");
   const srcLoads = Array.isArray(options.loads)
@@ -5820,8 +5856,13 @@ function scheduleDriverPrefetch(reason = "") {
 
     const mode = normalizeObLoadType(SETTINGS.obLoadType || "all");
     const rawOutbound = Array.isArray(STATE.outboundLoads) ? STATE.outboundLoads : [];
+    const excludedOriginalVrids = getExcludedOriginalVridsFromBackups(rawOutbound);
     const filteredOutbound = getFilteredOutboundLoadsForMode(mode, {
       loads: rawOutbound,
+      basePredicate: (l) => {
+        const vr = String(l?.vrId || l?.vrid || '').trim();
+        return !(vr && excludedOriginalVrids.has(vr));
+      },
       debugKey: "merge-group-building",
     });
 
@@ -8471,11 +8512,16 @@ function renderPanel() {
 
       const { startMs: opsStartMs, endMs: opsEndMs } = getOpsWindow(nowMs);
 
-      const rawOutbound = (STATE.outboundLoads || [])
+      const rawOutboundAll = (STATE.outboundLoads || []);
+      const excludedOriginalVrids = getExcludedOriginalVridsFromBackups(rawOutboundAll);
+      const rawOutbound = rawOutboundAll
         // Visibility rule (Action Panel): include all outbound loads except those that are truly gone.
         // Keep "COMPLETED" / "FINISHED_LOADING" visible so leadership can still see what's on deck.
+        // Also drop originals when a BACKUP-linked replacement exists, to avoid double-counting capacity.
         .filter((l) => {
           const st = String((l?.loadStatus ?? l?.status ?? "")).toUpperCase();
+          const vr = String(l?.vrId || l?.vrid || '').trim();
+          if (vr && excludedOriginalVrids.has(vr)) return false;
           if (!st) return true;
           if (st.includes("CANCEL")) return false;
           if (st.includes("DEPART")) return false;
