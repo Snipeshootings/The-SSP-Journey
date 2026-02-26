@@ -1961,7 +1961,7 @@ function getOpsWindow(nowMs = Date.now()) {
     actionableOnly: false,
 
     // Prefetch OB container details for visible VRIDs (can cause slow panel load if SSP is rate-limiting)
-    prefetchObDetails: false,
+    prefetchObDetails: true,
 
 
     // Show Merge Panel debug details (why eligible IB/units are missing)
@@ -2044,6 +2044,9 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
   const UI_PREFS_KEY = "ssp2:prefs";
 
   let SETTINGS = { ...DEFAULT_SETTINGS, ...(lsGet(SETTINGS_KEY, {}) || {}) };
+  // Always prefetch OB container details so Loaded/Capacity hydrate without extra clicks.
+  // This can increase request volume but matches ops expectation for immediate panel readiness.
+  SETTINGS.prefetchObDetails = true;
   SETTINGS.alerts = normalizeAlertSettings(SETTINGS.alerts);
   const CONFIG = SETTINGS; // alias for backward compatibility
   // UI prefs (header/panel hide state)
