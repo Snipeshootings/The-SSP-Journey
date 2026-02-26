@@ -1861,11 +1861,13 @@ function getOpsWindow(nowMs = Date.now()) {
         lateAdhoc: false,
         capacityAlert: false,
         stagingAlert: false,
+        sdtMissAlert: false,
         tdrLateAlert: false,
         buDriverArrivedAlert: false,
       },
       thresholds: {
         lateMinutes: 15,
+        sdtGraceMinutes: 0,
         maxRowsPerMessage: 10,
       },
     };
@@ -1887,11 +1889,13 @@ function getOpsWindow(nowMs = Date.now()) {
         lateAdhoc: !!srcTypes.lateAdhoc,
         capacityAlert: !!srcTypes.capacityAlert,
         stagingAlert: !!srcTypes.stagingAlert,
+        sdtMissAlert: !!srcTypes.sdtMissAlert,
         tdrLateAlert: !!srcTypes.tdrLateAlert,
         buDriverArrivedAlert: !!srcTypes.buDriverArrivedAlert,
       },
       thresholds: {
         lateMinutes: Math.max(1, Number(srcThresholds.lateMinutes || d.thresholds.lateMinutes)),
+        sdtGraceMinutes: Math.max(0, Number(srcThresholds.sdtGraceMinutes || d.thresholds.sdtGraceMinutes)),
         maxRowsPerMessage: Math.max(1, Number(srcThresholds.maxRowsPerMessage || d.thresholds.maxRowsPerMessage)),
       },
     };
@@ -2348,6 +2352,7 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
     lateAdhoc: { label: "LATE ADHOC", payloadType: "late_adhoc" },
     capacityAlert: { label: "CAPACITY ALERT", payloadType: "capacity_alert" },
     stagingAlert: { label: "STAGING ALERT", payloadType: "staging_alert" },
+    sdtMissAlert: { label: "SDT CHECK-IN MISS", payloadType: "sdt_checkin_miss" },
     tdrLateAlert: { label: "TDR LATE ALERT", payloadType: "tdr_late_alert" },
     buDriverArrivedAlert: { label: "BU DRIVER ARRIVED ALERT", payloadType: "bu_driver_arrived_alert" },
   };
@@ -2547,6 +2552,51 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
     return out;
   }
 
+  function _collectSdtMissRows(outboundLoads, vridIndex, alertsCfg) {
+    const out = [];
+    const now = Date.now();
+    const graceMs = Math.max(0, Number(alertsCfg?.thresholds?.sdtGraceMinutes || 0)) * 60000;
+
+    for (const l of outboundLoads || []) {
+      const vrid = String(l?.vrId || l?.vrid || "").trim();
+      if (!vrid) continue;
+      const idx = vridIndex?.[vrid] || {};
+      const lane = String(idx?.lane || _alertLane(l)).trim() || "-";
+      const cptMs = Number(idx?.cptMs || _alertCptMs(l) || 0);
+      const sdtMs = Number(idx?.sdtMs || parseSspDateTime(l?.scheduledDepartureTime || l?.scheduleDepartureTime || l?.scheduledDepartTime || l?.scheduleDepartTime || l?.departureTime || "") || 0);
+      if (!sdtMs) continue;
+
+      const status = String(idx?.status || l?.loadStatus || l?.status || "").toUpperCase();
+      if (isObFinalStatus(status)) continue;
+
+      const checkInMs = Number(idx?.checkInMs || 0);
+      const overdueByMs = now - (sdtMs + graceMs);
+      if (overdueByMs <= 0 || checkInMs > 0) continue;
+
+      const overdueMin = Math.floor(overdueByMs / 60000);
+      const severity = overdueMin >= 60 ? "critical" : (overdueMin >= 20 ? "warning" : "info");
+      out.push({
+        type: "sdtMissAlert",
+        key: `sdt-miss:${vrid}`,
+        signature: `${sdtMs}|${graceMs}|${status}`,
+        severity,
+        lane,
+        cptMs,
+        vrid,
+        line: `${lane} | VRID ${vrid} | SDT ${_fmtAlertTime(sdtMs)} missed check-in by ${overdueMin}m${graceMs ? ` (grace ${Math.round(graceMs / 60000)}m)` : ""}`,
+      });
+    }
+
+    return out;
+  }
+
+
+  // 🚀 New “SDT Check-in Miss” alert implemented
+  // - Uses Relay detail completionTime as check-in
+  // - Separate from existing TDR late logic
+  // - Integrated into alert prioritization & Slack payloads
+  // - Configurable via alerts settings
+
   function _collectBuDriverArrivedRows(outboundLoads) {
     const out = [];
     for (const l of outboundLoads) {
@@ -2657,6 +2707,7 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
       if (enabledTypes.capacityAlert) allRows = allRows.concat(_collectCapacityAlertRows(groups));
       if (enabledTypes.lateAdhoc) allRows = allRows.concat(_collectLateAdhocRows(groups));
       if (enabledTypes.stagingAlert) allRows = allRows.concat(_collectStagingRows(outboundLoads));
+      if (enabledTypes.sdtMissAlert) allRows = allRows.concat(_collectSdtMissRows(outboundLoads, STATE.vridIndex || {}, alertsCfg));
       if (enabledTypes.tdrLateAlert) allRows = allRows.concat(_collectTdrLateRows(STATE.vridIndex || {}));
       if (enabledTypes.buDriverArrivedAlert) allRows = allRows.concat(_collectBuDriverArrivedRows(outboundLoads));
       if (enabledTypes.lateLoad) allRows = allRows.concat(await _collectLateLoadRows(alertsCfg));
@@ -2677,6 +2728,7 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
         "lateAdhoc",
         "capacityAlert",
         "stagingAlert",
+        "sdtMissAlert",
         "tdrLateAlert",
         "buDriverArrivedAlert",
       ];
@@ -9460,6 +9512,54 @@ async function _sspFmcGetExecutionById(vrid) {
   return null;
 }
 
+
+function parseRelayCheckInMs(relayDetail) {
+  const firstStop = Array.isArray(relayDetail?.stops) ? relayDetail.stops[0] : null;
+  if (!firstStop) return 0;
+
+  // Primary source: checked-in status with arrival completion timestamp.
+  // NOTE: status values vary between Track/FMC payloads; adjust this gate as needed.
+  const status = String(relayDetail?.currentStatus || relayDetail?.executionStatusV2 || relayDetail?.executionStatus || "").toUpperCase();
+  if (status === "CHECKED_IN" || status.includes("CHECKED_IN") || status.includes("CHECKIN")) {
+    const arrivalMs = Number(_msFromAny(firstStop?.arrival?.completionTime) || 0);
+    if (arrivalMs > 0) return arrivalMs;
+  }
+
+  // Fallback: yard events on first stop (ARRIVAL action).
+  const events = Array.isArray(firstStop?.events) ? firstStop.events : [];
+  for (const ev of events) {
+    const action = String(ev?.yardEventAction || ev?.action || "").toUpperCase();
+    if (action !== "ARRIVAL") continue;
+    const eventMs = Number(_msFromAny(ev?.yardActionTime || ev?.eventTime || ev?.time) || 0);
+    if (eventMs > 0) return eventMs;
+  }
+
+  // Fallback: explicit check-in time reports.
+  const reports = Array.isArray(firstStop?.timeReports) ? firstStop.timeReports : [];
+  for (const tr of reports) {
+    const type = String(tr?.type || tr?.reportType || "").toUpperCase();
+    if (type !== "CHECKIN" && type !== "CHECK_IN") continue;
+    const reportMs = Number(_msFromAny(tr?.time || tr?.reportedTime || tr?.timestamp) || 0);
+    if (reportMs > 0) return reportMs;
+  }
+
+  return 0;
+}
+
+function _mergeRelayDetailIntoVridIndex(vrid, relayDetail) {
+  const v = String(vrid || "").trim();
+  if (!v || !relayDetail || typeof relayDetail !== "object") return;
+  STATE.vridIndex = STATE.vridIndex || {};
+  const prev = STATE.vridIndex[v] || { vrid: v };
+  const nextStatus = String(relayDetail?.currentStatus || relayDetail?.executionStatusV2 || relayDetail?.executionStatus || "").trim();
+  const checkInMs = Number(parseRelayCheckInMs(relayDetail) || 0);
+  STATE.vridIndex[v] = {
+    ...prev,
+    vrid: v,
+    relayStatus: nextStatus || prev.relayStatus || "",
+    checkInMs: checkInMs || Number(prev?.checkInMs || 0) || 0,
+  };
+}
 function _sspRelayParseIsoToLocal(iso) {
   if (!iso) return "";
   const d = new Date(iso);
@@ -9487,6 +9587,7 @@ async function _sspRelayGetDetail(vrid, opts = {}) {
   if (hit) {
     const src = String(cache[v]?.detail?.__sspSource || "").toUpperCase();
     if (!allowFmcFallback && src === "FMC") throw new Error("Relay detail unavailable (cached FMC fallback).");
+    _mergeRelayDetailIntoVridIndex(v, cache[v].detail);
     return cache[v].detail;
   }
 
@@ -9498,6 +9599,7 @@ async function _sspRelayGetDetail(vrid, opts = {}) {
     cache[v] = cache[v] || {};
     cache[v].detail = obj;
     cache[v].tDetail = now;
+    _mergeRelayDetailIntoVridIndex(v, obj);
     return obj;
   }
 
@@ -9513,6 +9615,7 @@ async function _sspRelayGetDetail(vrid, opts = {}) {
     cache[v] = cache[v] || {};
     cache[v].detail = obj;
     cache[v].tDetail = now;
+    _mergeRelayDetailIntoVridIndex(v, obj);
     return obj;
   } catch (e) {
     const msg = (e && e.message) ? String(e.message) : "";
@@ -9531,6 +9634,7 @@ async function _sspRelayGetDetail(vrid, opts = {}) {
         cache[v] = cache[v] || {};
         cache[v].detail = obj;
         cache[v].tDetail = now;
+        _mergeRelayDetailIntoVridIndex(v, obj);
         return obj;
       } catch (e2) {
         const msg2 = (e2 && e2.message) ? String(e2.message) : String(e2);
@@ -12547,6 +12651,7 @@ try {
             <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>Late Adhoc</span><input id="s-alert-lateadhoc" type="checkbox" ${alerts.types.lateAdhoc ? "checked" : ""} /></label>
             <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>Capacity Alert</span><input id="s-alert-capacity" type="checkbox" ${alerts.types.capacityAlert ? "checked" : ""} /></label>
             <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>Staging Alert</span><input id="s-alert-staging" type="checkbox" ${alerts.types.stagingAlert ? "checked" : ""} /></label>
+            <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>SDT Check-in Miss</span><input id="s-alert-sdtmiss" type="checkbox" ${alerts.types.sdtMissAlert ? "checked" : ""} /></label>
             <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>TDR Late Alert</span><input id="s-alert-tdr" type="checkbox" ${alerts.types.tdrLateAlert ? "checked" : ""} /></label>
             <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>BU Driver Arrived Alert</span><input id="s-alert-buarrived" type="checkbox" ${alerts.types.buDriverArrivedAlert ? "checked" : ""} /></label>
           </div>
@@ -13218,6 +13323,7 @@ function openSettingsModal(defaultTab) {
           lateAdhoc: readChk("s-alert-lateadhoc"),
           capacityAlert: readChk("s-alert-capacity"),
           stagingAlert: readChk("s-alert-staging"),
+          sdtMissAlert: readChk("s-alert-sdtmiss"),
           tdrLateAlert: readChk("s-alert-tdr"),
           buDriverArrivedAlert: readChk("s-alert-buarrived"),
         },
@@ -17883,4 +17989,3 @@ async function openRelayCasesPanel(laneKey, cptMs) {
 
   } catch (_) {}
 })();
-
