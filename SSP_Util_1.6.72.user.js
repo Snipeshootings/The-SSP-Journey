@@ -37,8 +37,8 @@
 // @match        https://trans-logistics.amazon.com/ssp/*
 // @match        https://www.amazonlogistics.com/ssp/dock/*
 // @match        https://track.relay.amazon.dev/*
-// @downloadURL  https://axzile.corp.amazon.com/-/carthamus/download_script/ssp-util-8.user.js
-// @updateURL    https://axzile.corp.amazon.com/-/carthamus/download_script/ssp-util-8.user.js
+// @downloadURL  https://tamarin.aces.amazon.dev/scripts/ssp-util/install.user.js
+// @updateURL    https://tamarin.aces.amazon.dev/scripts/ssp-util/install.user.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
