@@ -1297,9 +1297,6 @@ function getOpsWindow(nowMs = Date.now()) {
         addSample(`${sortRoute}::${loadType}::${equipShort}`, totalC, totalP);
         addSample(`${sortRoute}::__all::${equipShort}`, totalC, totalP);
         addSample(`${sortRoute}::__all::__all`, totalC, totalP);
-        addSample(`__GLOBAL__::${loadType}::${equipShort}`, totalC, totalP);
-        addSample(`__GLOBAL__::__all::${equipShort}`, totalC, totalP);
-        addSample(`__GLOBAL__::__all::__all`, totalC, totalP);
       }
 
       const estimates = {};
@@ -1428,14 +1425,11 @@ function getOpsWindow(nowMs = Date.now()) {
   } catch (_) {}
 
   /**
-   * Get estimate for a load using CSV-based statistics (with fallback to route averages).
+   * Get estimate for a load using CSV-based route statistics only.
    * Lookup order:
    * route::loadType::equipment ->
    * route::__all::equipment ->
-   * route::__all::__all ->
-   * __GLOBAL__::loadType::equipment ->
-   * __GLOBAL__::__all::equipment ->
-   * __GLOBAL__::__all::__all
+   * route::__all::__all
    */
   function _ibCsvEstGet(sortRoute, loadType, equipment) {
     try {
@@ -1460,18 +1454,6 @@ function getOpsWindow(nowMs = Date.now()) {
       // Fall back to route::__all::__all
       const key3 = `${sr}::__all::__all`;
       if (est[key3]) return est[key3];
-
-      // Fall back to global loadType + equipment
-      const key4 = `__GLOBAL__::${lt}::${equipShort}`;
-      if (est[key4]) return est[key4];
-
-      // Fall back to global __all + equipment
-      const key5 = `__GLOBAL__::__all::${equipShort}`;
-      if (est[key5]) return est[key5];
-
-      // Fall back to global __all + __all
-      const key6 = `__GLOBAL__::__all::__all`;
-      if (est[key6]) return est[key6];
 
       return null;
     } catch { return null; }
@@ -1498,22 +1480,11 @@ function getOpsWindow(nowMs = Date.now()) {
       };
     }
 
-    // Fall back to route averages from dock view
-    let equipBucket = "__all";
-    try {
-      equipBucket = typeof equipShort === "function"
-        ? equipShort(equipmentType)
-        : (equipmentType && equipmentType.match(/\d{2}/)?.[0]) || "__all";
-    } catch {
-      equipBucket = (equipmentType && equipmentType.match(/\d{2}/)?.[0]) || "__all";
-    }
-
-    const avg = _ibAvgGet(sortRoute, equipBucket);
-    if (!avg) return null;
+    // CSV-only mode: if no route data was uploaded, keep unmanifested counts at zero.
     return {
-      estC: ceilPosInt(avg.avgC),
-      estP: ceilPosInt(avg.avgP),
-      source: `avg_${avg.n || 0}`,
+      estC: 0,
+      estP: 0,
+      source: "csv_none",
     };
   }
 
@@ -5376,10 +5347,6 @@ async function loadInbound() {
   const ibLookbackMs = 3 * 60 * 60 * 1000;
   const ibStart = startMs - ibLookbackMs;
   const ibEnd = endMs;                                    // treat as 07:00 cutoff anchor
-
-  // Refresh inbound route averages (daily) in background
-  try { refreshInboundRouteAverages({ force:false }); } catch (_) {}
-
 
   // Single generalized pull
   const resp = await postFetch(
@@ -9500,8 +9467,8 @@ function _getLoadCountsForPlanningMath(l, opts = {}) {
         equipmentType: String(l?.equipmentType || l?.trailerEquipmentType || "").trim(),
         loadType: String(l?.shippingPurposeType || l?.loadType || l?.shippingPurpose || "").trim(),
       });
-      if (est && Number(est.estC) > 0) {
-        if (!(Number(C) > 0)) C = Number(est.estC);
+      if (est) {
+        if (!(Number(C) > 0) && Number.isFinite(Number(est.estC))) C = Number(est.estC);
         if (!(Number(P) > 0) && Number.isFinite(Number(est.estP))) P = Number(est.estP);
         source = String(est.source || "estimated");
       }
@@ -16701,10 +16668,10 @@ function _hhmmToMinutes(hhmm) {
         equipmentType: String(load?.equipmentType || load?.trailerEquipmentType || "").trim(),
         loadType: String(load?.shippingPurposeType || load?.loadType || load?.shippingPurpose || "").trim(),
       });
-      if (est && Number(est.estC) > 0) return Number(est.estC);
+      if (est && Number.isFinite(Number(est.estC)) && Number(est.estC) >= 0) return Number(est.estC);
     }
     if (resolved != null && resolved !== "" && Number.isFinite(Number(resolved)) && Number(resolved) >= 0) return Number(resolved);
-    return 1;
+    return 0;
   }
 
   function _requiredAAs(containers, targetCph, hours) {
