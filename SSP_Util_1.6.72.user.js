@@ -2857,6 +2857,10 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
     relayConnectivityInflight: null,
     alertRuntime: { activeByKey: {}, evalInFlight: false, relayRows: [], lastRelayScanMs: 0 },
 
+    // FCLM PPA cache for live Shift CPH (Crossdock/Sortable).
+    fclmPpa: { ts: 0, crossdockUph: null, sortableUph: null, source: "none", error: "" },
+    fclmPpaInflight: null,
+
     running: false,
     lastError: null,
     lastErrorDetail: null,
@@ -8289,6 +8293,9 @@ function renderPanel() {
       let expectedLoads = null;
       let processedLoads = null;
       let remainingLoads = null;
+      let shiftCphNow = null;
+      let hcNeedNow = null;
+      let shiftCphSource = "local";
 
       try {
         if (typeof _getShiftContext === "function" && typeof _shiftToWindowMs === "function") {
@@ -8299,20 +8306,64 @@ function renderPanel() {
           if (w && Number.isFinite(w.startMs) && Number.isFinite(w.endMs)) {
             let exp = 0;
             let proc = 0;
+            let processedC = 0;
+            let dueC = 0;
+            const done = (l) => String(l?.status || l?.loadStatus || "").toUpperCase().trim() === "COMPLETED";
+            const nowForShift = Math.min(nowMs, w.endMs);
             for (const l of (STATE?.inboundLoads || [])) {
               const t = (typeof _getLoadTimeForShiftBucketing === "function") ? _getLoadTimeForShiftBucketing(l) : null;
               if (t == null) continue;
               if (t >= w.startMs && t < w.endMs) {
                 exp += 1;
-                if (String(l?.status || "").toUpperCase() === "COMPLETED") {
+                if (done(l)) {
                   const at = (typeof _parseInboundTs === "function") ? _parseInboundTs(l?.actualArrivalTime) : null;
                   if (at != null && at >= w.startMs && at < w.endMs) proc += 1;
+                }
+              }
+
+              // Processed containers in active shift: completed + actualArrival in [start, now].
+              if (done(l)) {
+                const at = (typeof _parseInboundTs === "function") ? _parseInboundTs(l?.actualArrivalTime) : null;
+                if (at != null && at >= w.startMs && at <= nowForShift) {
+                  const c = (typeof _getLoadContainerCount === "function") ? Number(_getLoadContainerCount(l)) : 0;
+                  if (Number.isFinite(c) && c > 0) processedC += c;
+                }
+              } else {
+                // Remaining due containers now->shift end using planning timestamp.
+                const tp = (typeof _getLoadTimeForPlanning === "function") ? Number(_getLoadTimeForPlanning(l)) : 0;
+                if (Number.isFinite(tp) && tp > 0 && tp >= nowMs && tp < w.endMs) {
+                  const c = (typeof _getLoadContainerCount === "function") ? Number(_getLoadContainerCount(l)) : 0;
+                  if (Number.isFinite(c) && c > 0) dueC += c;
                 }
               }
             }
             expectedLoads = exp;
             processedLoads = proc;
             remainingLoads = Math.max(0, exp - proc);
+
+            // Local computed Shift CPH fallback.
+            const elapsedHrs = Math.max(0.0001, (nowForShift - w.startMs) / 3600000);
+            shiftCphNow = processedC / elapsedHrs;
+
+            // HC need now->shift end (containers / (hrsRemaining * targetCPH)).
+            const targetCph = Number(SHIFT_SETTINGS?.targetCph);
+            if (!(w.endMs > nowMs)) {
+              hcNeedNow = 0;
+            } else if (Number.isFinite(targetCph) && targetCph > 0) {
+              const hrsRemaining = Math.max(0.0001, (w.endMs - nowMs) / 3600000);
+              hcNeedNow = Math.max(0, Math.ceil(dueC / (hrsRemaining * targetCph)));
+            }
+
+            // FCLM PPA Shift CPH (Crossdock UPH) preferred when available.
+            const wh = String(STATE?.nodeId || SHIFT_SETTINGS?.siteCode || "").trim();
+            if (wh) {
+              try { void _refreshFclmPpaForShift(wh, w); } catch (_) {}
+              const ppa = STATE?.fclmPpa || null;
+              if (ppa && Number.isFinite(Number(ppa.crossdockUph))) {
+                shiftCphNow = Number(ppa.crossdockUph);
+                shiftCphSource = "fclm";
+              }
+            }
           }
         }
       } catch (_) {}
@@ -8357,6 +8408,14 @@ function renderPanel() {
         const d = Number.isFinite(Number(sh.deltaNeed)) ? Number(sh.deltaNeed) : (hcRec - hcPlan);
         const needColor = d > 0 ? "#dc2626" : (d < 0 ? "#2563eb" : "#16a34a");
         pushPart(`Need: ${formatDelta(d)}`, `<span><b>Need:</b> <span style="color:${needColor};font-weight:900;">${formatDelta(d)}</span></span>`);
+
+        const cphTxt = Number.isFinite(Number(shiftCphNow)) ? Number(shiftCphNow).toFixed(1) : "—";
+        const cphLbl = shiftCphSource === "fclm" ? "Shift CPH*" : "Shift CPH";
+        const cphTip = shiftCphSource === "fclm" ? "FCLM PPA Crossdock UPH" : "Local shift-to-now containers/hour";
+        pushPart(`${cphLbl}: ${cphTxt}`, `<span title="${cphTip}"><b>${cphLbl}:</b> ${cphTxt}</span>`);
+
+        const hcNowTxt = Number.isFinite(Number(hcNeedNow)) ? String(Math.max(0, Number(hcNeedNow))) : "—";
+        pushPart(`HC need: ${hcNowTxt}`, `<span><b>HC need:</b> ${hcNowTxt}</span>`);
       }
 
       pushPart(`Selected VRIDs: ${STATE.bulkSelection.size}`, `<span><b>Selected VRIDs:</b> ${STATE.bulkSelection.size}</span>`);
@@ -9163,6 +9222,134 @@ if (chip) {
       toMs(load?.estimatedArrivalTime) ||
       0
     );
+  }
+
+  function _fmtMmDdYyLocal(ts) {
+    const d = new Date(ts);
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    const yy = String(d.getFullYear()).slice(-2);
+    return `${mm}/${dd}/${yy}`;
+  }
+
+  function _toFclmIntradayWindow(w) {
+    if (!w || !Number.isFinite(w.startMs) || !Number.isFinite(w.endMs)) return null;
+    const s = new Date(w.startMs);
+    const e = new Date(w.endMs);
+    return {
+      startDate: _fmtMmDdYyLocal(w.startMs),
+      startHour: s.getHours(),
+      startMinute: s.getMinutes(),
+      endDate: _fmtMmDdYyLocal(w.endMs),
+      endHour: e.getHours(),
+      endMinute: e.getMinutes(),
+    };
+  }
+
+  function _toNumFromText(v) {
+    const n = Number(String(v ?? "").replace(/,/g, "").trim());
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function _parseFclmPpaTable(htmlText) {
+    const out = { crossdockUph: null, sortableUph: null };
+    if (!htmlText || typeof htmlText !== "string") return out;
+
+    const doc = document.implementation.createHTMLDocument("");
+    doc.documentElement.innerHTML = htmlText;
+    const tables = Array.from(doc.getElementsByTagName("table"));
+    if (!tables.length) return out;
+
+    // 718 chunk reads table[1] and expects row0=sortable, row1=crossdock, uph at col4.
+    const parseChunkLayout = (tbl) => {
+      try {
+        const body = tbl?.getElementsByTagName("tbody")?.[0];
+        const rows = body ? Array.from(body.rows || []) : [];
+        if (rows.length < 2) return null;
+        const sortableUph = _toNumFromText(rows[0]?.cells?.[4]?.innerText);
+        const crossdockUph = _toNumFromText(rows[1]?.cells?.[4]?.innerText);
+        return { sortableUph, crossdockUph };
+      } catch (_) {
+        return null;
+      }
+    };
+
+    const idx1 = tables[1] ? parseChunkLayout(tables[1]) : null;
+    if (idx1 && (idx1.crossdockUph != null || idx1.sortableUph != null)) return idx1;
+
+    // Fallback: scan for rows with labels containing "sortable" / "crossdock" and use last numeric col.
+    for (const t of tables) {
+      const rows = Array.from(t.querySelectorAll("tbody tr"));
+      for (const r of rows) {
+        const cells = Array.from(r.cells || []);
+        if (!cells.length) continue;
+        const txt = cells.map(c => String(c.innerText || "").trim()).join(" ").toLowerCase();
+        const nums = cells.map(c => _toNumFromText(c.innerText)).filter(n => n != null);
+        if (!nums.length) continue;
+        const v = nums[nums.length - 1];
+        if (txt.includes("sortable") && out.sortableUph == null) out.sortableUph = v;
+        if (txt.includes("crossdock") && out.crossdockUph == null) out.crossdockUph = v;
+      }
+    }
+    return out;
+  }
+
+  async function _refreshFclmPpaForShift(warehouseId, w, { force = false } = {}) {
+    try {
+      if (!warehouseId || !w) return null;
+      const ttlMs = 2 * 60 * 1000;
+      const cur = STATE.fclmPpa || {};
+      if (!force && Number(cur.ts || 0) > 0 && (Date.now() - Number(cur.ts || 0) < ttlMs) && !STATE.fclmPpaInflight) {
+        return cur;
+      }
+      if (STATE.fclmPpaInflight) return STATE.fclmPpaInflight;
+
+      const intraday = _toFclmIntradayWindow(w);
+      if (!intraday) return null;
+      const u = new URL("https://fclm-portal.amazon.com/ppa/inspect/node");
+      u.searchParams.set("nodeType", "SC");
+      u.searchParams.set("warehouseId", String(warehouseId));
+      u.searchParams.set("maxIntradayDays", "1");
+      u.searchParams.set("spanType", "Intraday");
+      u.searchParams.set("startDateIntraday", intraday.startDate);
+      u.searchParams.set("startHourIntraday", String(intraday.startHour));
+      u.searchParams.set("startMinuteIntraday", String(intraday.startMinute));
+      u.searchParams.set("endDateIntraday", intraday.endDate);
+      u.searchParams.set("endHourIntraday", String(intraday.endHour));
+      u.searchParams.set("endMinuteIntraday", String(intraday.endMinute));
+
+      const p = fetch(String(u), { method: "GET", credentials: "include", cache: "no-cache" })
+        .then(r => r.text())
+        .then((htmlText) => {
+          const ppa = _parseFclmPpaTable(htmlText);
+          STATE.fclmPpa = {
+            ts: Date.now(),
+            crossdockUph: ppa.crossdockUph,
+            sortableUph: ppa.sortableUph,
+            source: "fclm",
+            error: "",
+          };
+          return STATE.fclmPpa;
+        })
+        .catch((e) => {
+          STATE.fclmPpa = {
+            ts: Date.now(),
+            crossdockUph: null,
+            sortableUph: null,
+            source: "error",
+            error: String(e?.message || e || "FCLM fetch failed"),
+          };
+          return STATE.fclmPpa;
+        })
+        .finally(() => {
+          STATE.fclmPpaInflight = null;
+        });
+
+      STATE.fclmPpaInflight = p;
+      return p;
+    } catch (_) {
+      return null;
+    }
   }
 
 
@@ -11814,6 +12001,7 @@ function renderPlanningPanel() {
       const _shiftWindows = (shifts || [])
         .map(s => {
           const w = _shiftToWindowMs(s, baseDay0Ms);
+          if (!w || !Number.isFinite(w.startMs) || !Number.isFinite(w.endMs)) return null;
           return {
             s,
             startMs: w.startMs,
@@ -11821,6 +12009,7 @@ function renderPlanningPanel() {
             endClipped: Math.min(w.endMs, ops.endMs),
           };
         })
+        .filter(Boolean)
         .filter(x => x.endClipped > ops.startMs)
         .sort((a, b) => (a.endClipped - b.endClipped));
 
@@ -12064,6 +12253,68 @@ function renderPlanningPanel() {
         // Staffing call
         const hcTotal = (hc_cut_total != null) ? hc_cut_total : null;
 
+        // Current shift throughput strip (containers/HC) for flush at-a-glance display.
+        let shiftNameNow = "—";
+        let shiftWindowTxt = "—";
+        let processedShiftC = null;
+        let elapsedShiftHrs = null;
+        let localShiftCph = null;
+        let effectiveShiftCph = null;
+        let effectiveShiftCphSource = "local";
+        let shiftDueC = null;
+        let shiftHcNow = null;
+        try {
+          if (typeof _getShiftContext === "function" && typeof _shiftToWindowMs === "function") {
+            const ctxNow = _getShiftContext(nowMs);
+            const chosenNow = ctxNow && ctxNow.activeOrUpcoming;
+            const baseNow = ctxNow && ctxNow.baseDay0Ms;
+            const wNow = chosenNow ? _shiftToWindowMs(chosenNow, baseNow) : null;
+            if (chosenNow && wNow && Number.isFinite(wNow.startMs) && Number.isFinite(wNow.endMs)) {
+              shiftNameNow = String(chosenNow.name || "Shift");
+              shiftWindowTxt = `${fmtTime(wNow.startMs)}→${fmtTime(wNow.endMs)}`;
+              const nowForShift = Math.min(nowMs, wNow.endMs);
+              let procC = 0;
+              for (const l of (STATE?.inboundLoads || [])) {
+                const done = String(l?.status || l?.loadStatus || "").toUpperCase().trim() === "COMPLETED";
+                if (!done) continue;
+                const at = (typeof _parseInboundTs === "function") ? _parseInboundTs(l?.actualArrivalTime) : null;
+                if (at == null || at < wNow.startMs || at > nowForShift) continue;
+                const c = (typeof _getLoadContainerCount === "function") ? Number(_getLoadContainerCount(l)) : 0;
+                if (Number.isFinite(c) && c > 0) procC += c;
+              }
+              processedShiftC = procC;
+              elapsedShiftHrs = Math.max(0.0001, (nowForShift - wNow.startMs) / 3600000);
+              localShiftCph = procC / elapsedShiftHrs;
+              effectiveShiftCph = localShiftCph;
+
+              const ppa = STATE?.fclmPpa || null;
+              if (ppa && Number.isFinite(Number(ppa.crossdockUph))) {
+                effectiveShiftCph = Number(ppa.crossdockUph);
+                effectiveShiftCphSource = "fclm";
+              }
+
+              // due<=shiftEnd C and HC_now in this exact shift window
+              let dueCNow = 0;
+              for (const l of (STATE?.inboundLoads || [])) {
+                const done = String(l?.status || l?.loadStatus || "").toUpperCase().trim() === "COMPLETED";
+                if (done) continue;
+                const t = (typeof _getLoadTimeForPlanning === "function") ? Number(_getLoadTimeForPlanning(l)) : 0;
+                if (!Number.isFinite(t) || t <= 0) continue;
+                if (t < nowMs || t >= wNow.endMs) continue;
+                const c = (typeof _getLoadContainerCount === "function") ? Number(_getLoadContainerCount(l)) : 0;
+                if (Number.isFinite(c) && c > 0) dueCNow += c;
+              }
+              shiftDueC = dueCNow;
+              const tCph = Number(SHIFT_SETTINGS?.targetCph);
+              if (!(wNow.endMs > nowMs)) shiftHcNow = 0;
+              else if (Number.isFinite(tCph) && tCph > 0) {
+                const hrsRemain = Math.max(0.0001, (wNow.endMs - nowMs) / 3600000);
+                shiftHcNow = Math.max(0, Math.ceil(dueCNow / (hrsRemain * tCph)));
+              }
+            }
+          }
+        } catch (_) {}
+
         // Badge severity
         if (mathBadge) {
           let sev = "STAFFING";
@@ -12090,6 +12341,27 @@ function renderPlanningPanel() {
         `;
 
         const kv = (k,v) => `<div style="display:flex;justify-content:space-between;gap:10px;"><div style="color:#cbd5e1;font-weight:800;">${k}</div><div style="color:#ffffff;font-weight:900;">${v}</div></div>`;
+
+        const flushCell = (label, value, sub="") => `
+          <div style="min-width:150px;flex:1;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:8px;background:rgba(255,255,255,.03);">
+            <div style="color:#93c5fd;font-size:10px;font-weight:900;letter-spacing:.35px;text-transform:uppercase;">${label}</div>
+            <div style="color:#fff;font-size:20px;font-weight:1000;line-height:1.1;margin-top:3px;">${value}</div>
+            ${sub ? `<div style="color:#cbd5e1;font-size:11px;font-weight:800;margin-top:4px;">${sub}</div>` : ""}
+          </div>
+        `;
+
+        const throughputFlush = card(
+          "Current Shift Throughput (Containers)",
+          `
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              ${flushCell("Shift", shiftNameNow, shiftWindowTxt)}
+              ${flushCell("Shift CPH", (effectiveShiftCph == null ? "—" : Number(effectiveShiftCph).toFixed(1)), effectiveShiftCphSource === "fclm" ? "Source: FCLM Crossdock UPH" : `Local: ${localShiftCph == null ? "—" : Number(localShiftCph).toFixed(1)}`)}
+              ${flushCell("Processed C", processedShiftC == null ? "—" : fmtInt(processedShiftC), elapsedShiftHrs == null ? "" : `${elapsedShiftHrs.toFixed(2)} hrs elapsed`)}
+              ${flushCell("Due C now→end", shiftDueC == null ? "—" : fmtInt(shiftDueC), shiftHcNow == null ? "HC now: —" : `HC now: ${fmtInt(shiftHcNow)}`)}
+            </div>
+          `,
+          `Target: ${targetCph} CPH`
+        );
 
         const progressBar = (p) => {
           if (p == null) return "";
@@ -12123,6 +12395,7 @@ function renderPlanningPanel() {
 
         // Build UI
         let html = "";
+        html += throughputFlush;
         const shiftSummary = (typeof _getShiftSummary === "function") ? _getShiftSummary() : null;
         const plannedHc = (shiftSummary && shiftSummary.ok && Number.isFinite(Number(shiftSummary.staffed))) ? Number(shiftSummary.staffed) : null;
         const recHc = (hcTotal != null) ? Number(hcTotal) : ((shiftSummary && shiftSummary.ok && Number.isFinite(Number(shiftSummary.neededNow))) ? Number(shiftSummary.neededNow) : null);
@@ -12189,7 +12462,18 @@ function renderPlanningPanel() {
         ].join("\n");
       }
     } catch (e) {
-      // keep UI resilient
+      // keep UI resilient and visibly indicate why cards are empty
+      try {
+        const mathUi = panel.querySelector("#ssp2-plan-mathui");
+        const dbgPre = panel.querySelector("#ssp2-plan-debugpre");
+        const msg = String(e?.message || e || "Unknown planning render error");
+        if (mathUi) {
+          mathUi.innerHTML = `<div style="border:1px solid rgba(248,113,113,.5);border-radius:10px;padding:10px;background:rgba(127,29,29,.25);color:#fecaca;font-weight:900;">Container Math render error: ${esc(msg)}</div>`;
+        }
+        if (dbgPre) {
+          dbgPre.textContent = `Container Math render error: ${msg}\n${String(e?.stack || "")}`.trim();
+        }
+      } catch (_) {}
     }
 
 
