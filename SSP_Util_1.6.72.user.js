@@ -9286,6 +9286,15 @@ if (chip) {
       u.searchParams.set("endHourIntraday", String(intraday.endHour));
       u.searchParams.set("endMinuteIntraday", String(intraday.endMinute));
 
+      dlog("CPH_FCLM_URL", {
+        warehouseId: String(warehouseId),
+        shiftWindow: {
+          startMs: Number(w?.startMs || 0),
+          endMs: Number(w?.endMs || 0),
+        },
+        url: String(u),
+      });
+
       const p = gmFetch(String(u), { method: "GET", credentials: "include", cache: "no-cache" })
         .then(async (r) => {
           if (!r?.ok) {
