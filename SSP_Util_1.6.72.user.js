@@ -1035,7 +1035,11 @@ function getOpsWindow(nowMs = Date.now()) {
       _ibAvgSaveToStorage(result);
       return result;
     } catch (e) {
-      setLastError("refreshInboundRouteAverages", e);
+      if (typeof setLastError === "function") {
+        setLastError("refreshInboundRouteAverages", e);
+      } else {
+        console.error("[SSP UTIL ERROR] refreshInboundRouteAverages", e);
+      }
       return null;
     }
   }
@@ -9242,13 +9246,6 @@ if (chip) {
     return `${mm}/${dd}/${yy}`;
   }
 
-  function _fmtYyyyMmDdLocal(ts) {
-    const d = new Date(ts);
-    const yyyy = String(d.getFullYear());
-    const mm = String(d.getMonth() + 1).padStart(2, "0");
-    const dd = String(d.getDate()).padStart(2, "0");
-    return `${yyyy}/${mm}/${dd}`;
-  }
 
   function _toFclmIntradayWindow(w) {
     if (!w || !Number.isFinite(w.startMs) || !Number.isFinite(w.endMs)) return null;
