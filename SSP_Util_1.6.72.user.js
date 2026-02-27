@@ -12251,6 +12251,68 @@ function renderPlanningPanel() {
         // Staffing call
         const hcTotal = (hc_cut_total != null) ? hc_cut_total : null;
 
+        // Current shift throughput strip (containers/HC) for flush at-a-glance display.
+        let shiftNameNow = "—";
+        let shiftWindowTxt = "—";
+        let processedShiftC = null;
+        let elapsedShiftHrs = null;
+        let localShiftCph = null;
+        let effectiveShiftCph = null;
+        let effectiveShiftCphSource = "local";
+        let shiftDueC = null;
+        let shiftHcNow = null;
+        try {
+          if (typeof _getShiftContext === "function" && typeof _shiftToWindowMs === "function") {
+            const ctxNow = _getShiftContext(nowMs);
+            const chosenNow = ctxNow && ctxNow.activeOrUpcoming;
+            const baseNow = ctxNow && ctxNow.baseDay0Ms;
+            const wNow = chosenNow ? _shiftToWindowMs(chosenNow, baseNow) : null;
+            if (chosenNow && wNow && Number.isFinite(wNow.startMs) && Number.isFinite(wNow.endMs)) {
+              shiftNameNow = String(chosenNow.name || "Shift");
+              shiftWindowTxt = `${fmtTime(wNow.startMs)}→${fmtTime(wNow.endMs)}`;
+              const nowForShift = Math.min(nowMs, wNow.endMs);
+              let procC = 0;
+              for (const l of (STATE?.inboundLoads || [])) {
+                const done = String(l?.status || l?.loadStatus || "").toUpperCase().trim() === "COMPLETED";
+                if (!done) continue;
+                const at = (typeof _parseInboundTs === "function") ? _parseInboundTs(l?.actualArrivalTime) : null;
+                if (at == null || at < wNow.startMs || at > nowForShift) continue;
+                const c = (typeof _getLoadContainerCount === "function") ? Number(_getLoadContainerCount(l)) : 0;
+                if (Number.isFinite(c) && c > 0) procC += c;
+              }
+              processedShiftC = procC;
+              elapsedShiftHrs = Math.max(0.0001, (nowForShift - wNow.startMs) / 3600000);
+              localShiftCph = procC / elapsedShiftHrs;
+              effectiveShiftCph = localShiftCph;
+
+              const ppa = STATE?.fclmPpa || null;
+              if (ppa && Number.isFinite(Number(ppa.crossdockUph))) {
+                effectiveShiftCph = Number(ppa.crossdockUph);
+                effectiveShiftCphSource = "fclm";
+              }
+
+              // due<=shiftEnd C and HC_now in this exact shift window
+              let dueCNow = 0;
+              for (const l of (STATE?.inboundLoads || [])) {
+                const done = String(l?.status || l?.loadStatus || "").toUpperCase().trim() === "COMPLETED";
+                if (done) continue;
+                const t = (typeof _getLoadTimeForPlanning === "function") ? Number(_getLoadTimeForPlanning(l)) : 0;
+                if (!Number.isFinite(t) || t <= 0) continue;
+                if (t < nowMs || t >= wNow.endMs) continue;
+                const c = (typeof _getLoadContainerCount === "function") ? Number(_getLoadContainerCount(l)) : 0;
+                if (Number.isFinite(c) && c > 0) dueCNow += c;
+              }
+              shiftDueC = dueCNow;
+              const tCph = Number(SHIFT_SETTINGS?.targetCph);
+              if (!(wNow.endMs > nowMs)) shiftHcNow = 0;
+              else if (Number.isFinite(tCph) && tCph > 0) {
+                const hrsRemain = Math.max(0.0001, (wNow.endMs - nowMs) / 3600000);
+                shiftHcNow = Math.max(0, Math.ceil(dueCNow / (hrsRemain * tCph)));
+              }
+            }
+          }
+        } catch (_) {}
+
         // Badge severity
         if (mathBadge) {
           let sev = "STAFFING";
@@ -12277,6 +12339,27 @@ function renderPlanningPanel() {
         `;
 
         const kv = (k,v) => `<div style="display:flex;justify-content:space-between;gap:10px;"><div style="color:#cbd5e1;font-weight:800;">${k}</div><div style="color:#ffffff;font-weight:900;">${v}</div></div>`;
+
+        const flushCell = (label, value, sub="") => `
+          <div style="min-width:150px;flex:1;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:8px;background:rgba(255,255,255,.03);">
+            <div style="color:#93c5fd;font-size:10px;font-weight:900;letter-spacing:.35px;text-transform:uppercase;">${label}</div>
+            <div style="color:#fff;font-size:20px;font-weight:1000;line-height:1.1;margin-top:3px;">${value}</div>
+            ${sub ? `<div style="color:#cbd5e1;font-size:11px;font-weight:800;margin-top:4px;">${sub}</div>` : ""}
+          </div>
+        `;
+
+        const throughputFlush = card(
+          "Current Shift Throughput (Containers)",
+          `
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              ${flushCell("Shift", shiftNameNow, shiftWindowTxt)}
+              ${flushCell("Shift CPH", (effectiveShiftCph == null ? "—" : Number(effectiveShiftCph).toFixed(1)), effectiveShiftCphSource === "fclm" ? "Source: FCLM Crossdock UPH" : `Local: ${localShiftCph == null ? "—" : Number(localShiftCph).toFixed(1)}`)}
+              ${flushCell("Processed C", processedShiftC == null ? "—" : fmtInt(processedShiftC), elapsedShiftHrs == null ? "" : `${elapsedShiftHrs.toFixed(2)} hrs elapsed`)}
+              ${flushCell("Due C now→end", shiftDueC == null ? "—" : fmtInt(shiftDueC), shiftHcNow == null ? "HC now: —" : `HC now: ${fmtInt(shiftHcNow)}`)}
+            </div>
+          `,
+          `Target: ${targetCph} CPH`
+        );
 
         const progressBar = (p) => {
           if (p == null) return "";
@@ -12310,6 +12393,7 @@ function renderPlanningPanel() {
 
         // Build UI
         let html = "";
+        html += throughputFlush;
         const shiftSummary = (typeof _getShiftSummary === "function") ? _getShiftSummary() : null;
         const plannedHc = (shiftSummary && shiftSummary.ok && Number.isFinite(Number(shiftSummary.staffed))) ? Number(shiftSummary.staffed) : null;
         const recHc = (hcTotal != null) ? Number(hcTotal) : ((shiftSummary && shiftSummary.ok && Number.isFinite(Number(shiftSummary.neededNow))) ? Number(shiftSummary.neededNow) : null);
