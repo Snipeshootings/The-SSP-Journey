@@ -875,6 +875,176 @@ function getOpsWindow(nowMs = Date.now()) {
   return { startMs: start.getTime(), endMs: end.getTime() };
 }
   // =====================================================
+  // Inbound Dock Mgmt Route Averages (Completed Loads)
+  // - Used to estimate containers/packages for scheduled loads that are still unmanifested upstream (0 cntrs)
+  // - Refresh cadence: once per day (manual force refresh supported)
+  // =====================================================
+  const IB_AVG = {
+    storageKey: () => `ssp2_ibRouteAvg_v1:${String(STATE.nodeId||"").trim() || "UNKNOWN"}`,
+    maxAgeMs: 24 * 60 * 60 * 1000,
+    lookbackDays: 14,
+  };
+
+  function _ibAvgLoadFromStorage() {
+    try {
+      const raw = localStorage.getItem(IB_AVG.storageKey());
+      if (!raw) return null;
+      const obj = JSON.parse(raw);
+      if (!obj || typeof obj !== "object") return null;
+      if (!obj.ts || (Date.now() - obj.ts) > (IB_AVG.maxAgeMs * 7)) return null; // hard expire after 7 days
+      return obj;
+    } catch { return null; }
+  }
+
+  function _ibAvgSaveToStorage(obj) {
+    try {
+      localStorage.setItem(IB_AVG.storageKey(), JSON.stringify(obj));
+    } catch {}
+  }
+
+  function _ibAvgGet(route, equipShortName) {
+    try {
+      const cache = STATE.ibRouteAvg || _ibAvgLoadFromStorage();
+      if (!cache || !cache.routes) return null;
+      const routeKey = String(route || "").trim();
+      const eKey = String(equipShortName||"").trim() || "__all";
+      const routeBuckets = routeKey ? cache.routes[routeKey] : null;
+      const globalBuckets = cache.routes.__GLOBAL__ || null;
+      if (routeBuckets) return routeBuckets[eKey] || routeBuckets.__all || (globalBuckets ? (globalBuckets[eKey] || globalBuckets.__all || null) : null);
+      return globalBuckets ? (globalBuckets[eKey] || globalBuckets.__all || null) : null;
+    } catch { return null; }
+  }
+
+  function _ibAvgIsStale() {
+    const cache = STATE.ibRouteAvg || _ibAvgLoadFromStorage();
+    if (!cache || !cache.ts) return true;
+    return (Date.now() - cache.ts) > IB_AVG.maxAgeMs;
+  }
+
+  async function refreshInboundRouteAverages({ force=false } = {}) {
+    try {
+      if (!force && !_ibAvgIsStale()) return STATE.ibRouteAvg || _ibAvgLoadFromStorage();
+
+      const nodeId = String(STATE.nodeId||"").trim();
+      if (!nodeId) return null;
+
+      // 1) Pull completed loads for lookback window
+      const now = Date.now();
+      const endDate = now;
+      const startDate = now - (IB_AVG.lookbackDays * 24 * 60 * 60 * 1000);
+
+      const viewResp = await postFetch(
+        "/ssp/dock/hrz/ib/fetchdata?",
+        {
+          entity: "getInboundDockView",
+          nodeId,
+          startDate,
+          endDate,
+          loadCategories: "inboundCompleted",
+          shippingPurposeType: "TRANSSHIPMENT,NON-TRANSSHIPMENT,SHIP_WITH_AMAZON",
+        },
+        "IB getInboundDockView (avg)",
+        { priority: 0 }
+      );
+
+      const view = getAaData(viewResp, "IB getInboundDockView (avg)") || {};
+      const loads = Array.isArray(view?.loads) ? view.loads
+                  : Array.isArray(view?.inboundLoads) ? view.inboundLoads
+                  : Array.isArray(view?.data) ? view.data
+                  : Array.isArray(view?.rows) ? view.rows
+                  : [];
+
+      // Build id -> meta map (route/equip)
+      const idMeta = new Map();
+      for (const row of loads) {
+        const id = row?.inboundLoadId || row?.loadId || row?.id;
+        if (!id) continue;
+        const sortRoute = row?.sortRoute || row?.route || row?.sortroute || row?.sort_route;
+        const equip = row?.equipment || row?.equipmentType || row?.equipment_type;
+        idMeta.set(String(id), {
+          sortRoute: String(sortRoute||"").trim(),
+          equipShort: equipShort(equip),
+        });
+      }
+
+      const inboundLoadIds = Array.from(idMeta.keys());
+      if (!inboundLoadIds.length) {
+        const empty = { ts: Date.now(), nodeId, routes: {} };
+        STATE.ibRouteAvg = empty;
+        _ibAvgSaveToStorage(empty);
+        return empty;
+      }
+
+      // 2) Bulk container count for those loads
+      const ccResp = await postFetch(
+        "/ssp/dock/hrz/ib/fetchdata?",
+        { entity: "getInboundContainerCount", inboundLoadIds: inboundLoadIds.join(","), nodeId },
+        "IB getInboundContainerCount (avg)",
+        { priority: 0, cacheTtlMs: 5 * 60 * 1000 }
+      );
+      const cc = getAaData(ccResp, "IB getInboundContainerCount (avg)") || {};
+      const ccMap = cc?.inboundContainerCount || cc?.data || cc;
+
+      // 3) Aggregate averages: route -> equipShort -> {avgC, avgP, n}
+      const agg = {};
+      function push(route, equipS, c, p) {
+        if (!route) return;
+        agg[route] = agg[route] || {};
+        const bucket = agg[route][equipS] = agg[route][equipS] || { n: 0, sumC: 0, sumP: 0 };
+        bucket.n += 1;
+        bucket.sumC += (Number(c) || 0);
+        bucket.sumP += (Number(p) || 0);
+      }
+
+      for (const id of inboundLoadIds) {
+        const meta = idMeta.get(String(id)) || {};
+        const route = meta.sortRoute || "";
+        if (!route) continue;
+
+        const rec = ccMap?.[id] || ccMap?.[String(id)] || null;
+        const total = rec?.totalCount || rec?.total || rec?.totalcount || null;
+        const c = total?.C ?? total?.c ?? rec?.totalContainers ?? rec?.containers ?? rec?.C ?? rec?.c ?? 0;
+        const p = total?.P ?? total?.p ?? rec?.totalPackages ?? rec?.packages ?? rec?.P ?? rec?.p ?? 0;
+        const equipS = meta.equipShort || "__all";
+
+        // Include only loads with nonzero containers to avoid poisoning averages with unmanifested data
+        if ((Number(c) || 0) > 0) {
+          push(route, equipS, c, p);
+          push(route, "__all", c, p);
+          push("__GLOBAL__", equipS, c, p);
+          push("__GLOBAL__", "__all", c, p);
+        }
+      }
+
+      const routesOut = {};
+      for (const [route, byEquip] of Object.entries(agg)) {
+        routesOut[route] = {};
+        for (const [equipS, b] of Object.entries(byEquip)) {
+          const n = b.n || 0;
+          if (!n) continue;
+          routesOut[route][equipS] = {
+            n,
+            avgC: (b.sumC / n),
+            avgP: (b.sumP / n),
+          };
+        }
+      }
+
+      const result = { ts: Date.now(), nodeId, routes: routesOut, lookbackDays: IB_AVG.lookbackDays };
+      STATE.ibRouteAvg = result;
+      _ibAvgSaveToStorage(result);
+      return result;
+    } catch (e) {
+      if (typeof setLastError === "function") {
+        setLastError("refreshInboundRouteAverages", e);
+      } else {
+        console.error("[SSP UTIL ERROR] refreshInboundRouteAverages", e);
+      }
+      return null;
+    }
+  }
+
+  // =====================================================
   // CSV-Based Inbound Estimation (from 2-week historical export)
   // - Allows importing two-week SSP inbound export CSV for better statistical estimates
   // - Calculates averages by route, load type, and equipment
