@@ -875,172 +875,6 @@ function getOpsWindow(nowMs = Date.now()) {
   return { startMs: start.getTime(), endMs: end.getTime() };
 }
   // =====================================================
-  // Inbound Dock Mgmt Route Averages (Completed Loads)
-  // - Used to estimate containers/packages for scheduled loads that are still unmanifested upstream (0 cntrs)
-  // - Refresh cadence: once per day (manual force refresh supported)
-  // =====================================================
-  const IB_AVG = {
-    storageKey: () => `ssp2_ibRouteAvg_v1:${String(STATE.nodeId||"").trim() || "UNKNOWN"}`,
-    maxAgeMs: 24 * 60 * 60 * 1000,
-    lookbackDays: 14,
-  };
-
-  function _ibAvgLoadFromStorage() {
-    try {
-      const raw = localStorage.getItem(IB_AVG.storageKey());
-      if (!raw) return null;
-      const obj = JSON.parse(raw);
-      if (!obj || typeof obj !== "object") return null;
-      if (!obj.ts || (Date.now() - obj.ts) > (IB_AVG.maxAgeMs * 7)) return null; // hard expire after 7 days
-      return obj;
-    } catch { return null; }
-  }
-
-  function _ibAvgSaveToStorage(obj) {
-    try {
-      localStorage.setItem(IB_AVG.storageKey(), JSON.stringify(obj));
-    } catch {}
-  }
-
-  function _ibAvgGet(route, equipShortName) {
-    try {
-      const cache = STATE.ibRouteAvg || _ibAvgLoadFromStorage();
-      if (!cache || !cache.routes) return null;
-      const routeKey = String(route || "").trim();
-      const eKey = String(equipShortName||"").trim() || "__all";
-      const routeBuckets = routeKey ? cache.routes[routeKey] : null;
-      const globalBuckets = cache.routes.__GLOBAL__ || null;
-      if (routeBuckets) return routeBuckets[eKey] || routeBuckets.__all || (globalBuckets ? (globalBuckets[eKey] || globalBuckets.__all || null) : null);
-      return globalBuckets ? (globalBuckets[eKey] || globalBuckets.__all || null) : null;
-    } catch { return null; }
-  }
-
-  function _ibAvgIsStale() {
-    const cache = STATE.ibRouteAvg || _ibAvgLoadFromStorage();
-    if (!cache || !cache.ts) return true;
-    return (Date.now() - cache.ts) > IB_AVG.maxAgeMs;
-  }
-
-  async function refreshInboundRouteAverages({ force=false } = {}) {
-    try {
-      if (!force && !_ibAvgIsStale()) return STATE.ibRouteAvg || _ibAvgLoadFromStorage();
-
-      const nodeId = String(STATE.nodeId||"").trim();
-      if (!nodeId) return null;
-
-      // 1) Pull completed loads for lookback window
-      const now = Date.now();
-      const endDate = now;
-      const startDate = now - (IB_AVG.lookbackDays * 24 * 60 * 60 * 1000);
-
-      const viewResp = await postFetch(
-        "/ssp/dock/hrz/ib/fetchdata?",
-        {
-          entity: "getInboundDockView",
-          nodeId,
-          startDate,
-          endDate,
-          loadCategories: "inboundCompleted",
-          shippingPurposeType: "TRANSSHIPMENT,NON-TRANSSHIPMENT,SHIP_WITH_AMAZON",
-        },
-        "IB getInboundDockView (avg)",
-        { priority: 0 }
-      );
-
-      const view = getAaData(viewResp, "IB getInboundDockView (avg)") || {};
-      const loads = Array.isArray(view?.loads) ? view.loads
-                  : Array.isArray(view?.inboundLoads) ? view.inboundLoads
-                  : Array.isArray(view?.data) ? view.data
-                  : Array.isArray(view?.rows) ? view.rows
-                  : [];
-
-      // Build id -> meta map (route/equip)
-      const idMeta = new Map();
-      for (const row of loads) {
-        const id = row?.inboundLoadId || row?.loadId || row?.id;
-        if (!id) continue;
-        const sortRoute = row?.sortRoute || row?.route || row?.sortroute || row?.sort_route;
-        const equip = row?.equipment || row?.equipmentType || row?.equipment_type;
-        idMeta.set(String(id), {
-          sortRoute: String(sortRoute||"").trim(),
-          equipShort: equipShort(equip),
-        });
-      }
-
-      const inboundLoadIds = Array.from(idMeta.keys());
-      if (!inboundLoadIds.length) {
-        const empty = { ts: Date.now(), nodeId, routes: {} };
-        STATE.ibRouteAvg = empty;
-        _ibAvgSaveToStorage(empty);
-        return empty;
-      }
-
-      // 2) Bulk container count for those loads
-      const ccResp = await postFetch(
-        "/ssp/dock/hrz/ib/fetchdata?",
-        { entity: "getInboundContainerCount", inboundLoadIds: inboundLoadIds.join(","), nodeId },
-        "IB getInboundContainerCount (avg)",
-        { priority: 0, cacheTtlMs: 5 * 60 * 1000 }
-      );
-      const cc = getAaData(ccResp, "IB getInboundContainerCount (avg)") || {};
-      const ccMap = cc?.inboundContainerCount || cc?.data || cc;
-
-      // 3) Aggregate averages: route -> equipShort -> {avgC, avgP, n}
-      const agg = {};
-      function push(route, equipS, c, p) {
-        if (!route) return;
-        agg[route] = agg[route] || {};
-        const bucket = agg[route][equipS] = agg[route][equipS] || { n: 0, sumC: 0, sumP: 0 };
-        bucket.n += 1;
-        bucket.sumC += (Number(c) || 0);
-        bucket.sumP += (Number(p) || 0);
-      }
-
-      for (const id of inboundLoadIds) {
-        const meta = idMeta.get(String(id)) || {};
-        const route = meta.sortRoute || "";
-        if (!route) continue;
-
-        const rec = ccMap?.[id] || ccMap?.[String(id)] || null;
-        const total = rec?.totalCount || rec?.total || rec?.totalcount || null;
-        const c = total?.C ?? total?.c ?? rec?.totalContainers ?? rec?.containers ?? rec?.C ?? rec?.c ?? 0;
-        const p = total?.P ?? total?.p ?? rec?.totalPackages ?? rec?.packages ?? rec?.P ?? rec?.p ?? 0;
-        const equipS = meta.equipShort || "__all";
-
-        // Include only loads with nonzero containers to avoid poisoning averages with unmanifested data
-        if ((Number(c) || 0) > 0) {
-          push(route, equipS, c, p);
-          push(route, "__all", c, p);
-          push("__GLOBAL__", equipS, c, p);
-          push("__GLOBAL__", "__all", c, p);
-        }
-      }
-
-      const routesOut = {};
-      for (const [route, byEquip] of Object.entries(agg)) {
-        routesOut[route] = {};
-        for (const [equipS, b] of Object.entries(byEquip)) {
-          const n = b.n || 0;
-          if (!n) continue;
-          routesOut[route][equipS] = {
-            n,
-            avgC: (b.sumC / n),
-            avgP: (b.sumP / n),
-          };
-        }
-      }
-
-      const result = { ts: Date.now(), nodeId, routes: routesOut, lookbackDays: IB_AVG.lookbackDays };
-      STATE.ibRouteAvg = result;
-      _ibAvgSaveToStorage(result);
-      return result;
-    } catch (e) {
-      setLastError("refreshInboundRouteAverages", e);
-      return null;
-    }
-  }
-
-  // =====================================================
   // CSV-Based Inbound Estimation (from 2-week historical export)
   // - Allows importing two-week SSP inbound export CSV for better statistical estimates
   // - Calculates averages by route, load type, and equipment
@@ -1293,9 +1127,6 @@ function getOpsWindow(nowMs = Date.now()) {
         addSample(`${sortRoute}::${loadType}::${equipShort}`, totalC, totalP);
         addSample(`${sortRoute}::__all::${equipShort}`, totalC, totalP);
         addSample(`${sortRoute}::__all::__all`, totalC, totalP);
-        addSample(`__GLOBAL__::${loadType}::${equipShort}`, totalC, totalP);
-        addSample(`__GLOBAL__::__all::${equipShort}`, totalC, totalP);
-        addSample(`__GLOBAL__::__all::__all`, totalC, totalP);
       }
 
       const estimates = {};
@@ -1424,14 +1255,11 @@ function getOpsWindow(nowMs = Date.now()) {
   } catch (_) {}
 
   /**
-   * Get estimate for a load using CSV-based statistics (with fallback to route averages).
+   * Get estimate for a load using CSV-based route statistics only.
    * Lookup order:
    * route::loadType::equipment ->
    * route::__all::equipment ->
-   * route::__all::__all ->
-   * __GLOBAL__::loadType::equipment ->
-   * __GLOBAL__::__all::equipment ->
-   * __GLOBAL__::__all::__all
+   * route::__all::__all
    */
   function _ibCsvEstGet(sortRoute, loadType, equipment) {
     try {
@@ -1456,18 +1284,6 @@ function getOpsWindow(nowMs = Date.now()) {
       // Fall back to route::__all::__all
       const key3 = `${sr}::__all::__all`;
       if (est[key3]) return est[key3];
-
-      // Fall back to global loadType + equipment
-      const key4 = `__GLOBAL__::${lt}::${equipShort}`;
-      if (est[key4]) return est[key4];
-
-      // Fall back to global __all + equipment
-      const key5 = `__GLOBAL__::__all::${equipShort}`;
-      if (est[key5]) return est[key5];
-
-      // Fall back to global __all + __all
-      const key6 = `__GLOBAL__::__all::__all`;
-      if (est[key6]) return est[key6];
 
       return null;
     } catch { return null; }
@@ -1494,22 +1310,11 @@ function getOpsWindow(nowMs = Date.now()) {
       };
     }
 
-    // Fall back to route averages from dock view
-    let equipBucket = "__all";
-    try {
-      equipBucket = typeof equipShort === "function"
-        ? equipShort(equipmentType)
-        : (equipmentType && equipmentType.match(/\d{2}/)?.[0]) || "__all";
-    } catch {
-      equipBucket = (equipmentType && equipmentType.match(/\d{2}/)?.[0]) || "__all";
-    }
-
-    const avg = _ibAvgGet(sortRoute, equipBucket);
-    if (!avg) return null;
+    // CSV-only mode: if no route data was uploaded, keep unmanifested counts at zero.
     return {
-      estC: ceilPosInt(avg.avgC),
-      estP: ceilPosInt(avg.avgP),
-      source: `avg_${avg.n || 0}`,
+      estC: 0,
+      estP: 0,
+      source: "csv_none",
     };
   }
 
@@ -5372,10 +5177,6 @@ async function loadInbound() {
   const ibLookbackMs = 3 * 60 * 60 * 1000;
   const ibStart = startMs - ibLookbackMs;
   const ibEnd = endMs;                                    // treat as 07:00 cutoff anchor
-
-  // Refresh inbound route averages (daily) in background
-  try { refreshInboundRouteAverages({ force:false }); } catch (_) {}
-
 
   // Single generalized pull
   const resp = await postFetch(
@@ -9242,13 +9043,6 @@ if (chip) {
     return `${mm}/${dd}/${yy}`;
   }
 
-  function _fmtYyyyMmDdLocal(ts) {
-    const d = new Date(ts);
-    const yyyy = String(d.getFullYear());
-    const mm = String(d.getMonth() + 1).padStart(2, "0");
-    const dd = String(d.getDate()).padStart(2, "0");
-    return `${yyyy}/${mm}/${dd}`;
-  }
 
   function _toFclmIntradayWindow(w) {
     if (!w || !Number.isFinite(w.startMs) || !Number.isFinite(w.endMs)) return null;
@@ -9261,17 +9055,6 @@ if (chip) {
       endDate: _fmtMmDdYyLocal(w.endMs),
       endHour: e.getHours(),
       endMinute: e.getMinutes(),
-    };
-  }
-
-  function _toFclmDateAnchors(w) {
-    if (!w || !Number.isFinite(w.startMs)) return null;
-    const start = new Date(w.startMs);
-    const monthStart = new Date(start.getFullYear(), start.getMonth(), 1);
-    return {
-      startDateDay: _fmtYyyyMmDdLocal(w.startMs),
-      startDateWeek: _fmtYyyyMmDdLocal(w.startMs),
-      startDateMonth: _fmtYyyyMmDdLocal(monthStart.getTime()),
     };
   }
 
@@ -9306,20 +9089,6 @@ if (chip) {
     const idx1 = tables[1] ? parseChunkLayout(tables[1]) : null;
     if (idx1 && (idx1.crossdockUph != null || idx1.sortableUph != null)) return idx1;
 
-    // Fallback: scan for rows with labels containing "sortable" / "crossdock" and use last numeric col.
-    for (const t of tables) {
-      const rows = Array.from(t.querySelectorAll("tbody tr"));
-      for (const r of rows) {
-        const cells = Array.from(r.cells || []);
-        if (!cells.length) continue;
-        const txt = cells.map(c => String(c.innerText || "").trim()).join(" ").toLowerCase();
-        const nums = cells.map(c => _toNumFromText(c.innerText)).filter(n => n != null);
-        if (!nums.length) continue;
-        const v = nums[nums.length - 1];
-        if (txt.includes("sortable") && out.sortableUph == null) out.sortableUph = v;
-        if (txt.includes("crossdock") && out.crossdockUph == null) out.crossdockUph = v;
-      }
-    }
     return out;
   }
 
@@ -9334,16 +9103,12 @@ if (chip) {
       if (STATE.fclmPpaInflight) return STATE.fclmPpaInflight;
 
       const intraday = _toFclmIntradayWindow(w);
-      const anchors = _toFclmDateAnchors(w);
-      if (!intraday || !anchors) return null;
+      if (!intraday) return null;
       const u = new URL("https://fclm-portal.amazon.com/ppa/inspect/node");
       u.searchParams.set("nodeType", "SC");
       u.searchParams.set("warehouseId", String(warehouseId));
       u.searchParams.set("maxIntradayDays", "1");
       u.searchParams.set("spanType", "Intraday");
-      u.searchParams.set("startDateDay", anchors.startDateDay);
-      u.searchParams.set("startDateWeek", anchors.startDateWeek);
-      u.searchParams.set("startDateMonth", anchors.startDateMonth);
       u.searchParams.set("startDateIntraday", intraday.startDate);
       u.searchParams.set("startHourIntraday", String(intraday.startHour));
       u.searchParams.set("startMinuteIntraday", String(intraday.startMinute));
@@ -9532,8 +9297,8 @@ function _getLoadCountsForPlanningMath(l, opts = {}) {
         equipmentType: String(l?.equipmentType || l?.trailerEquipmentType || "").trim(),
         loadType: String(l?.shippingPurposeType || l?.loadType || l?.shippingPurpose || "").trim(),
       });
-      if (est && Number(est.estC) > 0) {
-        if (!(Number(C) > 0)) C = Number(est.estC);
+      if (est) {
+        if (!(Number(C) > 0) && Number.isFinite(Number(est.estC))) C = Number(est.estC);
         if (!(Number(P) > 0) && Number.isFinite(Number(est.estP))) P = Number(est.estP);
         source = String(est.source || "estimated");
       }
@@ -16733,10 +16498,10 @@ function _hhmmToMinutes(hhmm) {
         equipmentType: String(load?.equipmentType || load?.trailerEquipmentType || "").trim(),
         loadType: String(load?.shippingPurposeType || load?.loadType || load?.shippingPurpose || "").trim(),
       });
-      if (est && Number(est.estC) > 0) return Number(est.estC);
+      if (est && Number.isFinite(Number(est.estC)) && Number(est.estC) >= 0) return Number(est.estC);
     }
     if (resolved != null && resolved !== "" && Number.isFinite(Number(resolved)) && Number(resolved) >= 0) return Number(resolved);
-    return 1;
+    return 0;
   }
 
   function _requiredAAs(containers, targetCph, hours) {
