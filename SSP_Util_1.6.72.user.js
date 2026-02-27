@@ -9205,12 +9205,12 @@ if (chip) {
     );
   }
 
-  function _fmtMmDdYyLocal(ts) {
+  function _fmtYyyyMmDdLocal(ts) {
     const d = new Date(ts);
+    const yyyy = String(d.getFullYear());
     const mm = String(d.getMonth() + 1).padStart(2, "0");
     const dd = String(d.getDate()).padStart(2, "0");
-    const yy = String(d.getFullYear()).slice(-2);
-    return `${mm}/${dd}/${yy}`;
+    return `${yyyy}/${mm}/${dd}`;
   }
 
 
@@ -9219,10 +9219,10 @@ if (chip) {
     const s = new Date(w.startMs);
     const e = new Date(w.endMs);
     return {
-      startDate: _fmtMmDdYyLocal(w.startMs),
+      startDate: _fmtYyyyMmDdLocal(w.startMs),
       startHour: s.getHours(),
       startMinute: s.getMinutes(),
-      endDate: _fmtMmDdYyLocal(w.endMs),
+      endDate: _fmtYyyyMmDdLocal(w.endMs),
       endHour: e.getHours(),
       endMinute: e.getMinutes(),
     };
@@ -9277,6 +9277,9 @@ if (chip) {
       const u = new URL("https://fclm-portal.amazon.com/ppa/inspect/node");
       u.searchParams.set("nodeType", "SC");
       u.searchParams.set("warehouseId", String(warehouseId));
+      u.searchParams.set("startDateDay", intraday.startDate);
+      u.searchParams.set("startDateWeek", intraday.startDate);
+      u.searchParams.set("startDateMonth", `${intraday.startDate.slice(0, 8)}01`);
       u.searchParams.set("maxIntradayDays", "1");
       u.searchParams.set("spanType", "Intraday");
       u.searchParams.set("startDateIntraday", intraday.startDate);
@@ -9285,6 +9288,15 @@ if (chip) {
       u.searchParams.set("endDateIntraday", intraday.endDate);
       u.searchParams.set("endHourIntraday", String(intraday.endHour));
       u.searchParams.set("endMinuteIntraday", String(intraday.endMinute));
+
+      dlog("CPH_FCLM_URL", {
+        warehouseId: String(warehouseId),
+        shiftWindow: {
+          startMs: Number(w?.startMs || 0),
+          endMs: Number(w?.endMs || 0),
+        },
+        url: String(u),
+      });
 
       const p = gmFetch(String(u), { method: "GET", credentials: "include", cache: "no-cache" })
         .then(async (r) => {
