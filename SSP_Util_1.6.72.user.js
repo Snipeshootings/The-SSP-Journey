@@ -1495,7 +1495,16 @@ function getOpsWindow(nowMs = Date.now()) {
     }
 
     // Fall back to route averages from dock view
-    const avg = _ibAvgGet(sortRoute, equipShort(equipmentType));
+    let equipBucket = "__all";
+    try {
+      equipBucket = typeof equipShort === "function"
+        ? equipShort(equipmentType)
+        : (equipmentType && equipmentType.match(/\d{2}/)?.[0]) || "__all";
+    } catch {
+      equipBucket = (equipmentType && equipmentType.match(/\d{2}/)?.[0]) || "__all";
+    }
+
+    const avg = _ibAvgGet(sortRoute, equipBucket);
     if (!avg) return null;
     return {
       estC: ceilPosInt(avg.avgC),
