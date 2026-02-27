@@ -11454,13 +11454,23 @@ document.body.appendChild(p);
         const statusBucket = (st) => isInFacility(st) ? "ON_DOOR" : (isTransit(st) ? "ON_SCHEDULE" : "OTHER");
 
         const getCounts = (l) => {
-          const planId = String(l?.planId || "").trim();
-          const m = planId ? (STATE?.ibContainerCount?.[planId]) : null;
-          const it = m?.inTrailerCount || {};
-          const C = (typeof it?.C === "number") ? it.C : 0;
-          const P = (typeof it?.P === "number") ? it.P : 0;
-          const missing = (!m || (!it || (typeof it?.C !== "number" && typeof it?.P !== "number")));
-          return { C, P, missing };
+          const projected = _getLoadCountsForPlanningMath(l, { allowEstimate: true });
+          const Cn = Number(projected?.C);
+          const Pn = Number(projected?.P);
+          const C = Number.isFinite(Cn) ? Cn : 0;
+          const P = Number.isFinite(Pn) ? Pn : 0;
+
+          const src = String(projected?.source || "").trim().toLowerCase();
+          const hasManifest = src === "manifest";
+          const hasEstimate = src === "estimated" || src.startsWith("csv_") || src.startsWith("avg_");
+          const missing = !(hasManifest || hasEstimate);
+
+          return {
+            C,
+            P,
+            missing,
+            countSource: src || "unknown",
+          };
         };
 
         // Build responsibility buckets (gap-safe: bucket starts at previous bucket end)
@@ -11510,14 +11520,15 @@ document.body.appendChild(p);
 
           const hb = hourBucket(t);
           const sb = statusBucket(l?.status || l?.loadStatus);
-          const { C, P, missing } = getCounts(l);
+          const { C, P, missing, countSource } = getCounts(l);
 
           const k = `${shiftName}||${hb}||${sb}`;
-          const r = agg.get(k) || { shift: shiftName, hourBucket: hb, statusBucket: sb, loads: 0, carts: 0, packages: 0, missingCounts: 0, disruptedVrids: [] };
+          const r = agg.get(k) || { shift: shiftName, hourBucket: hb, statusBucket: sb, loads: 0, carts: 0, packages: 0, missingCounts: 0, disruptedVrids: [], countSource: {} };
           r.loads += 1;
           r.carts += (C || 0);
           r.packages += (P || 0);
           if (missing) r.missingCounts += 1;
+          r.countSource[countSource] = (Number(r.countSource[countSource]) || 0) + 1;
 
           // Check for disruptions for this load
           const lane = String(l?.route || l?.lane || "");
@@ -11539,11 +11550,14 @@ document.body.appendChild(p);
         const byHour = new Map(); // shift||hour -> total row
         for (const r of rows) {
           const hk = `${r.shift}||${r.hourBucket}`;
-          const t = byHour.get(hk) || { shift: r.shift, hourBucket: r.hourBucket, statusBucket: 'SUM_HOUR', loads: 0, carts: 0, packages: 0, missingCounts: 0, disruptedVrids: [] };
+          const t = byHour.get(hk) || { shift: r.shift, hourBucket: r.hourBucket, statusBucket: 'SUM_HOUR', loads: 0, carts: 0, packages: 0, missingCounts: 0, disruptedVrids: [], countSource: {} };
           t.loads += Number(r.loads || 0);
           t.carts += Number(r.carts || 0);
           t.packages += Number(r.packages || 0);
           t.missingCounts += Number(r.missingCounts || 0);
+          for (const [src, n] of Object.entries(r.countSource || {})) {
+            t.countSource[src] = (Number(t.countSource[src]) || 0) + Number(n || 0);
+          }
           // Aggregate disrupted VRIDs across status buckets for this hour
           for (const vrid of (r.disruptedVrids || [])) {
             if (!t.disruptedVrids.includes(vrid)) {
