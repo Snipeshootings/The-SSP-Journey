@@ -8277,6 +8277,13 @@ function renderPanel() {
       let shiftCphNow = null;
       let hcNeedNow = null;
       let shiftCphSource = "local";
+      let shiftProcessedC = null;
+      let shiftDueC = null;
+      let shiftHoursRemaining = null;
+      let effectiveShiftCph = null;
+      let shiftHcNow = null;
+      let targetCph = Number(SHIFT_SETTINGS?.targetCph);
+      const cutoffHcNow = Number.isFinite(Number(STATE?.staffing?.hcTotal)) ? Number(STATE.staffing.hcTotal) : null;
 
       try {
         if (typeof _getShiftContext === "function" && typeof _shiftToWindowMs === "function") {
@@ -8325,14 +8332,20 @@ function renderPanel() {
             // Local computed Shift CPH fallback.
             const elapsedHrs = Math.max(0.0001, (nowForShift - w.startMs) / 3600000);
             shiftCphNow = processedC / elapsedHrs;
+            effectiveShiftCph = shiftCphNow;
+            shiftProcessedC = processedC;
+            shiftDueC = dueC;
 
             // HC need now->shift end (containers / (hrsRemaining * targetCPH)).
-            const targetCph = Number(SHIFT_SETTINGS?.targetCph);
             if (!(w.endMs > nowMs)) {
               hcNeedNow = 0;
+              shiftHcNow = 0;
+              shiftHoursRemaining = 0;
             } else if (Number.isFinite(targetCph) && targetCph > 0) {
               const hrsRemaining = Math.max(0.0001, (w.endMs - nowMs) / 3600000);
               hcNeedNow = Math.max(0, Math.ceil(dueC / (hrsRemaining * targetCph)));
+              shiftHcNow = hcNeedNow;
+              shiftHoursRemaining = hrsRemaining;
             }
 
             // FCLM PPA Shift CPH (Crossdock UPH) preferred when available.
@@ -8342,6 +8355,7 @@ function renderPanel() {
               const ppa = STATE?.fclmPpa || null;
               if (ppa && Number.isFinite(Number(ppa.crossdockUph))) {
                 shiftCphNow = Number(ppa.crossdockUph);
+                effectiveShiftCph = shiftCphNow;
                 shiftCphSource = "fclm";
               }
             }
@@ -8389,18 +8403,29 @@ function renderPanel() {
         // Hybrid HC view: recommendation + live need now.
         const hcRec = Number.isFinite(Number(sh.neededNow)) ? Number(sh.neededNow) : 0;
         const hcPlan = Number.isFinite(Number(sh.staffed)) ? Number(sh.staffed) : 0;
-        pushPart(`HC Rec: ${hcRec}`, `<span><b>HC Rec:</b> ${hcRec}</span>`);
-
         const d = Number.isFinite(Number(sh.deltaNeed)) ? Number(sh.deltaNeed) : (hcRec - hcPlan);
         pushHoverPart(`Need Δ (HC Rec - HC Plan): ${formatDelta(d)} (HC Plan: ${hcPlan})`);
 
-        const cphTxt = Number.isFinite(Number(shiftCphNow)) ? Number(shiftCphNow).toFixed(1) : "—";
-        const cphLbl = shiftCphSource === "fclm" ? "Shift CPH*" : "Shift CPH";
+        const staffingMathPayload = encodeURIComponent(JSON.stringify({
+          processedC: Number.isFinite(Number(shiftProcessedC)) ? Math.round(Number(shiftProcessedC)).toLocaleString() : "—",
+          shiftDueC: Number.isFinite(Number(shiftDueC)) ? Math.round(Number(shiftDueC)).toLocaleString() : "—",
+          hoursRemaining: Number.isFinite(Number(shiftHoursRemaining)) ? Number(shiftHoursRemaining).toFixed(2) : "—",
+          targetCph: Number.isFinite(Number(targetCph)) ? Number(targetCph).toFixed(1) : "—",
+          hcNow: Number.isFinite(Number(shiftHcNow)) ? String(Math.max(0, Number(shiftHcNow))) : "—",
+          cutoffHc: Number.isFinite(Number(cutoffHcNow)) ? String(Math.max(0, Number(cutoffHcNow))) : ""
+        }));
+        const makeStaffingLabel = (label, value, tip = "") => {
+          const tipAttr = tip ? ` title="${escapeHtml(tip)}"` : "";
+          return `<span data-staffing-popover="1" data-staffing-math="${staffingMathPayload}" role="button" tabindex="0"${tipAttr} style="display:inline-flex;align-items:center;gap:3px;cursor:help;"><b>${label}:</b> ${value}</span>`;
+        };
+
+        const cphTxt = Number.isFinite(Number(effectiveShiftCph)) ? Number(effectiveShiftCph).toFixed(1) : "—";
         const cphTip = shiftCphSource === "fclm" ? "FCLM PPA Crossdock UPH" : "Local shift-to-now containers/hour";
-        pushPart(`${cphLbl}: ${cphTxt}`, `<span title="${cphTip}"><b>${cphLbl}:</b> ${cphTxt}</span>`);
+        pushPart(`Shift CPH: ${cphTxt}`, makeStaffingLabel("Shift CPH", cphTxt, cphTip));
 
         const hcNowTxt = Number.isFinite(Number(hcNeedNow)) ? String(Math.max(0, Number(hcNeedNow))) : "—";
-        pushPart(`HC need: ${hcNowTxt}`, `<span><b>HC need:</b> ${hcNowTxt}</span>`);
+        pushPart(`Headcount Need: ${hcNowTxt}`, makeStaffingLabel("Headcount Need", hcNowTxt));
+        pushPart(`Headcount Recommendation: ${hcRec}`, makeStaffingLabel("Headcount Recommendation", String(hcRec)));
       }
 
       pushPart(`Selected VRIDs: ${STATE.bulkSelection.size}`, `<span><b>Selected VRIDs:</b> ${STATE.bulkSelection.size}</span>`);
@@ -8439,6 +8464,7 @@ function renderPanel() {
       if (hs && s && typeof s.textContent === "string") {
         hs.innerHTML = (s.dataset && s.dataset.statusHeaderHtml) ? s.dataset.statusHeaderHtml : (s.textContent || "").replace(/\s*\n\s*/g, " | ").trim();
         hs.title = (s.dataset && s.dataset.statusHoverPlain) ? s.dataset.statusHoverPlain : ((s.dataset && s.dataset.statusPlain) ? s.dataset.statusPlain : (s.textContent || ""));
+        try { _bindStaffingMathPopover(hs); } catch (_) {}
         // hide in-panel status block (requested: move to header)
         s.style.display = "none";
         const hn = document.getElementById("ssp2-h-node");
@@ -11633,6 +11659,127 @@ function _getInboundLoadIdForHierarchy(l) {
   } catch {
     return "";
   }
+}
+
+function _ensureStaffingMathPopover() {
+  let pop = document.getElementById("ssp2-staffing-math-popover");
+  if (pop) return pop;
+
+  pop = document.createElement("div");
+  pop.id = "ssp2-staffing-math-popover";
+  pop.style.position = "fixed";
+  pop.style.zIndex = "999999";
+  pop.style.minWidth = "260px";
+  pop.style.maxWidth = "340px";
+  pop.style.display = "none";
+  pop.style.border = "1px solid #d1d5db";
+  pop.style.borderRadius = "12px";
+  pop.style.background = "#fff";
+  pop.style.boxShadow = "0 14px 30px rgba(0,0,0,.2)";
+  pop.style.padding = "10px 12px";
+  pop.style.fontSize = "11px";
+  pop.style.lineHeight = "1.35";
+  pop.style.color = "#111827";
+  pop.style.pointerEvents = "auto";
+
+  document.body.appendChild(pop);
+
+  let hideTimer = null;
+  const cancelHide = () => {
+    if (hideTimer) {
+      clearTimeout(hideTimer);
+      hideTimer = null;
+    }
+  };
+  const scheduleHide = () => {
+    cancelHide();
+    hideTimer = setTimeout(() => {
+      const p = document.getElementById("ssp2-staffing-math-popover");
+      if (p) p.style.display = "none";
+    }, 180);
+  };
+
+  pop.addEventListener("mouseenter", cancelHide);
+  pop.addEventListener("mouseleave", scheduleHide);
+  pop.__sspCancelHide = cancelHide;
+  pop.__sspScheduleHide = scheduleHide;
+
+  return pop;
+}
+
+function _showStaffingMathPopoverForAnchor(anchorEl) {
+  if (!anchorEl) return;
+  const raw = String(anchorEl.getAttribute("data-staffing-math") || "").trim();
+  if (!raw) return;
+
+  let math = null;
+  try { math = JSON.parse(decodeURIComponent(raw)); } catch (_) { return; }
+
+  const pop = _ensureStaffingMathPopover();
+  if (typeof pop.__sspCancelHide === "function") pop.__sspCancelHide();
+
+  const line = (label, value) => `
+    <div style="display:flex;justify-content:space-between;gap:10px;white-space:nowrap;">
+      <span style="opacity:.72;">${label}</span>
+      <span style="font-weight:800;">${value}</span>
+    </div>
+  `;
+
+  const rows = [
+    line("Processed C", math.processedC || "—"),
+    line("Due C now→end", math.shiftDueC || "—"),
+    line("Hours remaining", math.hoursRemaining || "—"),
+    line("Target CPH", math.targetCph || "—"),
+    line("HC now", math.hcNow || "—")
+  ];
+  if (math.cutoffHc) rows.push(line("Cutoff HC", math.cutoffHc));
+
+  pop.innerHTML = `
+    <div style="font-weight:900;margin-bottom:6px;">Staffing math</div>
+    <div style="display:grid;gap:4px;">${rows.join("")}</div>
+  `;
+
+  const r = anchorEl.getBoundingClientRect();
+  const pad = 8;
+  const w = pop.offsetWidth || 300;
+  const h = pop.offsetHeight || 170;
+  let left = r.left;
+  let top = r.bottom + pad;
+  if (left + w > window.innerWidth - 8) left = Math.max(8, window.innerWidth - w - 8);
+  if (top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - pad);
+
+  pop.style.left = `${left}px`;
+  pop.style.top = `${top}px`;
+  pop.style.display = "block";
+}
+
+function _bindStaffingMathPopover(scope) {
+  if (!scope || scope.__sspStaffingMathBound) return;
+  scope.__sspStaffingMathBound = true;
+
+  const isTarget = (el) => !!(el && el.closest && el.closest('[data-staffing-popover="1"]'));
+  const findTarget = (el) => (el && el.closest) ? el.closest('[data-staffing-popover="1"]') : null;
+
+  scope.addEventListener("mouseenter", (ev) => {
+    const t = findTarget(ev.target);
+    if (!t) return;
+    _showStaffingMathPopoverForAnchor(t);
+  }, true);
+  scope.addEventListener("mouseleave", (ev) => {
+    if (!isTarget(ev.target)) return;
+    const pop = document.getElementById("ssp2-staffing-math-popover");
+    if (pop && typeof pop.__sspScheduleHide === "function") pop.__sspScheduleHide();
+  }, true);
+  scope.addEventListener("focusin", (ev) => {
+    const t = findTarget(ev.target);
+    if (!t) return;
+    _showStaffingMathPopoverForAnchor(t);
+  });
+  scope.addEventListener("focusout", (ev) => {
+    if (!isTarget(ev.target)) return;
+    const pop = document.getElementById("ssp2-staffing-math-popover");
+    if (pop && typeof pop.__sspScheduleHide === "function") pop.__sspScheduleHide();
+  });
 }
 
 
