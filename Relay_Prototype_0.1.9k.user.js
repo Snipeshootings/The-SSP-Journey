@@ -112,6 +112,48 @@
     GM_setValue(TOKEN_EXP_KEY, expMs);
     return true;
   }
+  function getRelayAuthHeader() {
+    const tok = getStoredToken();
+    return tok ? `Bearer ${tok}` : '';
+  }
+
+  const RELAY_BOOTSTRAP_COOLDOWN_MS = 3 * 60 * 1000;
+  let relayBootstrapInflight = null;
+  let relayBootstrapLastAt = 0;
+  let relayBootstrapLastError = '';
+
+  async function bootstrapRelayAuth(opts = {}) {
+    const force = !!opts.force;
+    const cooldownMs = Number(opts.cooldownMs || RELAY_BOOTSTRAP_COOLDOWN_MS);
+    const now = Date.now();
+
+    if (!force && getRelayAuthHeader()) {
+      return { ok: true, tried: false, reason: 'already_authed' };
+    }
+    if (relayBootstrapInflight) return relayBootstrapInflight;
+
+    if (!force && relayBootstrapLastAt && (now - relayBootstrapLastAt) < cooldownMs && relayBootstrapLastError) {
+      return { ok: false, tried: false, reason: 'cooldown', error: relayBootstrapLastError };
+    }
+
+    relayBootstrapInflight = (async () => {
+      try {
+        const token = await fetchRelayIdTokenViaMidway();
+        if (!storeToken(token)) throw new Error('Midway token invalid or expired');
+        relayBootstrapLastAt = Date.now();
+        relayBootstrapLastError = '';
+        return { ok: true, tried: true };
+      } catch (e) {
+        relayBootstrapLastAt = Date.now();
+        relayBootstrapLastError = String(e?.message || e || 'bootstrap failed');
+        return { ok: false, tried: true, error: relayBootstrapLastError };
+      } finally {
+        relayBootstrapInflight = null;
+      }
+    })();
+
+    return relayBootstrapInflight;
+  }
 
   function extractTokenFromHash() {
     const h = String(location.hash || "");
@@ -495,11 +537,18 @@ function fetchRelayIdTokenViaMidway() {
     return `https://track.relay.amazon.dev/api/v2/transport-views?${q.toString()}`;
   }
 
-  function gmGetJson(url, attempt = 0) {
+  function normalizeRelayItems(payload) {
+    if (Array.isArray(payload)) return payload;
+    if (payload && Array.isArray(payload.items)) return payload.items;
+    if (payload && Array.isArray(payload.results)) return payload.results;
+    return [];
+  }
+
+  function relayRequestJson(url) {
     return new Promise((resolve, reject) => {
-      const token = getStoredToken();
+      const auth = getRelayAuthHeader();
       const hdrs = { Accept: 'application/json' };
-      if (token) hdrs.Authorization = `Bearer ${token}`;
+      if (auth) hdrs.Authorization = auth;
 
       GM_xmlhttpRequest({
         method: 'GET',
@@ -509,7 +558,7 @@ function fetchRelayIdTokenViaMidway() {
         withCredentials: true,
         anonymous: false,
         onload: async (resp) => {
-          dlog('gmGetJson', { status: resp.status, attempt, url: url.slice(0,120) + (url.length>120?'…':'') });
+          dlog('relayRequestJson', { status: resp.status, url: url.slice(0,120) + (url.length>120?'…':'') });
           try {
             if (resp.status === 401 || resp.status === 403) {
               app.state.authHold = true;
@@ -535,6 +584,20 @@ function fetchRelayIdTokenViaMidway() {
     });
   }
 
+  async function gmGetJson(url, attempt = 0) {
+    try {
+      return await relayRequestJson(url);
+    } catch (e) {
+      const msg = String(e?.message || e || 'Relay request failed');
+      const unauthorized = /Relay HTTP\s+(401|403)/.test(msg);
+      if (!unauthorized || attempt > 0) throw e;
+
+      const boot = await bootstrapRelayAuth({ force: true });
+      if (!boot?.ok) throw new Error(boot?.error || msg);
+      return await relayRequestJson(url);
+    }
+  }
+
   async function pullRelayVehicleRuns() {
     const s = app.settings;
     const out = [];
@@ -547,10 +610,11 @@ function fetchRelayIdTokenViaMidway() {
       dlog('fetch page', p);
       const url = buildRelayUrl(p);
       dlog('request', url.slice(0,220) + (url.length>220?'…':''));
-      const batch = await gmGetJson(url);
-      dlog('page done', { p, count: Array.isArray(batch)?batch.length:0, ms: Math.round(dtime()-tPage) });
-      if (Array.isArray(batch)) out.push(...batch);
-      if (!Array.isArray(batch) || batch.length < pageSize) break;
+      const payload = await gmGetJson(url);
+      const batch = normalizeRelayItems(payload);
+      dlog('page done', { p, count: batch.length, ms: Math.round(dtime()-tPage) });
+      out.push(...batch);
+      if (batch.length < pageSize) break;
     }
     dlog('fetch complete', { total: out.length, ms: Math.round(dtime()-t0Fetch) });
     return out;
@@ -1145,6 +1209,9 @@ function fetchRelayIdTokenViaMidway() {
     render();
 
     try {
+      if (!getRelayAuthHeader()) {
+        await bootstrapRelayAuth({ force: false });
+      }
       const vrs0 = await pullRelayVehicleRuns();
       const { windowStartMs, windowEndMs } = computeWindowMs(app.settings);
       const df = app.settings.dateField || 'effectiveEnd';
