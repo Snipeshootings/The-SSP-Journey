@@ -291,11 +291,11 @@ function fetchRelayIdTokenViaMidway() {
       right: 14px;
       bottom: 14px;
       z-index: 999999;
-      background: #111827;
-      color: #fff;
+      background: linear-gradient(135deg, #1d4ed8, #2563eb);
+      color: #eff6ff;
       border: 1px solid #334155;
-      border-radius: 10px;
-      padding: 10px 12px;
+      border-radius: 999px;
+      padding: 10px 14px;
       font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
       font-size: 12px;
       cursor: pointer;
@@ -308,10 +308,10 @@ function fetchRelayIdTokenViaMidway() {
       width: min(920px, calc(100vw - 28px));
       max-height: min(78vh, 820px);
       z-index: 999999;
-      background: rgba(17, 24, 39, .98);
+      background: rgba(15, 23, 42, .98);
       color: #e5e7eb;
       border: 1px solid #334155;
-      border-radius: 14px;
+      border-radius: 16px;
       overflow: hidden;
       display: none;
       box-shadow: 0 12px 44px rgba(0,0,0,.35);
@@ -324,8 +324,15 @@ function fetchRelayIdTokenViaMidway() {
       gap: 10px;
       padding: 10px 12px;
       border-bottom: 1px solid #334155;
-      background: rgba(15, 23, 42, .9);
+      background: linear-gradient(90deg, rgba(30, 41, 59, .95), rgba(37, 99, 235, .22));
       font-weight: 800;
+    }
+    #relay-proto-panel .hdr .title { font-size: 15px; }
+    #relay-proto-panel .hdr .subtitle {
+      font-size: 11px;
+      font-weight: 500;
+      opacity: .85;
+      margin-top: 2px;
     }
     #relay-proto-panel .hdr .meta {
       font-weight: 500;
@@ -347,7 +354,20 @@ function fetchRelayIdTokenViaMidway() {
       font-size: 12px;
       outline: none;
     }
-    #relay-proto-panel .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 10px; }
+    #relay-proto-panel .section {
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 10px;
+      margin-bottom: 10px;
+      background: rgba(2, 6, 23, .35);
+    }
+    #relay-proto-panel .section h4 {
+      margin: 0 0 8px;
+      font-size: 12px;
+      color: #bfdbfe;
+      letter-spacing: .2px;
+    }
+    #relay-proto-panel .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 8px; }
     #relay-proto-panel .field { display: flex; flex-direction: column; gap: 4px; }
     #relay-proto-panel .field label { font-size: 10px; opacity: .8; }
     #relay-proto-panel .btn {
@@ -409,6 +429,11 @@ function fetchRelayIdTokenViaMidway() {
       font-weight: 800;
       font-size: 11px;
       opacity: .9;
+    }
+    #relay-proto-panel .helper {
+      font-size: 11px;
+      opacity: .8;
+      margin: 2px 0 8px;
     }
   `);
   function pad2(n) { return String(n).padStart(2, '0'); }
@@ -798,7 +823,7 @@ function fetchRelayIdTokenViaMidway() {
 
     const btn = document.createElement('button');
     btn.id = 'relay-proto-btn';
-    btn.textContent = 'Relay Proto';
+    btn.textContent = 'Relay Helper';
     btn.addEventListener('click', () => togglePanel());
     document.body.appendChild(btn);
 
@@ -807,7 +832,8 @@ function fetchRelayIdTokenViaMidway() {
     panel.innerHTML = `
       <div class="hdr">
         <div>
-          Relay Prototype <span class="pill">0.1.9i</span>
+          <div class="title">Relay Helper <span class="pill">Prototype 0.1.9k</span></div>
+          <div class="subtitle">Friendly capacity view for vehicle runs and case signals</div>
           <div class="meta" id="relay-proto-meta"></div>
         </div>
         <div style="display:flex;gap:8px;align-items:center;">
@@ -817,61 +843,68 @@ function fetchRelayIdTokenViaMidway() {
       <div class="body">
         <div class="err" id="relay-proto-err"></div>
 
-        <div class="row">
-          <div class="field">
-            <label>Node</label>
-            <input id="rp-node" style="width:90px" />
-          </div>
-          <div class="field" style="min-width:280px;flex:1;">
-            <label>Shipper Accounts (comma-separated)</label>
-            <input id="rp-shippers" />
-          </div>
-          <div class="field">
-            <label>Date Field</label>
-            <select id="rp-datefield">
-              <option value="effectiveEnd">effectiveEnd</option>
-              <option value="dynamicSearchFields.dateRanges.plannedDockDepart">plannedDockDepart</option>
-            </select>
+        <div class="section">
+          <h4>Scope</h4>
+          <div class="helper">Choose where to pull runs from and which timestamp to filter by.</div>
+          <div class="row">
+            <div class="field">
+              <label>Site Node</label>
+              <input id="rp-node" style="width:90px" />
+            </div>
+            <div class="field" style="min-width:280px;flex:1;">
+              <label>Shipper Accounts (comma-separated)</label>
+              <input id="rp-shippers" />
+            </div>
+            <div class="field">
+              <label>Time Anchor</label>
+              <select id="rp-datefield">
+                <option value="effectiveEnd">Scheduled End Time</option>
+                <option value="dynamicSearchFields.dateRanges.plannedDockDepart">Planned Dock Depart</option>
+              </select>
+            </div>
           </div>
         </div>
 
-        <div class="row">
-          <div class="field">
-            <label>Shift Date</label>
-            <input id="rp-shiftdate" style="width:140px" placeholder="YYYY-MM-DD" />
-          </div>
-          <div class="field" style="align-self:flex-end;display:flex;gap:14px;align-items:center;flex-wrap:wrap;">
-            <div style="display:flex;gap:8px;align-items:center;">
-              <input type="checkbox" id="rp-filterwindow" />
-              <label for="rp-filterwindow" style="margin:0;font-weight:700;">Filter before window start</label>
+        <div class="section">
+          <h4>Shift Window</h4>
+          <div class="row">
+            <div class="field">
+              <label>Shift Date</label>
+              <input id="rp-shiftdate" style="width:140px" placeholder="YYYY-MM-DD" />
             </div>
-            <div style="display:flex;gap:8px;align-items:center;">
-              <input type="checkbox" id="rp-excludecompleted" />
-              <label for="rp-excludecompleted" style="margin:0;font-weight:700;">Exclude arrived/completed from capacity</label>
+            <div class="field" style="align-self:flex-end;display:flex;gap:14px;align-items:center;flex-wrap:wrap;">
+              <div style="display:flex;gap:8px;align-items:center;">
+                <input type="checkbox" id="rp-filterwindow" />
+                <label for="rp-filterwindow" style="margin:0;font-weight:700;">Only include runs inside this window</label>
+              </div>
+              <div style="display:flex;gap:8px;align-items:center;">
+                <input type="checkbox" id="rp-excludecompleted" />
+                <label for="rp-excludecompleted" style="margin:0;font-weight:700;">Skip arrived/completed for capacity count</label>
+              </div>
+            </div>
+            <div class="field" style="flex:1;">
+              <label>Computed Window</label>
+              <div id="rp-window" style="padding:6px 8px;border:1px solid #334155;border-radius:8px;background:#0b1220;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;"></div>
             </div>
           </div>
-          <div class="field" style="flex:1;">
-            <label>Window</label>
-            <div id="rp-window" style="padding:6px 8px;border:1px solid #334155;border-radius:8px;background:#0b1220;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;"></div>
-          </div>
-        </div>
 
-        <div class="row">
-          <div class="field">
-            <label>Start Time</label>
-            <input id="rp-starttime" style="width:120px" />
-          </div>
-          <div class="field">
-            <label>End Time</label>
-            <input id="rp-endtime" style="width:120px" />
-          </div>
-          <div class="field">
-            <label>Refresh (sec)</label>
-            <input id="rp-refresh" style="width:90px" />
-          </div>
-          <div class="field" style="margin-left:auto;display:flex;flex-direction:row;gap:8px;align-items:flex-end;">
-            <button class="btn secondary" id="relay-proto-save">Save</button>
-            <button class="btn" id="relay-proto-refresh">Pull Now</button>
+          <div class="row">
+            <div class="field">
+              <label>Start Time</label>
+              <input id="rp-starttime" style="width:120px" />
+            </div>
+            <div class="field">
+              <label>End Time</label>
+              <input id="rp-endtime" style="width:120px" />
+            </div>
+            <div class="field">
+              <label>Auto Refresh (sec)</label>
+              <input id="rp-refresh" style="width:90px" />
+            </div>
+            <div class="field" style="margin-left:auto;display:flex;flex-direction:row;gap:8px;align-items:flex-end;">
+              <button class="btn secondary" id="relay-proto-save">Save Settings</button>
+              <button class="btn" id="relay-proto-refresh">Pull Latest Runs</button>
+            </div>
           </div>
         </div>
 
@@ -960,7 +993,8 @@ function fetchRelayIdTokenViaMidway() {
     const s = app.settings;
     const fetched = app.state.lastFetchedAt ? new Date(app.state.lastFetchedAt).toLocaleTimeString() : '—';
     const { shiftDate, st, et } = computeWindowMs(s);
-    meta.textContent = `node=${s.nodeCode} | shippers=${(s.shipperAccounts || []).join(',')} | shift=${shiftDate} ${st}→${et} | dateField=${s.dateField} | last=${fetched}`;
+    const fieldLabel = s.dateField === 'dynamicSearchFields.dateRanges.plannedDockDepart' ? 'Planned Dock Depart' : 'Scheduled End';
+    meta.textContent = `Node ${s.nodeCode} • Shippers ${(s.shipperAccounts || []).join(',')} • Shift ${shiftDate} ${st}→${et} • Filter ${fieldLabel} • Last refresh ${fetched}`;
   }
 
   function render() {
@@ -977,7 +1011,7 @@ function fetchRelayIdTokenViaMidway() {
       err.innerHTML = `${escapeHtml(app.state.lastErr || '')}
         <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
           <button class="btn secondary" id="rp-open-relay-auth">Open Relay to authenticate</button>
-          <span style="opacity:.9;font-size:12px;">(One-time per session. After signing in, come back and click “Pull Now”.)</span>
+          <span style="opacity:.9;font-size:12px;">(One-time per session. After signing in, come back and click “Pull Latest Runs”.)</span>
         </div>`;
       const b = err.querySelector('#rp-open-relay-auth');
       if (b && !b.__bound) {
@@ -996,7 +1030,7 @@ function fetchRelayIdTokenViaMidway() {
     if (!grouped || grouped.size === 0) {
       results.innerHTML = app.state.loading
         ? `<div class="pill">Loading Relay data…</div>`
-        : `<div class="pill">No data yet. Click “Pull Now”.</div>`;
+        : `<div class="pill">No run data yet. Click “Pull Latest Runs”.</div>`;
       return;
     }
 
@@ -1019,12 +1053,12 @@ function fetchRelayIdTokenViaMidway() {
         const pdd = x.plannedDockDepartMs ? new Date(x.plannedDockDepartMs).toLocaleString() : '—';
         const sed = x.scheduledEndMs ? new Date(x.scheduledEndMs).toLocaleString() : '—';
         const casePart = (x.openCaseCount > 0)
-          ? `CASE Y (${x.caseId || ''})${x.caseTypeId ? ' ['+x.caseTypeId+']' : ''}${x.caseStatus ? ' '+x.caseStatus : ''}`
-          : (x.hasCase ? `CASE R (${x.caseId || ''})` : 'CASE N');
-        const crPart = x.crId ? `CR Y (${x.crId})` : 'CR N';
+          ? `Open Case: Yes (${x.caseId || ''})${x.caseTypeId ? ' ['+x.caseTypeId+']' : ''}${x.caseStatus ? ' '+x.caseStatus : ''}`
+          : (x.hasCase ? `Open Case: Resolved (${x.caseId || ''})` : 'Open Case: None');
+        const crPart = x.crId ? `Change Request: Yes (${x.crId})` : 'Change Request: No';
         const excl = x.excludeFromCapacity ? 'EXCL_ORIG_BACKUP' : '';
-        const st = x.status ? `ST ${x.status}` : '';
-        return `${x.id || 'VRID?'} | FILTER ${x.truckFilter || ''} | ROUTE ${x.laneRoute || x.laneKey || ''} | EQ ${x.equipmentType || ''} | ${casePart} | ${crPart} | ${st} ${excl ? '| '+excl : ''} | PDD ${pdd} | END ${sed} | ${x.shipper || ''}`.replace(/\s+\|/g,' |');
+        const st = x.status ? `Status: ${x.status}` : '';
+        return `Run ${x.id || 'VRID?'} • Filter: ${x.truckFilter || ''} • Route: ${x.laneRoute || x.laneKey || ''} • Equipment: ${x.equipmentType || ''} • ${casePart} • ${crPart} • ${st}${excl ? ` • Excluded: ${excl}` : ''} • Planned Dock Depart: ${pdd} • Scheduled End: ${sed} • Shipper: ${x.shipper || ''}`;
       }).join('\n');
 
       blocks.push(`
