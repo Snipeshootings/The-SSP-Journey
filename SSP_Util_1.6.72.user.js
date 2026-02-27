@@ -12001,6 +12001,7 @@ function renderPlanningPanel() {
       const _shiftWindows = (shifts || [])
         .map(s => {
           const w = _shiftToWindowMs(s, baseDay0Ms);
+          if (!w || !Number.isFinite(w.startMs) || !Number.isFinite(w.endMs)) return null;
           return {
             s,
             startMs: w.startMs,
@@ -12008,6 +12009,7 @@ function renderPlanningPanel() {
             endClipped: Math.min(w.endMs, ops.endMs),
           };
         })
+        .filter(Boolean)
         .filter(x => x.endClipped > ops.startMs)
         .sort((a, b) => (a.endClipped - b.endClipped));
 
@@ -12460,7 +12462,18 @@ function renderPlanningPanel() {
         ].join("\n");
       }
     } catch (e) {
-      // keep UI resilient
+      // keep UI resilient and visibly indicate why cards are empty
+      try {
+        const mathUi = panel.querySelector("#ssp2-plan-mathui");
+        const dbgPre = panel.querySelector("#ssp2-plan-debugpre");
+        const msg = String(e?.message || e || "Unknown planning render error");
+        if (mathUi) {
+          mathUi.innerHTML = `<div style="border:1px solid rgba(248,113,113,.5);border-radius:10px;padding:10px;background:rgba(127,29,29,.25);color:#fecaca;font-weight:900;">Container Math render error: ${esc(msg)}</div>`;
+        }
+        if (dbgPre) {
+          dbgPre.textContent = `Container Math render error: ${msg}\n${String(e?.stack || "")}`.trim();
+        }
+      } catch (_) {}
     }
 
 
