@@ -9264,17 +9264,6 @@ if (chip) {
     };
   }
 
-  function _toFclmDateAnchors(w) {
-    if (!w || !Number.isFinite(w.startMs)) return null;
-    const start = new Date(w.startMs);
-    const monthStart = new Date(start.getFullYear(), start.getMonth(), 1);
-    return {
-      startDateDay: _fmtYyyyMmDdLocal(w.startMs),
-      startDateWeek: _fmtYyyyMmDdLocal(w.startMs),
-      startDateMonth: _fmtYyyyMmDdLocal(monthStart.getTime()),
-    };
-  }
-
   function _toNumFromText(v) {
     const n = Number(String(v ?? "").replace(/,/g, "").trim());
     return Number.isFinite(n) ? n : null;
@@ -9306,20 +9295,6 @@ if (chip) {
     const idx1 = tables[1] ? parseChunkLayout(tables[1]) : null;
     if (idx1 && (idx1.crossdockUph != null || idx1.sortableUph != null)) return idx1;
 
-    // Fallback: scan for rows with labels containing "sortable" / "crossdock" and use last numeric col.
-    for (const t of tables) {
-      const rows = Array.from(t.querySelectorAll("tbody tr"));
-      for (const r of rows) {
-        const cells = Array.from(r.cells || []);
-        if (!cells.length) continue;
-        const txt = cells.map(c => String(c.innerText || "").trim()).join(" ").toLowerCase();
-        const nums = cells.map(c => _toNumFromText(c.innerText)).filter(n => n != null);
-        if (!nums.length) continue;
-        const v = nums[nums.length - 1];
-        if (txt.includes("sortable") && out.sortableUph == null) out.sortableUph = v;
-        if (txt.includes("crossdock") && out.crossdockUph == null) out.crossdockUph = v;
-      }
-    }
     return out;
   }
 
@@ -9334,16 +9309,12 @@ if (chip) {
       if (STATE.fclmPpaInflight) return STATE.fclmPpaInflight;
 
       const intraday = _toFclmIntradayWindow(w);
-      const anchors = _toFclmDateAnchors(w);
-      if (!intraday || !anchors) return null;
+      if (!intraday) return null;
       const u = new URL("https://fclm-portal.amazon.com/ppa/inspect/node");
       u.searchParams.set("nodeType", "SC");
       u.searchParams.set("warehouseId", String(warehouseId));
       u.searchParams.set("maxIntradayDays", "1");
       u.searchParams.set("spanType", "Intraday");
-      u.searchParams.set("startDateDay", anchors.startDateDay);
-      u.searchParams.set("startDateWeek", anchors.startDateWeek);
-      u.searchParams.set("startDateMonth", anchors.startDateMonth);
       u.searchParams.set("startDateIntraday", intraday.startDate);
       u.searchParams.set("startHourIntraday", String(intraday.startHour));
       u.searchParams.set("startMinuteIntraday", String(intraday.startMinute));
