@@ -46,6 +46,7 @@
 // @connect      track.relay.amazon.dev
 // @connect      midway-auth.amazon.com
 // @connect      trans-logistics.amazon.com
+// @connect      fclm-portal.amazon.com
 // @connect      hooks.slack.com
 // @connect      hooks.workflow.slack.com
 // @connect      hooks.slack-gov.com
@@ -9318,8 +9319,16 @@ if (chip) {
       u.searchParams.set("endHourIntraday", String(intraday.endHour));
       u.searchParams.set("endMinuteIntraday", String(intraday.endMinute));
 
-      const p = fetch(String(u), { method: "GET", credentials: "include", cache: "no-cache" })
-        .then(r => r.text())
+      const p = gmFetch(String(u), { method: "GET", credentials: "include", cache: "no-cache" })
+        .then(async (r) => {
+          if (!r?.ok) {
+            let body = "";
+            try { body = await r.text(); } catch (_) {}
+            const bodyMsg = String(body || "").trim().slice(0, 300);
+            throw new Error(`FCLM HTTP ${Number(r?.status || 0)}${bodyMsg ? `: ${bodyMsg}` : ""}`);
+          }
+          return r.text();
+        })
         .then((htmlText) => {
           const ppa = _parseFclmPpaTable(htmlText);
           STATE.fclmPpa = {
@@ -9327,7 +9336,6 @@ if (chip) {
             crossdockUph: ppa.crossdockUph,
             sortableUph: ppa.sortableUph,
             source: "fclm",
-            error: "",
           };
           return STATE.fclmPpa;
         })
