@@ -8357,10 +8357,16 @@ function renderPanel() {
 
       const partsPlain = [];
       const partsHtml = [];
+      const hoverPartsPlain = [];
 
       const pushPart = (plain, html) => {
         partsPlain.push(plain);
         partsHtml.push(html);
+        hoverPartsPlain.push(plain);
+      };
+
+      const pushHoverPart = (plain) => {
+        hoverPartsPlain.push(plain);
       };
 
       pushPart(`Inbound loads: ${inboundCount}`, `<span><b>Inbound loads:</b> ${inboundCount}</span>`);
@@ -8380,15 +8386,13 @@ function renderPanel() {
           pushPart(`Remaining: ${sh.remaining}`, `<span><b>Remaining:</b> ${sh.remaining}</span>`);
         }
 
-        // Hybrid HC view: recommendation + planned staffing + delta.
+        // Hybrid HC view: recommendation + live need now.
         const hcRec = Number.isFinite(Number(sh.neededNow)) ? Number(sh.neededNow) : 0;
         const hcPlan = Number.isFinite(Number(sh.staffed)) ? Number(sh.staffed) : 0;
         pushPart(`HC Rec: ${hcRec}`, `<span><b>HC Rec:</b> ${hcRec}</span>`);
-        pushPart(`HC Plan: ${hcPlan}`, `<span><b>HC Plan:</b> ${hcPlan}</span>`);
 
         const d = Number.isFinite(Number(sh.deltaNeed)) ? Number(sh.deltaNeed) : (hcRec - hcPlan);
-        const needColor = d > 0 ? "#dc2626" : (d < 0 ? "#2563eb" : "#16a34a");
-        pushPart(`Need: ${formatDelta(d)}`, `<span><b>Need:</b> <span style="color:${needColor};font-weight:900;">${formatDelta(d)}</span></span>`);
+        pushHoverPart(`Need Δ (HC Rec - HC Plan): ${formatDelta(d)} (HC Plan: ${hcPlan})`);
 
         const cphTxt = Number.isFinite(Number(shiftCphNow)) ? Number(shiftCphNow).toFixed(1) : "—";
         const cphLbl = shiftCphSource === "fclm" ? "Shift CPH*" : "Shift CPH";
@@ -8419,10 +8423,12 @@ function renderPanel() {
       const sep = ` <span style="opacity:.35;margin:0 8px;">|</span> `;
       const html = partsHtml.join(sep);
       const plain = partsPlain.join(" | ");
+      const hoverPlain = hoverPartsPlain.join(" | ");
 
       // Persist for header mirror + tooltip.
       s.dataset.statusPlain = plain;
       s.dataset.statusHeaderHtml = html;
+      s.dataset.statusHoverPlain = hoverPlain;
 
       // Keep panel status minimal (we hide it anyway right after mirroring).
       s.textContent = plain;
@@ -8432,7 +8438,7 @@ function renderPanel() {
       const hs = document.getElementById("ssp2-h-status");
       if (hs && s && typeof s.textContent === "string") {
         hs.innerHTML = (s.dataset && s.dataset.statusHeaderHtml) ? s.dataset.statusHeaderHtml : (s.textContent || "").replace(/\s*\n\s*/g, " | ").trim();
-        hs.title = (s.dataset && s.dataset.statusPlain) ? s.dataset.statusPlain : (s.textContent || "");
+        hs.title = (s.dataset && s.dataset.statusHoverPlain) ? s.dataset.statusHoverPlain : ((s.dataset && s.dataset.statusPlain) ? s.dataset.statusPlain : (s.textContent || ""));
         // hide in-panel status block (requested: move to header)
         s.style.display = "none";
         const hn = document.getElementById("ssp2-h-node");
