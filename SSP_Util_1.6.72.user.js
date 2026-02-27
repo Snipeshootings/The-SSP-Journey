@@ -9242,6 +9242,14 @@ if (chip) {
     return `${mm}/${dd}/${yy}`;
   }
 
+  function _fmtYyyyMmDdLocal(ts) {
+    const d = new Date(ts);
+    const yyyy = String(d.getFullYear());
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `${yyyy}/${mm}/${dd}`;
+  }
+
   function _toFclmIntradayWindow(w) {
     if (!w || !Number.isFinite(w.startMs) || !Number.isFinite(w.endMs)) return null;
     const s = new Date(w.startMs);
@@ -9253,6 +9261,17 @@ if (chip) {
       endDate: _fmtMmDdYyLocal(w.endMs),
       endHour: e.getHours(),
       endMinute: e.getMinutes(),
+    };
+  }
+
+  function _toFclmDateAnchors(w) {
+    if (!w || !Number.isFinite(w.startMs)) return null;
+    const start = new Date(w.startMs);
+    const monthStart = new Date(start.getFullYear(), start.getMonth(), 1);
+    return {
+      startDateDay: _fmtYyyyMmDdLocal(w.startMs),
+      startDateWeek: _fmtYyyyMmDdLocal(w.startMs),
+      startDateMonth: _fmtYyyyMmDdLocal(monthStart.getTime()),
     };
   }
 
@@ -9315,12 +9334,16 @@ if (chip) {
       if (STATE.fclmPpaInflight) return STATE.fclmPpaInflight;
 
       const intraday = _toFclmIntradayWindow(w);
-      if (!intraday) return null;
+      const anchors = _toFclmDateAnchors(w);
+      if (!intraday || !anchors) return null;
       const u = new URL("https://fclm-portal.amazon.com/ppa/inspect/node");
       u.searchParams.set("nodeType", "SC");
       u.searchParams.set("warehouseId", String(warehouseId));
       u.searchParams.set("maxIntradayDays", "1");
       u.searchParams.set("spanType", "Intraday");
+      u.searchParams.set("startDateDay", anchors.startDateDay);
+      u.searchParams.set("startDateWeek", anchors.startDateWeek);
+      u.searchParams.set("startDateMonth", anchors.startDateMonth);
       u.searchParams.set("startDateIntraday", intraday.startDate);
       u.searchParams.set("startHourIntraday", String(intraday.startHour));
       u.searchParams.set("startMinuteIntraday", String(intraday.startMinute));
@@ -9340,11 +9363,13 @@ if (chip) {
         })
         .then((htmlText) => {
           const ppa = _parseFclmPpaTable(htmlText);
+          const parseMismatch = !Number.isFinite(ppa.crossdockUph);
           STATE.fclmPpa = {
             ts: Date.now(),
             crossdockUph: ppa.crossdockUph,
             sortableUph: ppa.sortableUph,
             source: "fclm",
+            error: parseMismatch ? "parse_mismatch: crossdockUph not finite" : null,
           };
           return STATE.fclmPpa;
         })
