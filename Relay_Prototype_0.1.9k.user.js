@@ -634,6 +634,68 @@ function fetchRelayIdTokenViaMidway() {
     const ms = t ? Date.parse(t) : NaN;
     return Number.isFinite(ms) ? ms : null;
   }
+
+  function _firstValidMs(values) {
+    for (const t of values) {
+      const ms = t ? Date.parse(t) : NaN;
+      if (Number.isFinite(ms)) return ms;
+    }
+    return null;
+  }
+
+  function getScheduledArrivalMs(vr) {
+    // In Relay detail view payloads, startTime is the planned driver arrival anchor.
+    // Prefer it first so lateness/check-in logic aligns with expected SAT behavior.
+    return _firstValidMs([
+      vr?.startTime,
+      vr?.scheduledStartTime,
+      vr?.scheduled_start,
+      vr?.stops?.[0]?.arrival?.plannedTime,
+      vr?.stops?.[0]?.arrival?.plannedTimeUtc,
+      vr?.stops?.[0]?.arrival?.scheduledTime,
+      vr?.scheduledArrivalTime,
+      vr?.scheduledArrival,
+      vr?.arrivalTime,
+    ]);
+  }
+
+  function getScheduledDepartureMs(vr) {
+    return _firstValidMs([
+      vr?.stops?.[0]?.departure?.plannedTime,
+      vr?.stops?.[0]?.departure?.plannedTimeUtc,
+      vr?.stops?.[0]?.departure?.scheduledTime,
+      vr?.scheduledDepartureTime,
+      vr?.scheduledDeparture,
+      vr?.departureTime,
+    ]);
+  }
+
+  function getDriverCheckInMs(vr) {
+    return _firstValidMs([
+      vr?.driverCheckInTime,
+      vr?.driver?.checkInTime,
+      vr?.driver?.checkedInAt,
+      vr?.checkInTime,
+      vr?.checkedInAt,
+      vr?.freight?.[0]?.requests?.[0]?.driverCheckInTime,
+      vr?.freight?.[0]?.requests?.[0]?.checkInTime,
+      vr?.freight?.[0]?.driverCheckInTime,
+    ]);
+  }
+
+  function isDriverPresent(vr, driverCheckInMs) {
+    if (driverCheckInMs) return true;
+    const hasDriverIdentity = !!(
+      vr?.driver?.id ||
+      vr?.driver?.name ||
+      vr?.driverId ||
+      vr?.driverName ||
+      vr?.freight?.[0]?.requests?.[0]?.driverId ||
+      vr?.freight?.[0]?.requests?.[0]?.driverName
+    );
+    return hasDriverIdentity;
+  }
+
   function getScheduledEndMs(vr) {
     const t = vr?.endTime || vr?.scheduledEndTime || vr?.scheduled_end || vr?.effectiveEnd;
     const ms = t ? Date.parse(t) : NaN;
@@ -818,6 +880,7 @@ function fetchRelayIdTokenViaMidway() {
     const capUnits = equipCapacityUnits(equipmentType);
     const cs = getCaseSummary(vr);
     const status = getVrStatus(vr);
+    const driverCheckInMs = getDriverCheckInMs(vr);
     return {
       id,
       shipper,
@@ -837,8 +900,12 @@ function fetchRelayIdTokenViaMidway() {
       caseStatus: cs.status,
       crId: getCrId(vr),
       plannedDockDepartMs: getPlannedDockDepartMs(vr),
+      scheduledArrivalMs: getScheduledArrivalMs(vr),
+      scheduledDepartureMs: getScheduledDepartureMs(vr),
       scheduledEndMs: getScheduledEndMs(vr),
       cptMs: getCriticalPullTimeMs(vr),
+      driverPresent: isDriverPresent(vr, driverCheckInMs),
+      driverCheckInMs,
       status,
       raw: vr,
     };
@@ -1114,15 +1181,19 @@ function fetchRelayIdTokenViaMidway() {
 
 
       const lines = arr.slice(0, 80).map(x => {
+        const sat = x.scheduledArrivalMs ? new Date(x.scheduledArrivalMs).toLocaleString() : '—';
+        const sdt = x.scheduledDepartureMs ? new Date(x.scheduledDepartureMs).toLocaleString() : '—';
         const pdd = x.plannedDockDepartMs ? new Date(x.plannedDockDepartMs).toLocaleString() : '—';
         const sed = x.scheduledEndMs ? new Date(x.scheduledEndMs).toLocaleString() : '—';
+        const dci = x.driverCheckInMs ? new Date(x.driverCheckInMs).toLocaleString() : '—';
+        const dp = x.driverPresent ? 'Yes' : 'No';
         const casePart = (x.openCaseCount > 0)
           ? `Open Case: Yes (${x.caseId || ''})${x.caseTypeId ? ' ['+x.caseTypeId+']' : ''}${x.caseStatus ? ' '+x.caseStatus : ''}`
           : (x.hasCase ? `Open Case: Resolved (${x.caseId || ''})` : 'Open Case: None');
         const crPart = x.crId ? `Change Request: Yes (${x.crId})` : 'Change Request: No';
         const excl = x.excludeFromCapacity ? 'EXCL_ORIG_BACKUP' : '';
         const st = x.status ? `Status: ${x.status}` : '';
-        return `Run ${x.id || 'VRID?'} • Filter: ${x.truckFilter || ''} • Route: ${x.laneRoute || x.laneKey || ''} • Equipment: ${x.equipmentType || ''} • ${casePart} • ${crPart} • ${st}${excl ? ` • Excluded: ${excl}` : ''} • Planned Dock Depart: ${pdd} • Scheduled End: ${sed} • Shipper: ${x.shipper || ''}`;
+        return `Run ${x.id || 'VRID?'} • Filter: ${x.truckFilter || ''} • Route: ${x.laneRoute || x.laneKey || ''} • Equipment: ${x.equipmentType || ''} • ${casePart} • ${crPart} • ${st}${excl ? ` • Excluded: ${excl}` : ''} • Scheduled Arrival: ${sat} • Scheduled Departure: ${sdt} • Driver Present: ${dp} • Driver Check-in: ${dci} • Planned Dock Depart: ${pdd} • Scheduled End: ${sed} • Shipper: ${x.shipper || ''}`;
       }).join('\n');
 
       blocks.push(`
