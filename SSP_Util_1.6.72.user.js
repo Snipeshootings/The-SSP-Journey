@@ -51,6 +51,7 @@
 // @connect      hooks.workflow.slack.com
 // @connect      hooks.slack-gov.com
 // @connect      hooks.workflow.slack-gov.com
+// @connect      flow-metrics.service.pulse.ats.amazon.dev
 // @run-at       document-end
 // ==/UserScript==
 
@@ -306,6 +307,233 @@ async function sspCachedGetJson(cacheKey, url, fetchOpts) {
   const data = await res.json();
   __sspCacheSet(cacheKey, data);
   return data;
+}
+
+/* ================================
+ * Pulse Metrics Module (SORT_CENTER)
+ * - Isolated read-only integration for pillar header CPH/HC signals
+ * ================================ */
+function _pulseLog(...args) {
+  try { console.log("[SSP][Pulse]", ...args); } catch (_) {}
+}
+
+function _fmtYmdLocal(v) {
+  const d = v instanceof Date ? v : new Date(v || Date.now());
+  if (!Number.isFinite(d.getTime())) return "";
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function _pulseToNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function _pulseDivideSafe(numer, denom) {
+  const n = _pulseToNum(numer);
+  const d = _pulseToNum(denom);
+  if (!(n != null) || !(d != null) || d <= 0) return null;
+  return n / d;
+}
+
+function _pulsePickFlowShift(flowData, preferredShiftGroupId) {
+  const want = String(preferredShiftGroupId || "").trim().toUpperCase();
+  const nowMs = Date.now();
+  const roots = [flowData, flowData?.data, flowData?.flow, flowData?.result].filter(Boolean);
+  for (const root of roots) {
+    const shifts = [];
+    if (Array.isArray(root?.shifts)) shifts.push(...root.shifts);
+    if (Array.isArray(root?.flowShifts)) shifts.push(...root.flowShifts);
+    if (Array.isArray(root?.shiftGroups)) shifts.push(...root.shiftGroups);
+    if (!shifts.length) continue;
+
+    const normalize = (s) => {
+      const groupId = String(
+        s?.shiftGroupId ?? s?.shiftGroup ?? s?.groupId ?? s?.shiftCode ?? s?.name ?? s?.code ?? ""
+      ).trim();
+      const startMs = Number(s?.startTimeMs ?? s?.shiftStartTimeMs ?? s?.startTime ?? s?.startTs ?? s?.startTimestamp ?? 0);
+      const endMs = Number(s?.endTimeMs ?? s?.shiftEndTimeMs ?? s?.endTime ?? s?.endTs ?? s?.endTimestamp ?? 0);
+      return { groupId, startMs, endMs };
+    };
+
+    const normalized = shifts.map(normalize).filter((x) => x.groupId);
+    if (want) {
+      const found = normalized.find((x) => x.groupId.toUpperCase() === want);
+      if (found) return found;
+    }
+    const active = normalized.find((x) => x.startMs > 0 && x.endMs > 0 && nowMs >= x.startMs && nowMs < x.endMs);
+    if (active) return active;
+    if (normalized.length) return normalized[0];
+  }
+
+  if (want) return { groupId: want, startMs: 0, endMs: 0 };
+  return null;
+}
+
+function _pulseExtractMetricSeries(metricsData, metricId, facilityId) {
+  const fid = String(facilityId || "").trim();
+  const roots = [
+    metricsData,
+    metricsData?.[metricId],
+    metricsData?.metrics,
+    metricsData?.metricsData,
+    metricsData?.data,
+    metricsData?.compound,
+  ].filter(Boolean);
+
+  for (const root of roots) {
+    const mv = root?.metricsValues;
+    if (mv && typeof mv === "object") {
+      if (Array.isArray(mv[fid])) return mv[fid];
+      const first = Object.values(mv).find(Array.isArray);
+      if (first) return first;
+    }
+  }
+  return [];
+}
+
+async function fetchPulseMetrics({ facilityId, laborDate, shiftGroupId }) {
+  const fid = String(facilityId || "").trim();
+  const metricDate = String(laborDate || _fmtYmdLocal(Date.now())).trim();
+  if (!fid) throw new Error("Missing facilityId for Pulse metrics");
+
+  let resolvedShiftGroupId = String(shiftGroupId || "").trim();
+  try {
+    const flowUrl = `https://flow-metrics.service.pulse.ats.amazon.dev/getFlow/${encodeURIComponent(fid)}/${encodeURIComponent(metricDate)}`;
+    if (!resolvedShiftGroupId) {
+      const flowRes = await sspEnqueue(() => gmFetch(flowUrl, { method: "GET", credentials: "include" }), 1);
+      if (!flowRes.ok) throw new Error(`Pulse getFlow HTTP ${flowRes.status}`);
+      const flowData = await flowRes.json();
+      const picked = _pulsePickFlowShift(flowData, "");
+      if (picked && picked.groupId) resolvedShiftGroupId = picked.groupId;
+    }
+  } catch (e) {
+    _pulseLog("getFlow failed; continuing with provided shiftGroupId when available", e);
+  }
+
+  if (!resolvedShiftGroupId) throw new Error("Unable to resolve shiftGroupId for Pulse metrics");
+
+  const payload = {
+    businessSpace: "SORT_CENTER",
+    businessSpaceParams: { shiftGroupId: resolvedShiftGroupId },
+    dataTimeInterval: 5,
+    dataType: "regular",
+    facilityIds: [fid],
+    metricDate,
+    metricGranularity: "minute",
+    metricIds: ["cph", "crossdock-hc"],
+  };
+
+  const metricsRes = await sspEnqueue(() => gmFetch("https://flow-metrics.service.pulse.ats.amazon.dev/getMetricsData", {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }), 1);
+
+  if (!metricsRes.ok) throw new Error(`Pulse getMetricsData HTTP ${metricsRes.status}`);
+  const metricsData = await metricsRes.json();
+
+  // CPH is a compound metric (carts-processed + crossdock-hours), so we compute CPH manually.
+  // Bucket CPH uses the latest 5-min datapoint; shift-to-date CPH must aggregate all buckets first.
+  const cphSeries = _pulseExtractMetricSeries(metricsData, "cph", fid);
+  let bucketCph = null;
+  let sumCartsProcessed = 0;
+  let sumCrossdockHours = 0;
+  let latestTs = 0;
+  for (const row of (Array.isArray(cphSeries) ? cphSeries : [])) {
+    const compound = row?.compound || row;
+    const ts = Number(compound?.timestamp || row?.timestamp || 0);
+    const sub = compound?.subMetricsMap || row?.subMetricsMap || {};
+    const carts = _pulseToNum(sub["carts-processed"]);
+    const hrs = _pulseToNum(sub["crossdock-hours"]);
+    if (carts != null && hrs != null) {
+      sumCartsProcessed += carts;
+      sumCrossdockHours += hrs;
+      if (ts >= latestTs) {
+        latestTs = ts;
+        bucketCph = _pulseDivideSafe(carts, hrs);
+      }
+    }
+  }
+
+  const shiftToDateCph = _pulseDivideSafe(sumCartsProcessed, sumCrossdockHours);
+
+  const hcSeries = _pulseExtractMetricSeries(metricsData, "crossdock-hc", fid);
+  let crossdockHeadcount = null;
+  for (const row of (Array.isArray(hcSeries) ? hcSeries : [])) {
+    const value = _pulseToNum(row?.value ?? row?.metricValue ?? row?.hc ?? row?.crossdockHc ?? row?.compound?.value);
+    const ts = Number(row?.timestamp || row?.compound?.timestamp || 0);
+    if (value != null && ts >= latestTs) {
+      crossdockHeadcount = value;
+      latestTs = ts;
+    }
+  }
+
+  return {
+    bucketCph: _pulseToNum(bucketCph),
+    shiftToDateCph: _pulseToNum(shiftToDateCph),
+    crossdockHeadcount: _pulseToNum(crossdockHeadcount),
+    lastUpdated: latestTs || Date.now(),
+    shiftGroupId: resolvedShiftGroupId,
+  };
+}
+
+
+async function refreshPulseMetricsForHeader({ force = false } = {}) {
+  try {
+    const now = Date.now();
+    const ttlMs = 60 * 1000;
+    const cache = STATE?.pulseMetrics || {};
+    if (!force && Number(cache.ts || 0) > 0 && (now - Number(cache.ts || 0)) < ttlMs) return cache;
+    if (STATE.pulseMetricsInflight) return STATE.pulseMetricsInflight;
+
+    const facilityId = String((STATE && (STATE.nodeId || STATE.nodeID)) || SHIFT_SETTINGS?.siteCode || "").trim();
+    if (!facilityId) return cache;
+
+    const metricDate = _fmtYmdLocal(now);
+    let shiftGroupId = "";
+    try {
+      const ctx = (typeof _getShiftContext === "function") ? _getShiftContext(now) : null;
+      const chosen = ctx && ctx.activeOrUpcoming;
+      shiftGroupId = String(chosen?.key || chosen?.id || chosen?.name || "").trim().toUpperCase();
+    } catch (_) {}
+
+    STATE.pulseMetricsInflight = fetchPulseMetrics({ facilityId, laborDate: metricDate, shiftGroupId })
+      .then((m) => {
+        STATE.pulseMetrics = {
+          ts: Date.now(),
+          bucketCph: _pulseToNum(m?.bucketCph),
+          shiftToDateCph: _pulseToNum(m?.shiftToDateCph),
+          crossdockHeadcount: _pulseToNum(m?.crossdockHeadcount),
+          shiftGroupId: String(m?.shiftGroupId || shiftGroupId || "").trim().toUpperCase(),
+          error: "",
+        };
+        _pulseLog("Metrics updated", STATE.pulseMetrics);
+        return STATE.pulseMetrics;
+      })
+      .catch((e) => {
+        const msg = (e && e.message) ? String(e.message) : String(e || "Pulse metrics error");
+        STATE.pulseMetrics = {
+          ...(STATE.pulseMetrics || {}),
+          ts: Date.now(),
+          error: msg,
+        };
+        _pulseLog("Metrics fetch failed", msg);
+        return STATE.pulseMetrics;
+      })
+      .finally(() => {
+        STATE.pulseMetricsInflight = null;
+        try { renderPanel(); } catch (_) {}
+      });
+
+    return STATE.pulseMetricsInflight;
+  } catch (e) {
+    _pulseLog("refreshPulseMetricsForHeader error", e);
+    return STATE?.pulseMetrics || null;
+  }
 }
 
 
@@ -2845,6 +3073,9 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
     // FCLM PPA cache for live Shift CPH (Crossdock/Sortable).
     fclmPpa: { ts: 0, crossdockUph: null, sortableUph: null, source: "none", error: "" },
     fclmPpaInflight: null,
+
+    pulseMetrics: { ts: 0, bucketCph: null, shiftToDateCph: null, crossdockHeadcount: null, shiftGroupId: "", error: "" },
+    pulseMetricsInflight: null,
 
     running: false,
     lastError: null,
@@ -8263,6 +8494,7 @@ function renderPanel() {
     const lastEl = document.getElementById("last-stat");
     if (!s || !b || !ov) return;
     if (lastEl) lastEl.textContent = STATE.lastRun ? STATE.lastRun.toLocaleTimeString() : "—";
+    try { refreshPulseMetricsForHeader(); } catch (_) {}
 
     const qw = getQueryWindows(Date.now());
     const ibGroupsCount = Array.isArray(STATE.ib4cptGroups) ? STATE.ib4cptGroups.length : 0;
@@ -8422,6 +8654,14 @@ function renderPanel() {
         const cphTxt = Number.isFinite(Number(effectiveShiftCph)) ? Number(effectiveShiftCph).toFixed(1) : "—";
         const cphTip = shiftCphSource === "fclm" ? "FCLM PPA Crossdock UPH" : "Local shift-to-now containers/hour";
         pushPart(`Shift CPH: ${cphTxt}`, makeStaffingLabel("Shift CPH", cphTxt, cphTip));
+
+        const pulse = STATE?.pulseMetrics || {};
+        const pulseShift = String(pulse.shiftGroupId || "").trim().toUpperCase() || "--";
+        const pulseBucket = Number.isFinite(Number(pulse.bucketCph)) ? Number(pulse.bucketCph).toFixed(1) : "--";
+        const pulseStd = Number.isFinite(Number(pulse.shiftToDateCph)) ? Number(pulse.shiftToDateCph).toFixed(1) : "--";
+        const pulseHc = Number.isFinite(Number(pulse.crossdockHeadcount)) ? Number(pulse.crossdockHeadcount).toFixed(1) : "--";
+        const pulseLine = `${pulseShift} CPH: ${pulseBucket} | STD: ${pulseStd} | HC: ${pulseHc}`;
+        pushPart(pulseLine, `<span title="Pulse Flow metrics (5-min bucket + shift aggregate)"><b>${pulseShift} CPH:</b> ${pulseBucket} | <b>STD:</b> ${pulseStd} | <b>HC:</b> ${pulseHc}</span>`);
 
         const hcNowTxt = Number.isFinite(Number(hcNeedNow)) ? String(Math.max(0, Number(hcNeedNow))) : "—";
         pushPart(`Headcount Need: ${hcNowTxt}`, makeStaffingLabel("Headcount Need", hcNowTxt));
