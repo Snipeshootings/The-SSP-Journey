@@ -1,4 +1,4 @@
-# TGU (Tampermonkey/Greasemonkey Utilities)
+# SSP Journey (Tampermonkey/Greasemonkey Utilities)
 
 This repository contains browser userscripts for internal transportation and logistics workflows, plus experimental dashboard prototypes.
 
