@@ -8511,11 +8511,34 @@ function renderPanel() {
       let shiftCphSource = "local";
       let shiftProcessedC = null;
       let shiftDueC = null;
+      let arrivedBacklogC = null;
+      let next15C = null;
+      let nearTermWindowHours = 0.25;
       let shiftHoursRemaining = null;
       let effectiveShiftCph = null;
       let shiftHcNow = null;
+      let shiftHcNeedToEnd = null;
       let targetCph = Number(SHIFT_SETTINGS?.targetCph);
       const cutoffHcNow = Number.isFinite(Number(STATE?.staffing?.hcTotal)) ? Number(STATE.staffing.hcTotal) : null;
+
+      const _computeNearTermHeadcountInputs = (loads, nowTs, windowEndTs) => {
+        let arrivedBacklog = 0;
+        let upcomingEta = 0;
+        const done = (l) => String(l?.status || l?.loadStatus || "").toUpperCase().trim() === "COMPLETED";
+        const safeLoads = Array.isArray(loads) ? loads : [];
+        for (const l of safeLoads) {
+          if (done(l)) continue;
+          const c = (typeof _getLoadContainerCount === "function") ? Number(_getLoadContainerCount(l)) : 0;
+          if (!(Number.isFinite(c) && c > 0)) continue;
+
+          const at = (typeof _parseInboundTs === "function") ? _parseInboundTs(l?.actualArrivalTime) : null;
+          if (at != null && at <= nowTs) arrivedBacklog += c;
+
+          const eta = (typeof _getLoadTimeForPlanning === "function") ? Number(_getLoadTimeForPlanning(l)) : 0;
+          if (Number.isFinite(eta) && eta >= nowTs && eta < windowEndTs) upcomingEta += c;
+        }
+        return { arrivedBacklogC: arrivedBacklog, next15C: upcomingEta };
+      };
 
       try {
         if (typeof _getShiftContext === "function" && typeof _shiftToWindowMs === "function") {
@@ -8527,7 +8550,6 @@ function renderPanel() {
             let exp = 0;
             let proc = 0;
             let processedC = 0;
-            let dueC = 0;
             const done = (l) => String(l?.status || l?.loadStatus || "").toUpperCase().trim() === "COMPLETED";
             const nowForShift = Math.min(nowMs, w.endMs);
             for (const l of (STATE?.inboundLoads || [])) {
@@ -8548,13 +8570,6 @@ function renderPanel() {
                   const c = (typeof _getLoadContainerCount === "function") ? Number(_getLoadContainerCount(l)) : 0;
                   if (Number.isFinite(c) && c > 0) processedC += c;
                 }
-              } else {
-                // Remaining due containers now->shift end using planning timestamp.
-                const tp = (typeof _getLoadTimeForShiftPlan === "function") ? Number(_getLoadTimeForShiftPlan(l)) : 0;
-                if (Number.isFinite(tp) && tp > 0 && tp >= nowMs && tp < w.endMs) {
-                  const c = (typeof _getLoadContainerCount === "function") ? Number(_getLoadContainerCount(l)) : 0;
-                  if (Number.isFinite(c) && c > 0) dueC += c;
-                }
               }
             }
             expectedLoads = exp;
@@ -8566,18 +8581,35 @@ function renderPanel() {
             shiftCphNow = processedC / elapsedHrs;
             effectiveShiftCph = shiftCphNow;
             shiftProcessedC = processedC;
-            shiftDueC = dueC;
+            const nearTermWindowMs = Math.max(60000, Math.round(nearTermWindowHours * 3600000));
+            const nearTermWindowEndMs = nowMs + nearTermWindowMs;
+            const nearTermInputs = _computeNearTermHeadcountInputs(STATE?.inboundLoads, nowMs, nearTermWindowEndMs);
+            arrivedBacklogC = nearTermInputs.arrivedBacklogC;
+            next15C = nearTermInputs.next15C;
+            shiftDueC = Math.max(0, arrivedBacklogC + next15C);
 
-            // HC need now->shift end (containers / (hrsRemaining * targetCPH)).
+            // Keep shift-end HC as secondary KPI.
+            let dueCShiftEnd = 0;
+            for (const l of (STATE?.inboundLoads || [])) {
+              if (done(l)) continue;
+              const tp = (typeof _getLoadTimeForPlanning === "function") ? Number(_getLoadTimeForPlanning(l)) : 0;
+              if (Number.isFinite(tp) && tp > 0 && tp >= nowMs && tp < w.endMs) {
+                const c = (typeof _getLoadContainerCount === "function") ? Number(_getLoadContainerCount(l)) : 0;
+                if (Number.isFinite(c) && c > 0) dueCShiftEnd += c;
+              }
+            }
+
+            // HC need now->next horizon (arrived backlog + near-term ETA containers).
             if (!(w.endMs > nowMs)) {
               hcNeedNow = 0;
               shiftHcNow = 0;
               shiftHoursRemaining = 0;
             } else if (Number.isFinite(targetCph) && targetCph > 0) {
               const hrsRemaining = Math.max(0.0001, (w.endMs - nowMs) / 3600000);
-              hcNeedNow = Math.max(0, Math.ceil(dueC / (hrsRemaining * targetCph)));
+              hcNeedNow = Math.max(0, Math.ceil(shiftDueC / (Math.max(0.0001, nearTermWindowHours) * targetCph)));
               shiftHcNow = hcNeedNow;
               shiftHoursRemaining = hrsRemaining;
+              shiftHcNeedToEnd = Math.max(0, Math.ceil(dueCShiftEnd / (hrsRemaining * targetCph)));
             }
 
             // FCLM PPA Shift CPH (Crossdock UPH) preferred when available.
@@ -8640,10 +8672,14 @@ function renderPanel() {
 
         const staffingMathPayload = encodeURIComponent(JSON.stringify({
           processedC: Number.isFinite(Number(shiftProcessedC)) ? Math.round(Number(shiftProcessedC)).toLocaleString() : "—",
+          arrivedBacklogC: Number.isFinite(Number(arrivedBacklogC)) ? Math.round(Number(arrivedBacklogC)).toLocaleString() : "—",
+          next15C: Number.isFinite(Number(next15C)) ? Math.round(Number(next15C)).toLocaleString() : "—",
           shiftDueC: Number.isFinite(Number(shiftDueC)) ? Math.round(Number(shiftDueC)).toLocaleString() : "—",
+          nearTermHours: Number.isFinite(Number(nearTermWindowHours)) ? Number(nearTermWindowHours).toFixed(2) : "—",
           hoursRemaining: Number.isFinite(Number(shiftHoursRemaining)) ? Number(shiftHoursRemaining).toFixed(2) : "—",
           targetCph: Number.isFinite(Number(targetCph)) ? Number(targetCph).toFixed(1) : "—",
           hcNow: Number.isFinite(Number(shiftHcNow)) ? String(Math.max(0, Number(shiftHcNow))) : "—",
+          hcShiftEnd: Number.isFinite(Number(shiftHcNeedToEnd)) ? String(Math.max(0, Number(shiftHcNeedToEnd))) : "—",
           cutoffHc: Number.isFinite(Number(cutoffHcNow)) ? String(Math.max(0, Number(cutoffHcNow))) : ""
         }));
         const makeStaffingLabel = (label, value, tip = "") => {
@@ -8664,7 +8700,9 @@ function renderPanel() {
         pushPart(pulseLine, `<span title="Pulse Flow metrics (5-min bucket + shift aggregate)"><b>${pulseShift} CPH:</b> ${pulseBucket} | <b>STD:</b> ${pulseStd} | <b>HC:</b> ${pulseHc}</span>`);
 
         const hcNowTxt = Number.isFinite(Number(hcNeedNow)) ? String(Math.max(0, Number(hcNeedNow))) : "—";
-        pushPart(`Headcount Need: ${hcNowTxt}`, makeStaffingLabel("Headcount Need", hcNowTxt));
+        const hcShiftEndTxt = Number.isFinite(Number(shiftHcNeedToEnd)) ? String(Math.max(0, Number(shiftHcNeedToEnd))) : "—";
+        pushPart(`Headcount Need (15m): ${hcNowTxt}`, makeStaffingLabel("Headcount Need (15m)", hcNowTxt));
+        pushPart(`Headcount Need (shift end): ${hcShiftEndTxt}`, makeStaffingLabel("Headcount Need (shift end)", hcShiftEndTxt));
         pushPart(`Headcount Recommendation: ${hcRec}`, makeStaffingLabel("Headcount Recommendation", String(hcRec)));
       }
 
@@ -11985,10 +12023,14 @@ function _showStaffingMathPopoverForAnchor(anchorEl) {
 
   const rows = [
     line("Processed C", math.processedC || "—"),
-    line("Due C now→end", math.shiftDueC || "—"),
+    line("Arrived backlog C", math.arrivedBacklogC || "—"),
+    line("ETA next 15m C", math.next15C || "—"),
+    line("Near-term due C", math.shiftDueC || "—"),
+    line("Near-term hours", math.nearTermHours || "—"),
     line("Hours remaining", math.hoursRemaining || "—"),
     line("Target CPH", math.targetCph || "—"),
-    line("HC now", math.hcNow || "—")
+    line("HC need (15m)", math.hcNow || "—"),
+    line("HC need (shift end)", math.hcShiftEnd || "—")
   ];
   if (math.cutoffHc) rows.push(line("Cutoff HC", math.cutoffHc));
 
