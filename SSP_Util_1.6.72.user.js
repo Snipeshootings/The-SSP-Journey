@@ -8666,9 +8666,10 @@ function renderPanel() {
 
         // Hybrid HC view: recommendation + live need now.
         const hcRec = Number.isFinite(Number(sh.neededNow)) ? Number(sh.neededNow) : 0;
-        const hcPlan = Number.isFinite(Number(sh.staffed)) ? Number(sh.staffed) : 0;
-        const d = Number.isFinite(Number(sh.deltaNeed)) ? Number(sh.deltaNeed) : (hcRec - hcPlan);
-        pushHoverPart(`Need Δ (HC Rec - HC Plan): ${formatDelta(d)} (HC Plan: ${hcPlan})`);
+        const hcPlannedShift = Number.isFinite(Number(sh.plannedShift)) ? Number(sh.plannedShift) : 0;
+        const hcStaffed = Number.isFinite(Number(sh.staffed)) ? Number(sh.staffed) : 0;
+        const dPlannedVsStaffed = Number.isFinite(Number(sh.deltaPlannedStaffed)) ? Number(sh.deltaPlannedStaffed) : (hcPlannedShift - hcStaffed);
+        pushHoverPart(`HC Delta (Planned - Staffed): ${formatDelta(dPlannedVsStaffed)} (Planned: ${hcPlannedShift}, Staffed: ${hcStaffed})`);
 
         const staffingMathPayload = encodeURIComponent(JSON.stringify({
           processedC: Number.isFinite(Number(shiftProcessedC)) ? Math.round(Number(shiftProcessedC)).toLocaleString() : "—",
@@ -8704,6 +8705,9 @@ function renderPanel() {
         pushPart(`Headcount Need (15m): ${hcNowTxt}`, makeStaffingLabel("Headcount Need (15m)", hcNowTxt));
         pushPart(`Headcount Need (shift end): ${hcShiftEndTxt}`, makeStaffingLabel("Headcount Need (shift end)", hcShiftEndTxt));
         pushPart(`Headcount Recommendation: ${hcRec}`, makeStaffingLabel("Headcount Recommendation", String(hcRec)));
+        pushPart(`HC Planned (shift total): ${hcPlannedShift}`, makeStaffingLabel("HC Planned (shift total)", String(hcPlannedShift)));
+        pushPart(`HC Staffed (current plan): ${hcStaffed}`, makeStaffingLabel("HC Staffed (current plan)", String(hcStaffed)));
+        pushPart(`Delta (Planned - Staffed): ${formatDelta(dPlannedVsStaffed)}`, makeStaffingLabel("Delta (Planned - Staffed)", formatDelta(dPlannedVsStaffed)));
       }
 
       pushPart(`Selected VRIDs: ${STATE.bulkSelection.size}`, `<span><b>Selected VRIDs:</b> ${STATE.bulkSelection.size}</span>`);
@@ -12853,9 +12857,10 @@ function renderPlanningPanel() {
         let html = "";
         html += throughputFlush;
         const shiftSummary = (typeof _getShiftSummary === "function") ? _getShiftSummary() : null;
-        const plannedHc = (shiftSummary && shiftSummary.ok && Number.isFinite(Number(shiftSummary.staffed))) ? Number(shiftSummary.staffed) : null;
+        const hcPlannedShift = (shiftSummary && shiftSummary.ok && Number.isFinite(Number(shiftSummary.plannedShift))) ? Number(shiftSummary.plannedShift) : null;
+        const hcStaffed = (shiftSummary && shiftSummary.ok && Number.isFinite(Number(shiftSummary.staffed))) ? Number(shiftSummary.staffed) : null;
         const recHc = (hcTotal != null) ? Number(hcTotal) : ((shiftSummary && shiftSummary.ok && Number.isFinite(Number(shiftSummary.neededNow))) ? Number(shiftSummary.neededNow) : null);
-        const deltaVsPlan = (plannedHc != null && recHc != null) ? (recHc - plannedHc) : null;
+        const deltaPlannedStaffed = (hcPlannedShift != null && hcStaffed != null) ? (hcPlannedShift - hcStaffed) : null;
         html += card(
           "Ops-to-Cutoff Headcount (Primary)",
           big(hcTotal == null ? "—" : String(hcTotal), "HC needed now→cutoff"),
@@ -12863,8 +12868,9 @@ function renderPlanningPanel() {
             kv("C due … cutoff", fmtInt(sumC_cut)),
             kv("Hours left", hrsLeft == null ? "—" : hrsLeft.toFixed(2)),
             kv("Target", `${targetCph} CPH`),
-            kv("HC planned", plannedHc == null ? "â€”" : String(plannedHc)),
-            kv("Delta vs plan", deltaVsPlan == null ? "â€”" : formatDelta(deltaVsPlan)),
+            kv("HC Planned (shift total)", hcPlannedShift == null ? "â€”" : String(hcPlannedShift)),
+            kv("HC Staffed (current plan)", hcStaffed == null ? "â€”" : String(hcStaffed)),
+            kv("Delta (Planned - Staffed)", deltaPlannedStaffed == null ? "â€”" : formatDelta(deltaPlannedStaffed)),
             cutoffMs != null ? kv("Cutoff", fmtTime(cutoffMs)) : ""
           ].filter(Boolean).join(""),
         );
@@ -17195,15 +17201,39 @@ function _hhmmToMinutes(hhmm) {
 
     const remaining = Math.max(0, expected - processed);
 
+    // Shift-total workload for active shift:
+    // arrived/on-site now + scheduled/estimated due before shift end.
+    let arrivedShiftC = 0;
+    let dueByShiftEndC = 0;
+    for (const l of (STATE?.inboundLoads || [])) {
+      const actualMs = _parseInboundTs(l?.actualArrivalTime);
+      const planMs = _getLoadTimeForPlanning(l);
+      const c = Number(_getLoadContainerCount(l)) || 0;
+      if (!(c > 0)) continue;
+
+      if (actualMs != null && actualMs >= w.startMs && actualMs <= Math.min(nowMs, w.endMs)) {
+        arrivedShiftC += c;
+        continue;
+      }
+      if (!(actualMs != null) && planMs >= nowMs && planMs < w.endMs) {
+        dueByShiftEndC += c;
+      }
+    }
+    const plannedShiftWorkloadC = (nowMs >= w.startMs && nowMs < w.endMs)
+      ? Math.max(0, arrivedShiftC + dueByShiftEndC)
+      : Math.max(0, expected);
+
     const staffed = Number.isFinite(Number(shift.staffedAAs)) ? Number(shift.staffedAAs) : 0;
 
     // If shift is active, staff against remaining hours; if upcoming, staff against full shift duration.
     const inWindow = nowMs >= w.startMs && nowMs < w.endMs;
     const hoursForCalc = inWindow ? Math.max(0, remainingH) : Math.max(0, durationH);
     const neededNow = hoursForCalc > 0 ? _requiredAAs(remaining, SHIFT_SETTINGS.targetCph, hoursForCalc) : 0;
+    const plannedShift = durationH > 0 ? _requiredAAs(plannedShiftWorkloadC, SHIFT_SETTINGS.targetCph, durationH) : 0;
 
     // Positive delta means we are short (need more AAs). Negative means surplus.
     const deltaNeed = neededNow - staffed;
+    const deltaPlannedStaffed = plannedShift - staffed;
 
     return {
       valid: true,
@@ -17212,8 +17242,10 @@ function _hhmmToMinutes(hhmm) {
       processed,
       remaining,
       neededNow,
+      plannedShift,
       staffed,
       deltaNeed,
+      deltaPlannedStaffed,
     };
   }
 
@@ -17249,8 +17281,10 @@ function _hhmmToMinutes(hhmm) {
       processed: stats.processed,
       remaining: stats.remaining,
       neededNow: stats.neededNow,
+      plannedShift: stats.plannedShift,
       staffed: stats.staffed,
       deltaNeed: stats.deltaNeed,
+      deltaPlannedStaffed: stats.deltaPlannedStaffed,
     };
   }
 
