@@ -8550,7 +8550,7 @@ function renderPanel() {
                 }
               } else {
                 // Remaining due containers now->shift end using planning timestamp.
-                const tp = (typeof _getLoadTimeForPlanning === "function") ? Number(_getLoadTimeForPlanning(l)) : 0;
+                const tp = (typeof _getLoadTimeForShiftPlan === "function") ? Number(_getLoadTimeForShiftPlan(l)) : 0;
                 if (Number.isFinite(tp) && tp > 0 && tp >= nowMs && tp < w.endMs) {
                   const c = (typeof _getLoadContainerCount === "function") ? Number(_getLoadContainerCount(l)) : 0;
                   if (Number.isFinite(c) && c > 0) dueC += c;
@@ -9464,8 +9464,8 @@ if (chip) {
     return active || upcoming || enabled[0];
   }
 
-  function _getLoadTimeForPlanning(load) {
-    // Prefer actual, then scheduled, then estimated.
+  function _getLoadTimeForExecutionNow(load) {
+    // Legacy/execution ordering for retrospective reporting.
     return (
       parseSspDateTime(load?.actualArrivalTime) ||
       parseSspDateTime(load?.scheduledArrivalTime) ||
@@ -9475,6 +9475,24 @@ if (chip) {
       toMs(load?.estimatedArrivalTime) ||
       0
     );
+  }
+
+  function _getLoadTimeForShiftPlan(load) {
+    // Forward-looking ordering: arrived actual, else ETA, else scheduled.
+    return (
+      parseSspDateTime(load?.actualArrivalTime) ||
+      parseSspDateTime(load?.estimatedArrivalTime) ||
+      parseSspDateTime(load?.scheduledArrivalTime) ||
+      toMs(load?.actualArrivalTime) ||
+      toMs(load?.estimatedArrivalTime) ||
+      toMs(load?.scheduledArrivalTime) ||
+      0
+    );
+  }
+
+  function _getLoadTimeForPlanning(load) {
+    // Backward-compatible alias for planning contexts.
+    return _getLoadTimeForShiftPlan(load);
   }
 
   function _fmtYyyyMmDdLocal(ts) {
@@ -12204,7 +12222,7 @@ function renderPlanningPanel() {
     // Source loads: always use full inboundLoads, then filter into the ops window.
     const allLoads = Array.isArray(STATE?.inboundLoads) ? STATE.inboundLoads : [];
     const all = allLoads.filter(l => {
-      const t = _getLoadTimeForPlanning(l);
+      const t = _getLoadTimeForShiftPlan(l);
       if (!t) return true; // keep unknown-timestamp rows visible in ops view
       return (t >= ops.startMs && t < ops.endMs);
     });
@@ -12225,7 +12243,7 @@ function renderPlanningPanel() {
     }
 
     let rows = all.filter(l => {
-      const t = _getLoadTimeForPlanning(l);
+      const t = _getLoadTimeForShiftPlan(l);
       if (!t) return winVal === "ops"; // keep timestamp-less loads in ops view only
       return (t >= wStart && t < wEnd);
     });
@@ -12284,18 +12302,18 @@ function renderPlanningPanel() {
           case "scheduled": {
             const vr = String(l?.vrId || l?.vrid || "").trim();
             const relayMs = Number(STATE.__planRelayByVrid && vr && STATE.__planRelayByVrid[vr] ? STATE.__planRelayByVrid[vr].scheduledMs : 0) || 0;
-            return _getLoadTimeForPlanning({ scheduledArrivalTime: l?.scheduledArrivalTime }) || relayMs || 0;
+            return _getLoadTimeForShiftPlan({ scheduledArrivalTime: l?.scheduledArrivalTime }) || relayMs || 0;
           }
           case "eta": {
             const vr = String(l?.vrId || l?.vrid || "").trim();
             const relayMs = Number(STATE.__planRelayByVrid && vr && STATE.__planRelayByVrid[vr] ? STATE.__planRelayByVrid[vr].etaMs : 0) || 0;
-            return _getLoadTimeForPlanning({ estimatedArrivalTime: l?.estimatedArrivalTime }) || relayMs || 0;
+            return _getLoadTimeForShiftPlan({ estimatedArrivalTime: l?.estimatedArrivalTime }) || relayMs || 0;
           }
           case "arrived": {
             const vr = String(l?.vrId || l?.vrid || "").trim();
             const relayArr = Number(STATE.__planRelayByVrid && vr && STATE.__planRelayByVrid[vr] ? STATE.__planRelayByVrid[vr].arrivedMs : 0) || 0;
             const relayEta = Number(STATE.__planRelayByVrid && vr && STATE.__planRelayByVrid[vr] ? STATE.__planRelayByVrid[vr].etaMs : 0) || 0;
-            return _getLoadTimeForPlanning({ actualArrivalTime: l?.actualArrivalTime }) || relayArr || relayEta || 0;
+            return _getLoadTimeForExecutionNow({ actualArrivalTime: l?.actualArrivalTime }) || relayArr || relayEta || 0;
           }
           case "cntrsLeft": {
             const projected = _getLoadCountsForPlanningMath(l, { allowEstimate: true });
@@ -12372,7 +12390,7 @@ function renderPlanningPanel() {
       if (cutoffMs != null) {
         const opsLoads = Array.isArray(STATE?.inboundLoads) ? STATE.inboundLoads : [];
         for (const l of opsLoads) {
-          const t = _getLoadTimeForPlanning(l);
+          const t = _getLoadTimeForShiftPlan(l);
           if (!t) continue;
           if (t < ops.startMs || t >= ops.endMs) continue;
           if (t > cutoffMs) continue;
@@ -12422,7 +12440,7 @@ function renderPlanningPanel() {
         let sumC = 0, sumP = 0, missing = 0, loads = 0;
         const opsLoads = Array.isArray(STATE?.inboundLoads) ? STATE.inboundLoads : [];
         for (const l of opsLoads) {
-          const t = _getLoadTimeForPlanning(l);
+          const t = _getLoadTimeForShiftPlan(l);
           if (!t) continue;
           if (t < a || t >= b) continue;
           loads++;
@@ -12447,7 +12465,7 @@ function renderPlanningPanel() {
           let dueC = 0, dueP = 0;
           const opsLoads2 = Array.isArray(STATE?.inboundLoads) ? STATE.inboundLoads : [];
           for (const l2 of opsLoads2) {
-            const t2 = _getLoadTimeForPlanning(l2);
+            const t2 = _getLoadTimeForShiftPlan(l2);
             if (!t2) continue;
             if (t2 < ops.startMs || t2 >= ops.endMs) continue;
             if (t2 >= b) continue; // not due yet by this bucket end
@@ -12515,7 +12533,7 @@ function renderPlanningPanel() {
         // Distribute all due-before-cutoff loads into intervals; anything that doesn't fit becomes "unbucketed"
         const opsLoads3 = Array.isArray(STATE?.inboundLoads) ? STATE.inboundLoads : [];
         for (const l3 of opsLoads3) {
-          const t3 = _getLoadTimeForPlanning(l3);
+          const t3 = _getLoadTimeForShiftPlan(l3);
           if (!t3) continue;
           if (t3 < ops.startMs || t3 >= ops.endMs) continue;
           if (t3 > cutoffMs) continue;
@@ -12694,7 +12712,7 @@ function renderPlanningPanel() {
               for (const l of (STATE?.inboundLoads || [])) {
                 const done = String(l?.status || l?.loadStatus || "").toUpperCase().trim() === "COMPLETED";
                 if (done) continue;
-                const t = (typeof _getLoadTimeForPlanning === "function") ? Number(_getLoadTimeForPlanning(l)) : 0;
+                const t = (typeof _getLoadTimeForShiftPlan === "function") ? Number(_getLoadTimeForShiftPlan(l)) : 0;
                 if (!Number.isFinite(t) || t <= 0) continue;
                 if (t < nowMs || t >= wNow.endMs) continue;
                 const c = (typeof _getLoadContainerCount === "function") ? Number(_getLoadContainerCount(l)) : 0;
@@ -17054,7 +17072,7 @@ function _hhmmToMinutes(hhmm) {
   }
 
   function _getLoadTimeForShiftBucketing(load) {
-    return _parseInboundTs(load?.actualArrivalTime) ?? _parseInboundTs(load?.scheduledArrivalTime) ?? null;
+    return _getLoadTimeForShiftPlan(load) || null;
   }
 
   function _getLoadContainerCount(load) {
