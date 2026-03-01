@@ -13116,11 +13116,6 @@ try {
           <input id="ssp2-h-overlay" type="checkbox" ${SETTINGS.overlayOn ? "checked" : ""}/>
           <span style="font-weight:700;">Overlay</span>
         </label>
-
-        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-          <input id="ssp2-h-actionable" type="checkbox" ${SETTINGS.actionableOnly ? "checked" : ""}/>
-          <span style="font-weight:700;">Actionable Only</span>
-        </label>
       </div>
 
       <div style="display:flex;align-items:center;gap:8px;margin-left:14px;">
@@ -13160,13 +13155,6 @@ try {
       persistSettings();
       if (!SETTINGS.overlayOn) removeOverlays();
       else renderOverlays();
-      renderPanel();
-    });
-
-    $("#ssp2-h-actionable").addEventListener("change", (e) => {
-      SETTINGS.actionableOnly = !!e.target.checked;
-      persistSettings();
-      // filter logic to be applied later
       renderPanel();
     });
 
@@ -14184,9 +14172,7 @@ function openSettingsModal(defaultTab) {
 
       // reflect header toggle checkboxes immediately
       const ov = document.getElementById("ssp2-h-overlay");
-      const act = document.getElementById("ssp2-h-actionable");
       if (ov) ov.checked = SETTINGS.overlayOn;
-      if (act) act.checked = SETTINGS.actionableOnly;
 
       // apply immediately
       // Overlays can be toggled off, but phone icons should still bind/rebind.
