@@ -8648,7 +8648,9 @@ function renderPanel() {
       };
 
       pushPart(`Inbound loads: ${inboundCount}`, `<span><b>Inbound loads:</b> ${inboundCount}</span>`);
-      pushPart(`IB4CPT groups: ${ibGroupsCount}`, `<span><b>IB4CPT groups:</b> ${ibGroupsCount}</span>`);
+      if (SETTINGS.diagEnabled) {
+        pushPart(`IB4CPT groups: ${ibGroupsCount}`, `<span><b>IB4CPT groups:</b> ${ibGroupsCount}</span>`);
+      }
 
       if (sh && sh.ok) {
         pushPart(`Shift: ${sh.shiftName} (${sh.label})`, `<span><b>Shift:</b> ${sh.shiftName} (${sh.label})</span>`);
