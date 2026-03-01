@@ -108,10 +108,6 @@ const __sspSeen = { equip: new Set() };
  */
 function __sspMarkUsed(key){ if(!DEV_DIAG) return; __sspDiag.used[key] = (__sspDiag.used[key]||0)+1; }
 /**
- * DEV-only: dump aggregated diagnostic counters to the console.
- */
-function __sspDumpDiag(){ if(!DEV_DIAG) return; try{ console.debug("[SSP Util] DIAG.used", __sspDiag.used); }catch(e){} }
-/**
  * DEV-only: log current URL query params for debugging host/page differences.
  */
 function __sspLogUrlParamsOnce(tag="boot"){
@@ -159,10 +155,6 @@ let __sspBackoffUntil = 0;
  * Monotonic-ish wallclock helper used by cache + backoff logic.
  */
 function __sspNow() { return Date.now(); }
-/**
- * Promise-based sleep helper used by the request scheduler/backoff.
- */
-function __sspSleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 /**
  * Read from the in-memory TTL cache used to dedupe repeated API calls.
@@ -4482,16 +4474,6 @@ async function dumpObPayloadForVrid(vrid) {
   ====================================================== */
   const log = (...a) => console.log("[SSP UTIL]", ...a);
 
-  // Debug guard: referenced in Merge Panel debug payloads
-  function dbgEmptyAa(v) {
-    return (v === undefined) ? null : v;
-  }
-function __diagTrunc(s, max) {
-  if (s == null) return s;
-  s = String(s);
-  return s.length > max ? (s.slice(0, max) + "…(truncated)") : s;
-}
-
 function __diagSafePayload(payload) {
   if (!payload || typeof payload !== "object") return null;
   // Never persist large lists; keys-only unless enabled
@@ -4579,14 +4561,6 @@ function dgroup(title, fn) {
     const end = new Date(start);
     end.setDate(end.getDate() + 1);
     return { startMs: start.getTime(), endMs: end.getTime() };
-  }
-
-  function fmtLocal(ms) {
-    try {
-      return new Date(ms).toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
-    } catch {
-      return String(ms);
-    }
   }
 
   // Centralize the effective query windows we use for inbound/outbound.
@@ -5281,66 +5255,6 @@ function ensureHighlightStyleOverrides() {
     const n = parseInt(full, 16);
     return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
   }
-
-  function pickTextColor(bgHex) {
-    try {
-      const { r, g, b } = hexToRgb(bgHex);
-      // relative luminance (sRGB)
-      const srgb = [r, g, b].map(v => {
-        const c = v / 255;
-        return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
-      });
-      const L = 0.2126 * srgb[0] + 0.7152 * srgb[1] + 0.0722 * srgb[2];
-      return L < 0.5 ? "#ffffff" : "#111827";
-    } catch {
-      return "#111827";
-    }
-  }
-
-  function getContrastingTextColor(hexColor) {
-    // supports #RGB or #RRGGBB
-    let hex = (hexColor || "").trim();
-    if (!hex.startsWith("#")) return "#000";
-
-    hex = hex.slice(1);
-    if (hex.length === 3) hex = hex.split("").map(c => c + c).join("");
-
-   const r = parseInt(hex.slice(0, 2), 16);
-    const g = parseInt(hex.slice(2, 4), 16);
-    const b = parseInt(hex.slice(4, 6), 16);
-
-   // perceived luminance
-   const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
-    return luminance > 0.6 ? "#000" : "#fff";
-  }
-
-
-
-  function clearHighlightStyles(root) {
-  const cells = root.querySelectorAll("td, th");
-  cells.forEach((c) => {
-    if (c.dataset.ssp2HlText === "1") {
-      try {
-        c.style.removeProperty("color");
-        c.style.removeProperty("font-weight");
-        c.style.removeProperty("text-decoration");
-      } catch {
-        c.style.color = "";
-        c.style.fontWeight = "";
-        c.style.textDecoration = "";
-      }
-      delete c.dataset.ssp2HlText;
-    }
-  });
-}
-
-
-function getCandidateCells() {
-  // Broad selectors to catch SSP/Dock Console grid/table cells
-  return Array.from(document.querySelectorAll(
-    "td, th, div[role='gridcell'], div[role='cell'], div[role='columnheader'], .cell, .table-cell"
-  ));
-}
 
 function applyHighlights() {
   const rules = Array.isArray(SETTINGS.highlights)
@@ -16159,8 +16073,6 @@ function ensureDisruptionsPanel() {
        loadGroupId=<single>
        planId=<optional>
  ============================================================ */
-
-function ensureObDetailsProbeWidget_v198_removed(){}
 
 function openMergePanel(laneKey, cptMs, options = {}) {
   STATE.mergePanelOpen = true;
