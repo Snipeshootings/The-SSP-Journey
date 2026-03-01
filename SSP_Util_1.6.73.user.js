@@ -1,4 +1,4 @@
-﻿// ==UserScript==
+// ==UserScript==
 // @name         SSP Util
 // @namespace    https://deicide.internal/ssp-util-2
 // @version 1.6.73
@@ -8220,108 +8220,22 @@ if (r) STATE._lastBulkFmc = { at: Date.now(), ids, resp: r };
     }
   }
 
-  function _buildLaneCapacityMetrics(g) {
-    const mm = g && g.mergeMeta ? g.mergeMeta : {};
-    const capTotal = Math.max(0, Number(mm.capTotal || g?.capacityTotal || 0));
-    const loaded = Math.max(0, Number(mm.loaded || g?.loadedUnits || 0));
-    const staged = Math.max(0, Number(g?.stagedUnits || mm.staged || 0));
-    const stacked = Math.max(0, Number(g?.stackedUnits || mm.stacked || 0));
-    const inFacility = Math.max(0, Number(mm.current || g?.currentUnits || 0));
-    const inFacilityGeneral = Math.max(0, inFacility - staged - stacked);
-    const waitingToUnload = Math.max(0, Number(mm.upstream || g?.inboundUnits || 0));
-
-    const loadedByVrid = [];
-    let loadedSplit = 0;
-    for (const v of (g?.vrids || [])) {
-      const vrid = String(v?.vrid || v?.vrId || "").trim();
-      if (!vrid) continue;
-      const units = Math.max(0, Number((STATE.vridLoadedUnits && STATE.vridLoadedUnits[vrid]) || 0));
-      if (!units) continue;
-      loadedByVrid.push({ key: vrid, value: units });
-      loadedSplit += units;
+  function _renderMergeTopActionsHtml(snapshot, esc) {
+    if (!snapshot || !Array.isArray(snapshot.topActions) || !snapshot.topActions.length) {
+      return `<div style="margin-top:6px;color:#6b7280;font-size:12px;">Top actions: computing...</div>`;
     }
-    loadedByVrid.sort((a, b) => b.value - a.value);
-    if (loaded > loadedSplit) loadedByVrid.push({ key: "Other", value: Math.max(0, loaded - loadedSplit) });
-
-    const stagedByArea = [];
-    const areaObj = g?.stagedByArea || mm?.stagedByArea || null;
-    if (areaObj && typeof areaObj === 'object') {
-      for (const [k, val] of Object.entries(areaObj)) {
-        const n = Math.max(0, Number(val || 0));
-        if (n) stagedByArea.push({ key: String(k || 'Area'), value: n });
-      }
-      stagedByArea.sort((a, b) => b.value - a.value);
-    }
-
-    const used = loaded + staged + inFacilityGeneral + stacked + waitingToUnload;
-    const free = Math.max(0, capTotal - used);
-
-    return {
-      capTotal,
-      totalBaseline: capTotal,
-      loaded,
-      loadedByVrid,
-      staged,
-      stagedByArea,
-      inFacilityGeneral,
-      stacked,
-      waitingToUnload,
-      free,
-    };
-  }
-
-  function renderLaneCapacityPie(g, metrics) {
-    const m = metrics || _buildLaneCapacityMetrics(g || {});
-    const den = Math.max(1, Number(m.capTotal || 0));
-    const segs = [
-      { key: 'loaded', label: 'Loaded', value: Number(m.loaded || 0), color: '#22c55e' },
-      { key: 'staged', label: 'Staged', value: Number(m.staged || 0), color: '#3b82f6' },
-      { key: 'in_facility', label: 'In-facility', value: Number(m.inFacilityGeneral || 0), color: '#f97316' },
-      { key: 'stacked', label: 'Stacked', value: Number(m.stacked || 0), color: '#a855f7' },
-      { key: 'waiting', label: 'Waiting to unload', value: Number(m.waitingToUnload || 0), color: '#eab308' },
-      { key: 'free', label: 'Free', value: Number(m.free || 0), color: '#d1d5db' },
-    ];
-    let acc = 0;
-    const grad = [];
-    for (const seg of segs) {
-      const pct = Math.max(0, Math.min(100, (seg.value / den) * 100));
-      if (pct <= 0.01) continue;
-      grad.push(`${seg.color} ${acc.toFixed(2)}% ${(acc + pct).toFixed(2)}%`);
-      acc += pct;
-    }
-    if (acc < 100) grad.push(`#e5e7eb ${acc.toFixed(2)}% 100%`);
-    const title = `Baseline ${m.totalBaseline || 0} | Loaded ${m.loaded || 0} | Staged ${m.staged || 0} | In-facility ${m.inFacilityGeneral || 0} | Stacked ${m.stacked || 0} | Waiting ${m.waitingToUnload || 0} | Free ${m.free || 0}`;
-    return `<div title="${title}" style="width:58px;height:58px;border-radius:999px;border:1px solid #e5e7eb;background:conic-gradient(${grad.join(',')});position:relative;flex:0 0 auto;">
-      <div style="position:absolute;inset:11px;border-radius:999px;background:#fff;border:1px solid #f3f4f6;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:900;color:#111827;">${Math.round((1 - (m.free || 0) / den) * 100)}%</div>
-    </div>`;
-  }
-
-  function renderLaneActionStrip(g, snapshot, meta) {
-    const esc = meta?.esc || ((v) => String(v ?? ''));
-    const top = (snapshot && Array.isArray(snapshot.topActions) && snapshot.topActions.length) ? snapshot.topActions[0] : null;
-    const laneEsc = esc(g?.lane || snapshot?.lane || '—');
-    const cpt = Number(g?.cptMs || snapshot?.cptMs || 0);
-    const topHtml = (() => {
-      if (!top) return `<span style="color:#6b7280;font-size:12px;">Top action: computing…</span>`;
-      const kind = String(top?.actionType || '').replace(/_/g, ' ').toUpperCase();
-      const tab = _mergeNormalizeScenarioTab(top?.actionType);
-      const rv = _mergeNum(top?.riskDelta, 0);
-      const uv = _mergeNum(top?.utilGain, 0);
-      const color = rv > 0 ? '#065f46' : (uv > 0 ? '#1d4ed8' : '#6b7280');
-      return `<span class="open-merge" data-lane="${laneEsc}" data-cpt="${cpt}" data-merge-tab="${tab}" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;padding:2px 8px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-size:12px;">
+    const rows = snapshot.topActions.map((a) => {
+      const kind = String(a?.actionType || "").replace(/_/g, " ").toUpperCase();
+      const tab = _mergeNormalizeScenarioTab(a?.actionType);
+      const rv = _mergeNum(a?.riskDelta, 0);
+      const uv = _mergeNum(a?.utilGain, 0);
+      const color = rv > 0 ? "#065f46" : (uv > 0 ? "#1d4ed8" : "#6b7280");
+      return `<span class="open-merge" data-lane="${esc(snapshot.lane)}" data-cpt="${snapshot.cptMs}" data-merge-tab="${tab}" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;padding:2px 8px;border-radius:999px;border:1px solid #e5e7eb;background:#fff;">
         <span style="font-weight:900;color:#111827;">${esc(kind)}</span>
         <span style="font-weight:800;color:${color};">R ${rv.toFixed(1)} | U ${uv.toFixed(1)}</span>
       </span>`;
-    })();
-    const cases = Math.max(0, Number(meta?.caseCount || 0));
-    const disruptions = Math.max(0, Number(meta?.disruptionCount || 0));
-    const notes = Math.max(0, Number(meta?.noteCount || 0));
-    const badges = [
-      `<span class="open-cases" data-lane="${laneEsc}" data-cpt="${cpt}" title="Open lane cases" style="cursor:pointer;padding:2px 7px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-size:11px;font-weight:900;">C${cases ? ':' + cases : ''}</span>`,
-      `<span class="open-disruptions" data-lane="${laneEsc}" data-cpt="${cpt}" title="Disruptions" style="cursor:pointer;padding:2px 7px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-size:11px;font-weight:900;">D${disruptions ? ':' + disruptions : ''}</span>`,
-      `<span title="Notes" style="padding:2px 7px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-size:11px;font-weight:900;">N${notes ? ':' + notes : ''}</span>`,
-    ].join('');
-    return `<div style="display:flex;align-items:center;justify-content:flex-end;gap:6px;flex-wrap:wrap;">${badges}${topHtml}</div>`;
+    }).join(" ");
+    return `<div style="margin-top:6px;"><div style="color:#374151;font-weight:900;margin-bottom:4px;">Top Actions</div><div style="display:flex;gap:6px;flex-wrap:wrap;">${rows}</div></div>`;
   }
 
   function _isIbContribFresh(lgKey, maxAgeMs) {
@@ -9405,54 +9319,42 @@ if (DEBUG.laneGroups) {
 
           try { void _ensureMergeDecisionForGroup(g, { includeRelay: false }); } catch (_) {}
           const __decision = _getMergeDecisionForGroup(g);
-          const __metrics = _buildLaneCapacityMetrics(g);
+          const __topActionsHtml = _renderMergeTopActionsHtml(__decision, esc);
+          const ibContribHtml = '';
+// Disruptions indicator (empty until we have lates/slips)
+const __dkey = _ibContribKey(g.lane, g.cptMs);
+const __dis = (typeof computeDisruptionsForLaneCpt === 'function') ? computeDisruptionsForLaneCpt(g.lane, g.cptMs) : [];
+try {
+  STATE.disruptionsByLaneCpt = STATE.disruptionsByLaneCpt || {};
+  STATE.disruptionsByLaneCpt[__dkey] = Array.isArray(__dis) ? __dis : [];
+} catch (_) {}
+const __sev = (() => {
+  let mx = 0;
+  for (const x of (__dis || [])) {
+    const m = Number(x?.minutes || 0);
+    if (x?.kind === "LATE" || x?.kind === "ARRIVED_LATE") mx = Math.max(mx, 2);
+    else if (x?.kind === "ETA_SLIP") mx = Math.max(mx, 1);
+    if (m >= 60) mx = Math.max(mx, 3);
+  }
+  return mx;
+})();
+const __dColor = (__sev >= 3) ? "#dc2626" : (__sev === 2) ? "#f59e0b" : "#60a5fa";
+const disruptDotHtml = (__dis && __dis.length)
+  ? `<span class="disrupt-dot open-disruptions" data-lane="${esc(g.lane)}" data-cpt="${g.cptMs}" title="Disruptions: ${__dis.length}" style="cursor:pointer;width:12px;height:12px;border-radius:999px;display:inline-block;border:1px solid #e5e7eb;background:${__dColor};"></span>`
+  : ``;
 
-          const __dkey = _ibContribKey(g.lane, g.cptMs);
-          const __dis = (typeof computeDisruptionsForLaneCpt === 'function') ? computeDisruptionsForLaneCpt(g.lane, g.cptMs) : [];
-          try {
-            STATE.disruptionsByLaneCpt = STATE.disruptionsByLaneCpt || {};
-            STATE.disruptionsByLaneCpt[__dkey] = Array.isArray(__dis) ? __dis : [];
-          } catch (_) {}
 
-          const __caseKey = _ibContribKey(g.lane, g.cptMs);
-          const __caseVridCount = (STATE.obCaseVridCountByLaneCpt && typeof STATE.obCaseVridCountByLaneCpt[__caseKey] === "number")
-            ? STATE.obCaseVridCountByLaneCpt[__caseKey]
-            : 0;
+// // Outbound cases badge: number of VRIDs on this lane/CPT with >=1 FMC case
+const __caseKey = _ibContribKey(g.lane, g.cptMs);
+const __caseVridCount = (STATE.obCaseVridCountByLaneCpt && typeof STATE.obCaseVridCountByLaneCpt[__caseKey] === "number")
+  ? STATE.obCaseVridCountByLaneCpt[__caseKey]
+  : 0;
 
-          const __relayCache = (typeof _sspRelayCache === "function") ? _sspRelayCache() : {};
-          const __noteCount = (g.vrids || []).reduce((sum, v) => {
-            const vrid = String(v?.vrid || v?.vrId || "").trim();
-            if (!vrid || !__relayCache || !__relayCache[vrid]) return sum;
-            return sum + Number(__relayCache[vrid].notesCount || 0);
-          }, 0);
-
-          const __capPieHtml = renderLaneCapacityPie(g, __metrics);
-          const __actionStripHtml = renderLaneActionStrip(g, __decision, {
-            esc,
-            caseCount: __caseVridCount,
-            disruptionCount: Array.isArray(__dis) ? __dis.length : 0,
-            noteCount: __noteCount,
-          });
-
-          return `
-            <details ${idx == 0 ? "open" : ""} style="border:1px solid #e5e7eb;border-radius:12px;padding:10px;margin-bottom:8px;background:#fff;">
-              <summary style="cursor:pointer;list-style:none;display:flex;align-items:flex-start;justify-content:space-between;gap:10px;">
-                <div style="font-weight:900;min-width:0;">
-                  <span class="ssp-open-lane-map" data-lane="${esc(g.lane)}" data-cpt="${g.cptMs}" style="cursor:pointer;text-decoration:underline;">${esc(g.lane)}</span> (${fmtCptLabel((g && g.cptMs) || (lane && lane.cptMs) || cptMs)})
-                  <div style="margin-top:2px;color:#111827;font-weight:800;">${sub}</div>
-                  <div style="margin-top:2px;color:#6b7280;font-weight:800;">Loads shown: ${g.vrids.length} | CPT remaining loads: ${g.remainingLoadsCpt}</div>
-                </div>
-                <div style="display:flex;align-items:flex-start;gap:10px;">
-                  ${__capPieHtml}
-                  <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end;">
-                    ${__actionStripHtml}
-                    <span class="merge-dot open-merge" data-lane="${esc(g.lane)}" data-cpt="${g.cptMs}" title="Merge: ${stateLabel(g.mergeState)}" style="cursor:pointer;width:12px;height:12px;border-radius:999px;display:inline-block;border:1px solid #e5e7eb;background:${stateColor(g.mergeState)};"></span>
-                  </div>
-                </div>
-              </summary>
-              <div style="margin-top:8px;">${vridRows}</div>
-            </details>
-          `;
+return `            <details ${idx == 0 ? "open" : ""} style="border:1px solid #e5e7eb;border-radius:12px;padding:10px;margin-bottom:8px;background:#fff;">              <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:10px;">                <div style="font-weight:900;">                  <span class="ssp-open-lane-map" data-lane="${esc(g.lane)}" data-cpt="${g.cptMs}" style="cursor:pointer;text-decoration:underline;">${esc(g.lane)}</span> (${fmtCptLabel((g && g.cptMs) || (lane && lane.cptMs) || cptMs)})                  <div style="margin-top:2px;color:#111827;font-weight:800;">${sub}</div>${__topActionsHtml}${ibContribHtml}                  <div style="margin-top:2px;color:#6b7280;font-weight:800;">Loads shown: ${g.vrids.length} | CPT remaining loads: ${g.remainingLoadsCpt}</div>                </div>                <div style="display:flex;gap:6px;align-items:center;">
+	                  <span class="cap-dot open-merge" data-lane="${esc(g.lane)}" data-cpt="${g.cptMs}" title="Capacity: ${capLabel(pct)} (${pct}%)" style="cursor:pointer;width:12px;height:12px;border-radius:999px;display:inline-block;border:1px solid #e5e7eb;background:${capColor(pct)};"></span>
+<span class="merge-dot open-merge" data-lane="${esc(g.lane)}" data-cpt="${g.cptMs}" title="Merge: ${stateLabel(g.mergeState)}" style="cursor:pointer;width:12px;height:12px;border-radius:999px;display:inline-block;border:1px solid #e5e7eb;background:${stateColor(g.mergeState)};"></span>
+${disruptDotHtml}
+	                </div>              </summary>              <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:8px;">                <button class="open-cases" data-lane="${esc(g.lane)}" data-cpt="${g.cptMs}" title="Open lane cases" style="cursor:pointer;padding:4px 12px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;">Cases${__caseVridCount ? ` (${__caseVridCount})` : ``}</button>                <button class="open-merge" data-lane="${esc(g.lane)}" data-cpt="${g.cptMs}" title="Open lane details" style="cursor:pointer;padding:4px 12px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;">Details</button>              </div>              <div style="margin-top:8px;">${vridRows}</div>            </details>          `;
         })
         .join("");
 
