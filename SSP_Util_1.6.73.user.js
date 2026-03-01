@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         SSP Util
 // @namespace    https://deicide.internal/ssp-util-2
-// @version 1.6.72
+// @version 1.6.73
 // ===============================
 // VERSION HISTORY
 // ===============================
