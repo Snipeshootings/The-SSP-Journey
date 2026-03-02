@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SSP Util
 // @namespace    https://deicide.internal/ssp-util-2
-// @version 1.6.73
+// @version 1.6.74
 // ===============================
 // VERSION HISTORY
 // ===============================
@@ -2123,7 +2123,6 @@ function getOpsWindow(nowMs = Date.now()) {
       disruptionSeverity: "high_critical",
       types: {
         mergeAlert: false,
-        lateLoad: false,
         lateAdhoc: false,
         capacityAlert: false,
         stagingAlert: false,
@@ -2151,7 +2150,6 @@ function getOpsWindow(nowMs = Date.now()) {
       disruptionSeverity: String(src.disruptionSeverity || d.disruptionSeverity),
       types: {
         mergeAlert: !!srcTypes.mergeAlert,
-        lateLoad: !!srcTypes.lateLoad,
         lateAdhoc: !!srcTypes.lateAdhoc,
         capacityAlert: !!srcTypes.capacityAlert,
         stagingAlert: !!srcTypes.stagingAlert,
@@ -2200,7 +2198,7 @@ capHardWarnPct: 0.90,      // "in-facility" threshold that enables MERGE NOW log
 capMergeSoonPct: 0.85,     // projected fullness threshold to say MERGE SOON
 capMergeNowPct: 1.00,      // projected fullness threshold to say MERGE NOW
 capRiskPct: 1.00,          // hard fullness threshold to say RISK (overflow)
-mergeInboundWeight: 0.35,  // weight applied to "scheduled/in-transit" inbound volume
+mergeInboundWeight: 0.35,  // weight applied to "scheduled/in-transit" inbound volume (0‑0.95 range; higher=more aggressive)
 adhocOverageUnits: 8,      // units over capacity that triggers ADHOC recommendation
 cancelLeadMinutes: 120,    // suggest CANCEL only when >= this many minutes before CPT
 cancelShowHorizonMinutes: 360, // don't suggest CANCEL earlier than this far out (data can be sparse)
@@ -2376,6 +2374,126 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
   const SLACK_CONFIG = {
     storageKey: "ssp2:slack-config",
   };
+
+  // timer ID for shift summary notifications
+  let __shiftSummaryIntervalId = null;
+
+  // make sure STATE.inboundEligibleMap contains counts for given planIds
+  async function _ensureEligibleCounts(planIds) {
+    try {
+      const uniq = Array.from(new Set((planIds || []).map(p => String(p || "").trim()).filter(Boolean)));
+      if (!uniq.length) return;
+      const existing = STATE.inboundEligibleMap || {};
+      const have = Object.keys(existing || {}).filter(k => uniq.includes(k));
+      if (have.length === uniq.length) return; // already have everything
+
+      const rElig = await postFetch(
+        "/ssp/dock/hrz/ib/fetchdata?",
+        { entity: "getEligibleContainerCountsForLoads", nodeId: STATE.nodeId, loadIds: uniq.join(",") },
+        "IB",
+        { priority: 2 }
+      );
+      const eligMap = rElig?.ret?.eligibleContainerCountMap || {};
+      STATE.inboundEligibleMap = (eligMap && typeof eligMap === "object") ? eligMap : {};
+    } catch (e) {
+      // ignore failures; no eligible counts available
+      STATE.inboundEligibleMap = STATE.inboundEligibleMap || {};
+    }
+  }
+
+  function computeShiftCounts() {
+    const loads = Array.isArray(STATE.inboundLoadsWindow) ? STATE.inboundLoadsWindow : [];
+    let containerSum = 0;
+    let packageSum = 0;
+    const eligMap = STATE.inboundEligibleMap || {};
+    const missing = [];
+
+    for (const l of loads) {
+      const pid = String(l?.planId || "").trim();
+      // containers
+      let c = Number(l?.inTrailerCount?.C || l?.inTrailerCountC || l?.containerCountInTrailer || 0);
+      // packages
+      let p = Number(l?.inTrailerCount?.P || l?.inTrailerCountP || l?.packageCountInTrailer || 0);
+
+      if ((!c || c === 0) && pid) {
+        const rec = eligMap[pid] || {};
+        c = Number(rec.containers || rec.containerCount || rec.totalContainers || rec.eligibleContainers || rec.eligibleContainerCount || 0);
+      }
+      if ((!p || p === 0) && pid) {
+        const rec = eligMap[pid] || {};
+        p = Number(rec.packages || rec.packageCount || rec.totalPackages || rec.eligiblePackages || rec.eligiblePackageCount || 0);
+      }
+
+      if ((!c || c === 0) || (!p || p === 0)) {
+        missing.push({ planId: pid, rec: eligMap[pid] || {}, c, p });
+      }
+
+      if (Number.isFinite(c)) containerSum += c;
+      if (Number.isFinite(p)) packageSum += p;
+    }
+
+    if (missing.length) {
+      console.debug("[SSP Util] computeShiftCounts missing info", missing);
+    }
+
+    return { loads: loads.length, containers: containerSum, packages: packageSum };
+  }
+
+  async function sendShiftCountsSlack() {
+    try {
+      const cfg = getSlackConfig();
+      console.debug("[SSP Util] sendShiftCountsSlack config", cfg);
+      if (!cfg.enabled) {
+        console.debug("[SSP Util] sendShiftCountsSlack aborted: slack disabled");
+        return;
+      }
+
+      // make sure we have eligible counts for the loads we are summarizing
+      const loads = Array.isArray(STATE.inboundLoadsWindow) ? STATE.inboundLoadsWindow : [];
+      const planIds = loads.map(l => String(l?.planId || "").trim()).filter(Boolean);
+      if (planIds.length) {
+        try { await _ensureEligibleCounts(planIds); } catch (e) { console.warn("[SSP Util] failed to refresh eligible counts", e); }
+      }
+
+      const { loads: loadCount, containers, packages } = computeShiftCounts();
+      console.debug("[SSP Util] shift counts computed", { loads: loadCount, containers, packages });
+      const text = `*📊 SHIFT SUMMARY*
+Loads remaining: ${loadCount}
+Containers remaining: ${containers}
+Packages remaining: ${packages}
+Detected: ${formatLocalIsoTimestamp()}`;
+
+      const payload = buildSlackPayload('shift_summary', {
+        loads_remaining: loadCount,
+        containers_remaining: containers,
+        packages_remaining: packages,
+      });
+      payload.message = text;
+      payload.text = text;
+      payload.mrkdwn = true;
+
+      console.debug("[SSP Util] final shift summary payload", payload);
+      const result = await sendSlackMessage(text, payload);
+      console.debug("[SSP Util] shift summary send result", result);
+    } catch (e) {
+      console.warn("[SSP Util] shift summary error", e);
+    }
+  }
+
+  function startShiftSummaryTicker() {
+    if (__shiftSummaryIntervalId) return;
+    console.debug("[SSP Util] starting shift summary ticker");
+    __shiftSummaryIntervalId = setInterval(() => {
+      sendShiftCountsSlack();
+    }, 30 * 60 * 1000);
+  }
+
+  function stopShiftSummaryTicker() {
+    if (__shiftSummaryIntervalId) {
+      clearInterval(__shiftSummaryIntervalId);
+      __shiftSummaryIntervalId = null;
+    }
+  }
   function getSlackConfig() {
     try {
       return lsGet(SLACK_CONFIG.storageKey, { webhookUrl: "", workflowUrl: "", enabled: false, useWorkflow: false });
@@ -2397,8 +2515,30 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
       SETTINGS.slackWorkflowUrl = safe.workflowUrl || "";
       SETTINGS.slackEnabled = !!safe.enabled;
       persistSettings();
+
+      // start/stop ticker based on enabled state
+      if (safe.enabled) {
+        // start ticker and send one immediate summary so users don't wait 30m
+        startShiftSummaryTicker();
+        try { sendShiftCountsSlack(); } catch (e) { /* ignore */ }
+      } else {
+        stopShiftSummaryTicker();
+      }
     } catch {}
   }
+
+  // ensure ticker is running if slack was already enabled when script loaded
+  (function () {
+    try {
+      const cfg = getSlackConfig();
+      console.debug("[SSP Util] startup slack config", cfg);
+      if (cfg.enabled) {
+        startShiftSummaryTicker();
+        // send an initial summary immediately so users see something right away
+        try { sendShiftCountsSlack(); } catch (e) { console.warn("[SSP Util] shift summary initial dispatch failed", e); }
+      }
+    } catch (_) {}
+  })();
 
   function buildSlackPayload(eventType, context) {
     const ctx = (context && typeof context === "object") ? context : {};
@@ -2552,6 +2692,9 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
         <input type="checkbox" id="slack-enabled-check" ${config.enabled ? "checked" : ""} style="cursor:pointer;">
         <label for="slack-enabled-check" style="cursor:pointer;font-weight:700">Enable Slack notifications</label>
       </div>
+      <div style="margin-bottom:15px;font-size:12px;color:#555;">
+        When enabled, SSP Util will also post a *shift summary* message every 30 minutes listing loads, containers, and packages remaining for the active shift.
+      </div>
       <div style="color:#666;margin-bottom:15px;font-size:12px;">
         <div style="margin-bottom:8px;"><strong>How to get a webhook or workflow trigger URL:</strong></div>
         <ol style="margin:0;padding-left:20px;">
@@ -2617,13 +2760,14 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
 
   const ALERT_TYPE_INFO = {
     mergeAlert: { label: "MERGE ALERT", payloadType: "merge_alert" },
-    lateLoad: { label: "LATE LOAD", payloadType: "late_load" },
     lateAdhoc: { label: "LATE ADHOC", payloadType: "late_adhoc" },
     capacityAlert: { label: "CAPACITY ALERT", payloadType: "capacity_alert" },
     stagingAlert: { label: "STAGING ALERT", payloadType: "staging_alert" },
     sdtMissAlert: { label: "SDT CHECK-IN MISS", payloadType: "sdt_checkin_miss" },
     tdrLateAlert: { label: "TDR LATE ALERT", payloadType: "tdr_late_alert" },
     buDriverArrivedAlert: { label: "BU DRIVER ARRIVED ALERT", payloadType: "bu_driver_arrived_alert" },
+    // scheduled summaries (non‑alert)
+    shiftSummary: { label: "SHIFT SUMMARY", payloadType: "shift_summary" },
   };
 
   function _getAlertRuntime() {
@@ -2730,10 +2874,11 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
       if (!(st === "risk" || st === "cancel" || util >= 1)) continue;
       const lane = String(g?.lane || "").trim() || "-";
       const cptMs = Number(g?.cptMs || 0);
+      // signature only includes merge state to fire alerts on state change
       out.push({
         type: "capacityAlert",
         key: `capacity:${lane}::${cptMs}`,
-        signature: `${st}|${Math.round(util * 100)}|${Number(g?.mergeMeta?.overage || 0)}`,
+        signature: `${st}`,
         severity: "critical",
         lane,
         cptMs,
@@ -2833,26 +2978,46 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
       const lane = String(idx?.lane || _alertLane(l)).trim() || "-";
       const cptMs = Number(idx?.cptMs || _alertCptMs(l) || 0);
       const sdtMs = Number(idx?.sdtMs || parseSspDateTime(l?.scheduledDepartureTime || l?.scheduleDepartureTime || l?.scheduledDepartTime || l?.scheduleDepartTime || l?.departureTime || "") || 0);
-      if (!sdtMs) continue;
+      if (!sdtMs && !idx?.relayExpectedCheckInMs) continue; // need at least one baseline
 
       const status = String(idx?.status || l?.loadStatus || l?.status || "").toUpperCase();
       if (isObFinalStatus(status)) continue;
 
       const checkInMs = Number(idx?.checkInMs || 0);
-      const overdueByMs = now - (sdtMs + graceMs);
-      if (overdueByMs <= 0 || checkInMs > 0) continue;
+      const relayExpCheck = Number(idx?.relayExpectedCheckInMs || 0);
+      const relayExpDepart = Number(idx?.relayExpectedDepartureMs || 0);
+
+      // use relay expected check-in if available, otherwise fall back to sdt
+      const baselineMs = relayExpCheck > 0 ? relayExpCheck : sdtMs;
+      const effectiveMs = checkInMs > 0 ? checkInMs : now;
+      const overdueByMs = effectiveMs - (baselineMs + graceMs);
+      if (overdueByMs <= 0) continue;
+      // debug why the row triggered and which baseline we used
+      if (relayExpCheck > 0) {
+        console.debug("[SSP Util] sdt miss using relay baseline", { vrid, baselineMs, sdtMs, relayExpCheck });
+      }
 
       const overdueMin = Math.floor(overdueByMs / 60000);
       const severity = overdueMin >= 60 ? "critical" : (overdueMin >= 20 ? "warning" : "info");
+      const isPostCheck = checkInMs > 0;
+      const verb = isPostCheck ? "checked in late by" : "missed check-in by";
+
       out.push({
         type: "sdtMissAlert",
         key: `sdt-miss:${vrid}`,
-        signature: `${sdtMs}|${graceMs}|${status}`,
+        // include checkInMs/baseline so row will re-fire when a real check-in occurs or baseline changes
+        signature: `${baselineMs}|${graceMs}|${status}|${checkInMs}`,
         severity,
         lane,
         cptMs,
         vrid,
-        line: `${lane} | VRID ${vrid} | SDT ${_fmtAlertTime(sdtMs)} missed check-in by ${overdueMin}m${graceMs ? ` (grace ${Math.round(graceMs / 60000)}m)` : ""}`,
+        // expose both possible baselines for info
+        sdtMs,
+        baselineMs,
+        checkInMs,
+        relayExpectedCheckInMs: relayExpCheck,
+        relayExpectedDepartureMs: relayExpDepart,
+        line: `${lane} | VRID ${vrid} | ${relayExpCheck ? "ARR" : "SDT"} ${_fmtAlertTime(baselineMs)}${relayExpDepart ? `-${_fmtAlertTime(relayExpDepart)}` : ""} ${verb} ${overdueMin}m${graceMs ? ` (grace ${Math.round(graceMs / 60000)}m)` : ""}`,
       });
     }
 
@@ -2861,7 +3026,11 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
 
 
   // 🚀 New “SDT Check-in Miss” alert implemented
-  // - Uses Relay detail completionTime as check-in
+  // - Uses Relay detail completionTime (or first stop action) as check-in
+  // - Expected check‑in pulled from Relay detail (pickupWindows start, falling back to startTime)
+  //   and stored in vridIndex.sdtMs so alarms use the most accurate time.
+  // - Also captures relay pickup window end for departure time
+  // - Slack payload now includes expected/actual check-in and relay window times
   // - Separate from existing TDR late logic
   // - Integrated into alert prioritization & Slack payloads
   // - Configurable via alerts settings
@@ -2890,51 +3059,6 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
     return out;
   }
 
-  async function _collectLateLoadRows(alertsCfg) {
-    const out = [];
-    const lateThreshold = Math.max(1, Number(alertsCfg?.thresholds?.lateMinutes || 15));
-    try {
-      const inbound = (typeof computeDisruptionsAll === "function") ? (computeDisruptionsAll() || []) : [];
-      for (const r of inbound) {
-        const mins = Number(r?.minutes || 0);
-        if (mins < lateThreshold) continue;
-        const lane = String(r?.laneKey || "").trim() || "-";
-        const cptMs = Number(r?.cptMs || 0);
-        const kind = String(r?.kind || "LATE").toUpperCase();
-        const vrid = String(r?.vrid || "").trim();
-        out.push({
-          type: "lateLoad",
-          key: `late-load-ib:${vrid}:${lane}:${cptMs}`,
-          signature: `${kind}|${mins}`,
-          severity: mins >= 60 ? "critical" : "warning",
-          lane,
-          cptMs,
-          vrid,
-          line: `${lane} | VRID ${vrid || "-"} | ${kind} ${mins}m | CPT ${_fmtAlertTime(cptMs)}`,
-        });
-      }
-    } catch (_) {}
-
-    const outbound = await _getOutboundDisruptionRowsForAlerts(alertsCfg);
-    for (const r of (outbound || [])) {
-      const lane = String(r?.laneKey || r?.lane || "").trim() || "-";
-      const cptMs = Number(r?.cptMs || 0);
-      const vrid = String(r?.vrid || "").trim();
-      const sev = String(r?.severity || "").toUpperCase();
-      const mins = Number(r?.minutes || 0);
-      out.push({
-        type: "lateLoad",
-        key: `late-load-ob:${vrid}:${lane}:${cptMs}`,
-        signature: `${sev}|${mins}|${String(r?.kind || "")}`,
-        severity: "critical",
-        lane,
-        cptMs,
-        vrid,
-        line: `${lane} | VRID ${vrid || "-"} | outbound ${sev || "HIGH"}${mins ? ` ${mins}m` : ""} | CPT ${_fmtAlertTime(cptMs)}`,
-      });
-    }
-    return out;
-  }
 
   function _buildAlertMessage(typeKey, rows, alertsCfg) {
     const info = ALERT_TYPE_INFO[typeKey] || { label: String(typeKey || "ALERT").toUpperCase(), payloadType: "general_alert" };
@@ -2979,7 +3103,6 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
       if (enabledTypes.sdtMissAlert) allRows = allRows.concat(_collectSdtMissRows(outboundLoads, STATE.vridIndex || {}, alertsCfg));
       if (enabledTypes.tdrLateAlert) allRows = allRows.concat(_collectTdrLateRows(STATE.vridIndex || {}));
       if (enabledTypes.buDriverArrivedAlert) allRows = allRows.concat(_collectBuDriverArrivedRows(outboundLoads));
-      if (enabledTypes.lateLoad) allRows = allRows.concat(await _collectLateLoadRows(alertsCfg));
 
       const nextActive = {};
       const pendingByType = new Map();
@@ -2993,7 +3116,6 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
 
       const sendOrder = [
         "mergeAlert",
-        "lateLoad",
         "lateAdhoc",
         "capacityAlert",
         "stagingAlert",
@@ -3009,7 +3131,8 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
         const maxSev = rows.reduce((acc, r) => (_alertSeverityRank(r.severity) > _alertSeverityRank(acc) ? r.severity : acc), "info");
         const info = ALERT_TYPE_INFO[t] || { payloadType: "general_alert" };
         const first = rows[0] || {};
-        const payload = buildSlackPayload(info.payloadType, {
+        // build base payload data
+        const payloadData = {
           severity: maxSev,
           site: STATE?.nodeId || "",
           lane: first.lane || "",
@@ -3017,7 +3140,18 @@ cancelMinObservedUnits: 6,   // require at least this many observed units (facil
           cpt: _fmtAlertTime(first.cptMs),
           message: text,
           text,
-        });
+        };
+        // attach relay/check-in details for SDT misses
+        if (t === "sdtMissAlert") {
+          // show whichever schedule baseline was used (relay arrival or SDT)
+          const base = Number(first.baselineMs || first.sdtMs || 0);
+          if (base) payloadData.scheduled_checkin = _fmtAlertTime(base);
+          if (first.relayExpectedCheckInMs) payloadData.relay_expected_start = _fmtAlertTime(first.relayExpectedCheckInMs);
+          if (first.relayExpectedDepartureMs) payloadData.relay_expected_departure = _fmtAlertTime(first.relayExpectedDepartureMs);
+          if (first.checkInMs) payloadData.actual_checkin = _fmtAlertTime(first.checkInMs);
+        }
+
+        const payload = buildSlackPayload(info.payloadType, payloadData);
         payload.mrkdwn = true;
         await sendSlackMessage(text, payload);
       }
@@ -6250,7 +6384,10 @@ const nowPct   = Number(SETTINGS.capMergeNowPct ?? 1.00);
 const riskPct  = Number(SETTINGS.capRiskPct ?? 1.00);
 
 const baseWRaw = Number(SETTINGS.mergeInboundWeight);
-const baseW = Number.isFinite(baseWRaw) ? Math.max(0, Math.min(baseWRaw, 0.50)) : 0.35;
+// allow a much larger ceiling than before; users may push close to 1.0 so inbound is
+// nearly counted 1‑for‑1 once it’s in the pipeline.  Previously we capped at 0.5 which
+// produced a sharp jump when loads checked in.
+const baseW = Number.isFinite(baseWRaw) ? Math.max(0, Math.min(baseWRaw, 0.95)) : 0.65;
 
 const adhocOver = Math.max(0, Number(SETTINGS.adhocOverageUnits ?? 8));
 const cancelLeadMin = Math.max(0, Number(SETTINGS.cancelLeadMinutes ?? 120));
@@ -6303,7 +6440,7 @@ Object.values(map).forEach(cpt => {
     if (minsToCpt > 180) inboundW = Math.min(inboundW, 0.15);
     else if (minsToCpt > 90) inboundW = Math.min(inboundW, 0.25);
     else if (minsToCpt > 45) inboundW = Math.min(inboundW, baseW); // typically 0.35
-    else inboundW = Math.max(inboundW, 0.50);
+    else inboundW = Math.max(inboundW, 0.95); // almost fully weighted when imminent
   }
 
   const projUnits = (facility + inboundW * upstream);
@@ -8714,20 +8851,7 @@ function renderPanel() {
 
       pushPart(`Selected VRIDs: ${STATE.bulkSelection.size}`, `<span><b>Selected VRIDs:</b> ${STATE.bulkSelection.size}</span>`);
 
-      const relayState = String((STATE.relayConnectivity && STATE.relayConnectivity.state) || "unknown");
-      const relayStatusLabel = (() => {
-        if (relayState === "connected") return "Relay connected";
-        if (relayState === "fallback") return "Relay fallback";
-        if (relayState === "no_auth") return "Relay not authed";
-        if (relayState === "auth_only") return "Relay auth ready";
-        if (relayState === "error") return "Relay error";
-        return "Relay unknown";
-      })();
-      const needsRelayRetry = relayState === "no_auth" || relayState === "error";
-      const relayHtml = needsRelayRetry
-        ? `${getRelayConnectivityBadgeHtml()} <button id="ssp2-relay-retry-inline" style="padding:2px 8px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;cursor:pointer;">Relay Auth Retry</button>`
-        : getRelayConnectivityBadgeHtml();
-      pushPart(relayStatusLabel, relayHtml);
+      // relay connectivity information moved to settings debug panel; header status no longer includes relay state.
 
       const sep = ` <span style="opacity:.35;margin:0 8px;">|</span> `;
       const html = partsHtml.join(sep);
@@ -9051,6 +9175,18 @@ STATE.actionGroups = groups;
 
         let currentUnits = currentSum;
 
+        // Prefer the freshest OB "current units" if we have it; this is what the panel
+        // displays when available.  Without this step, mergeMeta (and consequently the
+        // util pct shown on the lane card) can lag behind the UI because OB data is
+        // fetched asynchronously after the groups are constructed.
+        if (groupKey && STATE.cuByGroupKey) {
+          const cu = STATE.cuByGroupKey[groupKey];
+          if (cu && !cu.loading && !cu.error && Number.isFinite(Number(cu.units))) {
+            currentUnits = Number(cu.units);
+            cuPending = false;
+          }
+        }
+
         // Prefer cached OB-derived Current Units (loadGroupContainerCache), but fall back to CPT-derived aggregates (groupAgg)
         // when OB stats are pending/unavailable.
         if (groupKey && STATE.groupAgg && STATE.groupAgg[groupKey]) {
@@ -9094,7 +9230,7 @@ STATE.actionGroups = groups;
           const riskPct  = Number(SETTINGS.capRiskPct ?? 1.00);
 
           const baseWRaw = Number(SETTINGS.mergeInboundWeight);
-          const baseW = Number.isFinite(baseWRaw) ? Math.max(0, Math.min(baseWRaw, 0.50)) : 0.35;
+          const baseW = Number.isFinite(baseWRaw) ? Math.max(0, Math.min(baseWRaw, 0.95)) : 0.35;
 
           const minsToCpt = Number.isFinite(Number(g.cptMs))
             ? Math.round((Number(g.cptMs) - Date.now()) / 60000)
@@ -9283,12 +9419,12 @@ if (DEBUG.laneGroups) {
               ? Math.round((Number(g.cptMs) - Date.now()) / 60000)
               : NaN;
             const baseWRaw = Number(SETTINGS.mergeInboundWeight);
-            let w = Number.isFinite(baseWRaw) ? Math.max(0, Math.min(baseWRaw, 0.50)) : 0.35;
+            let w = Number.isFinite(baseWRaw) ? Math.max(0, Math.min(baseWRaw, 0.95)) : 0.35;
             if (!Number.isFinite(minsToCpt)) return w;
             if (minsToCpt > 180) return Math.min(w, 0.15);
             if (minsToCpt > 90) return Math.min(w, 0.25);
             if (minsToCpt > 45) return w;
-            return Math.max(w, 0.50);
+            return Math.max(w, 0.95);
           })();
           const __fallbackCurrent = (() => {
             if (curNum === null || Number.isNaN(curNum)) return 0;
@@ -9297,8 +9433,22 @@ if (DEBUG.laneGroups) {
             if (ld > 0 && raw >= ld && (raw - ld) <= capTotal) return Math.max(0, raw - ld);
             return raw;
           })();
-          const __utilNum = (__mm && __utilDen)
-            ? (Number(__mm.loaded || 0) + Number(__mm.current || 0) + (Number(__mm.inboundW || 0) * Number(__mm.upstream || 0)))
+          // compute util using whichever current value is actually being displayed;
+          // also refresh mergeMeta properties so that any subsequent alert logic will be
+          // based on the same numbers.
+          const mmLoaded = Number(__mm?.loaded || 0);
+          const mmUpstream = Number(__mm?.upstream || 0);
+          const mmInboundW = Number(__mm?.inboundW || 0);
+          const mmCap = __utilDen;
+          const mmCurrent = Number.isFinite(curNum) ? curNum : Number(__mm?.current || 0);
+          if (__mm) {
+            __mm.loaded = mmLoaded;
+            __mm.current = mmCurrent;
+            __mm.upstream = mmUpstream;
+          }
+
+          const __utilNum = (__utilDen && __mm)
+            ? (mmLoaded + mmCurrent + (mmInboundW * mmUpstream))
             : (Number(g.loadedUnits || 0) + __fallbackCurrent + (__fallbackW * Number(g.inboundUnits || 0)));
           const __utilPct = (__utilDen > 0) ? Math.round((__utilNum / __utilDen) * 100) : 0;
           const __utilFactorDisp = (__utilDen > 0 && Number.isFinite(__utilNum))
@@ -9851,7 +10001,7 @@ function _findShiftByKey(key) {
 function _updatePlanSortIndicators(panel) {
   try {
     const PLAN = (window.__SSP_PLAN__ = window.__SSP_PLAN__ || { sort: { key: "status", dir: "asc" } });
-    const keys = ["vrid","planId","route","status","cntrsLeft","scheduled","eta","arrived","equip","loc"];
+    const keys = ["vrid","route","status","cntrsLeft","scheduled","eta","arrived","equip","loc"];
     const ths = panel.querySelectorAll("#ssp2-plan-table thead th");
     ths.forEach((th, i) => {
       const k = keys[i];
@@ -10113,6 +10263,38 @@ async function _sspFmcGetExecutionById(vrid) {
 }
 
 
+// helpers for interpreting relay detail timestamps
+function parseRelayExpectedCheckInMs(relayDetail) {
+  // look for pickup window start, then fall back to detail.startTime
+  try {
+    const req = Array.isArray(relayDetail?.freight?.requests) ? relayDetail.freight.requests[0] : null;
+    const win = req && Array.isArray(req.pickupWindows) ? req.pickupWindows[0] : null;
+    if (win) {
+      const iso = win.start || win.end || "";
+      const ms = Number(_msFromAny(iso) || 0);
+      if (ms > 0) return ms;
+    }
+  } catch (_) {}
+  const iso2 = relayDetail?.startTime || relayDetail?.expectedCheckInTime || "";
+  const ms2 = Number(_msFromAny(iso2) || 0);
+  return ms2 > 0 ? ms2 : 0;
+}
+
+function parseRelayExpectedDepartureMs(relayDetail) {
+  try {
+    const req = Array.isArray(relayDetail?.freight?.requests) ? relayDetail.freight.requests[0] : null;
+    const win = req && Array.isArray(req.pickupWindows) ? req.pickupWindows[0] : null;
+    if (win) {
+      const iso = win.end || win.start || "";
+      const ms = Number(_msFromAny(iso) || 0);
+      if (ms > 0) return ms;
+    }
+  } catch (_) {}
+  const iso2 = relayDetail?.endTime || relayDetail?.expectedDepartureTime || "";
+  const ms2 = Number(_msFromAny(iso2) || 0);
+  return ms2 > 0 ? ms2 : 0;
+}
+
 function parseRelayCheckInMs(relayDetail) {
   const firstStop = Array.isArray(relayDetail?.stops) ? relayDetail.stops[0] : null;
   if (!firstStop) return 0;
@@ -10143,6 +10325,14 @@ function parseRelayCheckInMs(relayDetail) {
     if (reportMs > 0) return reportMs;
   }
 
+  // extra fallback: some detail payloads include actions array
+  const actions = Array.isArray(firstStop?.actions) ? firstStop.actions : [];
+  for (const a of actions) {
+    const comp = a?.completionTime || a?.actualTime || a?.completedTime;
+    const aMs = Number(_msFromAny(comp) || 0);
+    if (aMs > 0) return aMs;
+  }
+
   return 0;
 }
 
@@ -10153,11 +10343,24 @@ function _mergeRelayDetailIntoVridIndex(vrid, relayDetail) {
   const prev = STATE.vridIndex[v] || { vrid: v };
   const nextStatus = String(relayDetail?.currentStatus || relayDetail?.executionStatusV2 || relayDetail?.executionStatus || "").trim();
   const checkInMs = Number(parseRelayCheckInMs(relayDetail) || 0);
+  const expectedCheckMs = Number(parseRelayExpectedCheckInMs(relayDetail) || 0);
+  const expectedDepartMs = Number(parseRelayExpectedDepartureMs(relayDetail) || 0);
+
+  // if relay gives a better SDT (expected check-in) use it
+  let mergedSdt = Number(prev?.sdtMs || 0) || 0;
+  if (expectedCheckMs > 0 && expectedCheckMs !== mergedSdt) {
+    mergedSdt = expectedCheckMs;
+  }
+
   STATE.vridIndex[v] = {
     ...prev,
     vrid: v,
     relayStatus: nextStatus || prev.relayStatus || "",
     checkInMs: checkInMs || Number(prev?.checkInMs || 0) || 0,
+    relayExpectedCheckInMs: expectedCheckMs || Number(prev?.relayExpectedCheckInMs || 0) || 0,
+    relayExpectedDepartureMs: expectedDepartMs || Number(prev?.relayExpectedDepartureMs || 0) || 0,
+    // ensure sdtMs stays available for other logic
+    sdtMs: mergedSdt,
   };
 }
 function _sspRelayParseIsoToLocal(iso) {
@@ -11636,7 +11839,6 @@ function ensurePlanningPanel() {
               <thead>
                 <tr style="text-align:left;border-bottom:1px solid #e5e7eb;">
                   <th style="padding:8px 6px;">VRID</th>
-                  <th style="padding:8px 6px;">PlanId</th>
                   <th style="padding:8px 6px;">Route</th>
                   <th style="padding:8px 6px;">Status</th>
                   <th style="padding:8px 6px;">Cntrs Left</th>
@@ -11652,7 +11854,7 @@ function ensurePlanningPanel() {
           </div>
         </div>
 
-        <!-- Right: Math + Debug (?^1/3) -->
+        <!-- Right: Math only (debug info folded into math output) -->
         <div id="ssp2-plan-right" style="flex:1;min-width:340px;max-width:520px;display:flex;flex-direction:column;border-left:1px solid #e5e7eb;padding-left:10px;min-height:0;">
           <div id="ssp2-plan-right-top" style="flex:1;min-height:0;display:flex;flex-direction:column;">
             <div style="font-weight:900;margin-bottom:6px;">Container Math</div>
@@ -11664,12 +11866,6 @@ function ensurePlanningPanel() {
             </div>
             <div id="ssp2-plan-mathui" style="flex:1;min-height:0;overflow:auto;background:#0b1020;color:#e5e7eb;border-radius:10px;padding:10px;"></div>
             <pre id="ssp2-plan-mathpre" style="display:none;flex:1;min-height:0;overflow:auto;background:#0b1020;color:#dbeafe;border-radius:10px;padding:10px;font-size:11px;line-height:1.25;white-space:pre-wrap;"></pre>
-          </div>
-
-          <div id="ssp2-plan-right-bot" style="flex:1;min-height:0;display:flex;flex-direction:column;margin-top:10px;">
-            <div style="font-weight:900;margin-bottom:6px;">Debug</div>
-            <div id="ssp2-plan-debug-meta" style="font-weight:800;color:#374151;margin-bottom:8px;"></div>
-            <pre id="ssp2-plan-debugpre" style="flex:1;min-height:0;overflow:auto;background:#0b1020;color:#dbeafe;border-radius:10px;padding:10px;font-size:11px;line-height:1.25;white-space:pre-wrap;"></pre>
           </div>
         </div>
       </div>
@@ -11733,7 +11929,7 @@ document.body.appendChild(p);
     try {
       const PLAN = (window.__SSP_PLAN__ = window.__SSP_PLAN__ || { sort: { key: "status", dir: "asc" } });
       const ths = p.querySelectorAll("#ssp2-plan-table thead th");
-      const keys = ["vrid","planId","route","status","cntrsLeft","scheduled","eta","arrived","equip","loc"];
+      const keys = ["vrid","route","status","cntrsLeft","scheduled","eta","arrived","equip","loc"];
       ths.forEach((th, i) => {
         const k = keys[i];
         if (!k) return;
@@ -12408,8 +12604,6 @@ function renderPlanningPanel() {
     try {
       const mathPre = panel.querySelector("#ssp2-plan-mathpre");
       const mathMeta = panel.querySelector("#ssp2-plan-math-meta");
-      const dbgPre = panel.querySelector("#ssp2-plan-debugpre");
-      const dbgMeta = panel.querySelector("#ssp2-plan-debug-meta");
 
       // Determine MOR2 cutoff (30 mins before MOR2 end) within ops window
       const targetCph = Number(SHIFT_SETTINGS?.targetCph) || 15;
@@ -12549,7 +12743,12 @@ function renderPlanningPanel() {
       if (mathMeta) {
         const cutTxt = (cutoffMs != null) ? `${fmtTime(ops.startMs)}→${fmtTime(cutoffMs)}` : "n/a";
         const mor2Txt = mor2W ? `${fmtTime(mor2W.startMs)}→${fmtTime(mor2W.endMs)} (cutoff ${fmtTime(cutoffMs)})` : "MOR2 not configured";
-        mathMeta.textContent = `Target: ${targetCph} CPH | MOR2: ${mor2Txt} | Cutoff Window: ${cutTxt}`;
+        // add debug summary info
+        const PLAN = window.__SSP_PLAN__ || {};
+        const sort = PLAN.sort || { key: "status", dir: "asc" };
+        const rendered = panel.querySelectorAll("#ssp2-plan-tbody tr").length;
+        const dbgSummary = ` | Sort: ${sort.key} (${sort.dir}) | Rows: ${rows.length} | Rendered: ${rendered}`;
+        mathMeta.textContent = `Target: ${targetCph} CPH | MOR2: ${mor2Txt} | Cutoff Window: ${cutTxt}${dbgSummary}`;
       }
 
       // 2b) Cutoff staffing + breakdown (bucketed by shift windows, clipped to cutoff)
@@ -12696,7 +12895,30 @@ function renderPlanningPanel() {
         lines.push(`    Remaining: C=${ps.C.toLocaleString()} P=${ps.P.toLocaleString()} | loads=${ps.loads} missing=${ps.missing} | HC_shift: ${ps.hc}${hcNowTxt}`);
       }
 
-      if (mathPre) mathPre.textContent = lines.join("\n");
+      if (mathPre) {
+        // append debug details at end of pre output
+        const PLAN = window.__SSP_PLAN__ || {};
+        const sort = PLAN.sort || { key: "status", dir: "asc" };
+        const sample = rows.slice(0, 6).map(l => ({
+          vrid: l?.vrId || l?.vrid,
+          status: l?.status,
+          scheduled: l?.scheduledArrivalTime,
+          arrived: l?.actualArrivalTime,
+          equip: l?.equipmentType || l?.trailerEquipmentType,
+          location: _getLoadLocationForPlanning(l),
+          cntrsLeft: _getLoadContainersLeftForPlanning(l),
+          pkgsLeft: (STATE.__planPkgs && l?.planId) ? STATE.__planPkgs[String(l.planId).trim()] : undefined,
+        }));
+        const dbgLines = [
+          "",
+          "DEBUG",
+          `Sort: ${sort.key} (${sort.dir}) | Rows: ${rows.length} | Rendered: ${panel.querySelectorAll("#ssp2-plan-tbody tr").length}`,
+          `Window: ${new Date(wStart).toLocaleString()} → ${new Date(wEnd).toLocaleString()}`,
+          `Ops: ${new Date(ops.startMs).toLocaleString()} → ${new Date(ops.endMs).toLocaleString()}`,
+          `Sample: ${JSON.stringify(sample, null, 2)}`
+        ];
+        mathPre.textContent = lines.concat(dbgLines).join("\n");
+      }
 
       // SUMMARY cards for PAs/AMs (execution view)
       if (mathUi) {
@@ -12900,42 +13122,13 @@ function renderPlanningPanel() {
       }
 
 
-      // Render: debug (bottom-right)
-      if (dbgMeta) {
-        const PLAN = window.__SSP_PLAN__ || {};
-        const sort = PLAN.sort || { key: "status", dir: "asc" };
-        dbgMeta.textContent = `Sort: ${sort.key} (${sort.dir}) | Rows: ${rows.length} | Rendered: ${panel.querySelectorAll("#ssp2-plan-tbody tr").length}`;
-      }
-      if (dbgPre) {
-        const PLAN = window.__SSP_PLAN__ || {};
-        const sort = PLAN.sort || { key: "status", dir: "asc" };
-        const sample = rows.slice(0, 6).map(l => ({
-          vrid: l?.vrId || l?.vrid,
-          status: l?.status,
-          scheduled: l?.scheduledArrivalTime,
-          arrived: l?.actualArrivalTime,
-          equip: l?.equipmentType || l?.trailerEquipmentType,
-          location: _getLoadLocationForPlanning(l),
-          cntrsLeft: _getLoadContainersLeftForPlanning(l),
-          pkgsLeft: (STATE.__planPkgs && l?.planId) ? STATE.__planPkgs[String(l.planId).trim()] : undefined,
-        }));
-        dbgPre.textContent = [
-          `Window: ${new Date(wStart).toLocaleString()} → ${new Date(wEnd).toLocaleString()}`,
-          `Ops: ${new Date(ops.startMs).toLocaleString()} → ${new Date(ops.endMs).toLocaleString()}`,
-          `Sample: ${JSON.stringify(sample, null, 2)}`
-        ].join("\n");
-      }
     } catch (e) {
       // keep UI resilient and visibly indicate why cards are empty
       try {
         const mathUi = panel.querySelector("#ssp2-plan-mathui");
-        const dbgPre = panel.querySelector("#ssp2-plan-debugpre");
         const msg = String(e?.message || e || "Unknown planning render error");
         if (mathUi) {
           mathUi.innerHTML = `<div style="border:1px solid rgba(248,113,113,.5);border-radius:10px;padding:10px;background:rgba(127,29,29,.25);color:#fecaca;font-weight:900;">Container Math render error: ${esc(msg)}</div>`;
-        }
-        if (dbgPre) {
-          dbgPre.textContent = `Container Math render error: ${msg}\n${String(e?.stack || "")}`.trim();
         }
       } catch (_) {}
     }
@@ -13004,7 +13197,6 @@ try {
       }
 
       tr.appendChild(vrEl ? tdNode(vrEl) : tdText(vrid));
-      tr.appendChild(tdText(planId));
       
       // Route (hover -> Relay iframe preview)
       let routeEl = null;
@@ -13079,10 +13271,10 @@ try {
     if (!tbody.children.length) {
       const tr0 = document.createElement('tr');
       const td0 = document.createElement('td');
-      td0.colSpan = 10;
+      td0.colSpan = 9;
       td0.style.padding = '10px 6px';
       td0.style.color = '#6b7280';
-      td0.textContent = 'No rows rendered in table. (Rows exist in memory; see Debug panel.)';
+      td0.textContent = 'No rows rendered in table. (Rows exist in memory; see math details.)';
       tr0.appendChild(td0);
       tbody.appendChild(tr0);
     }
@@ -13109,7 +13301,6 @@ try {
     bar.innerHTML = `
       <div style="display:flex;align-items:center;gap:8px;">
         <span style="font-weight:800;">SSP Util 2.0</span>
-        <span style="padding:2px 8px;border-radius:999px;background:#f3f4f6;border:1px solid #e5e7eb;font-weight:700;">ssp-dock</span>
         <span id="ssp2-h-node" style="padding:2px 8px;border-radius:999px;background:#eef2ff;border:1px solid #c7d2fe;font-weight:800;color:#1e3a8a;">node: …</span>
       </div>
 
@@ -13124,7 +13315,6 @@ try {
         <button id="ssp2-h-refresh" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:800;cursor:pointer;">Refresh</button>
         <button id="ssp2-h-settings" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:800;cursor:pointer;">Settings</button>
         <button id="ssp2-h-panel" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:800;cursor:pointer;">Panel</button>
-        <button id="ssp2-h-relay-connect" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:800;cursor:pointer;">Relay Connect</button>
 
         <select id="ssp2-h-loadtype" title="Loads filter" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:800;cursor:pointer;">
           <option value="all">All Loads</option>
@@ -13171,61 +13361,8 @@ try {
       persistPrefs();
     });
 
-    $("#ssp2-h-relay-connect")?.addEventListener("click", async () => {
-      try {
-        await checkRelayConnectivity({ force: true, ttlMs: 0, bootstrapForce: true });
-        try { renderPanel(); } catch (_) {}
-        return;
-        const st = await checkRelayConnectivity({ force: true, ttlMs: 0 });
-        if (st && st.state === "no_auth") {
-          // Legacy fallback intentionally disabled (inline retry flow is used instead).
-          // legacy alert disabled
-        } else {
-          renderPanel();
-          // legacy alert disabled
-        }
-      } catch (e) {
-        // legacy alert disabled
-      }
-    });
-    // Replace relay button handler with inline-only auth/connectivity flow.
-    try {
-      const relayBtnOld = document.getElementById("ssp2-h-relay-connect");
-      if (relayBtnOld && relayBtnOld.parentNode) {
-        const relayBtn = relayBtnOld.cloneNode(true);
-        relayBtnOld.parentNode.replaceChild(relayBtn, relayBtnOld);
-        relayBtn.addEventListener("click", async () => {
-          try {
-            relayBtn.disabled = true;
-            relayBtn.textContent = "Checking...";
-            await checkRelayConnectivity({ force: true, ttlMs: 0, bootstrapForce: true });
-          } catch (_) {
-            // Inline status line shows error details.
-          } finally {
-            relayBtn.disabled = false;
-            relayBtn.textContent = "Relay Connect";
-            try { renderPanel(); } catch (_) {}
-          }
-        });
-      }
-      bar.addEventListener("click", async (e) => {
-        const retry = e.target && e.target.closest ? e.target.closest("#ssp2-relay-retry-inline") : null;
-        if (!retry) return;
-        e.preventDefault();
-        e.stopPropagation();
-        retry.disabled = true;
-        retry.textContent = "Retrying...";
-        try {
-          await checkRelayConnectivity({ force: true, ttlMs: 0, bootstrapForce: true });
-        } catch (_) {
-          // no-op
-        } finally {
-          retry.disabled = false;
-          retry.textContent = "Relay Auth Retry";
-          try { renderPanel(); } catch (_) {}
-        }
-      });
-    } catch (_) {}
+    // header relay-connect listener removed (no-op)
+    // relay header-related handlers removed
 
     // Loads dropdown: classify by route keyword
     const lt = document.getElementById("ssp2-h-loadtype");
@@ -13342,12 +13479,64 @@ try {
             <input id="ssp2-merge-debug" type="checkbox" ${SETTINGS.mergeDebug ? "checked" : ""} />
             <span>Show Merge Panel debug details</span>
           </label>
+          <div id="ssp2-debug-relay" style="margin-top:10px;padding-top:10px;border-top:1px solid #e5e7eb;">
+            <button id="ssp2-debug-relay-connect" style="padding:6px 10px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:800;cursor:pointer;">Relay Connect</button>
+            <div id="ssp2-debug-relay-status" style="margin-top:6px;">${getRelayConnectivityBadgeHtml()}</div>
+          </div>
         `;
         toolPanel.appendChild(dbgWrap);
+
         dbgWrap.querySelector("#ssp2-merge-debug")?.addEventListener("change", (e) => {
           SETTINGS.mergeDebug = !!e.target.checked;
           persistSettings();
         });
+
+        // helper to update the relay status area
+        function updateRelayDebug() {
+          const statusEl = dbgWrap.querySelector("#ssp2-debug-relay-status");
+          if (!statusEl) return;
+          const relayState = String((STATE.relayConnectivity && STATE.relayConnectivity.state) || "unknown");
+          const needsRelayRetry = relayState === "no_auth" || relayState === "error";
+          const relayHtml = needsRelayRetry
+            ? `${getRelayConnectivityBadgeHtml()} <button id="ssp2-debug-relay-retry-inline" style="padding:2px 8px;border-radius:999px;border:1px solid #d1d5db;background:#fff;font-weight:900;cursor:pointer;">Relay Auth Retry</button>`
+            : getRelayConnectivityBadgeHtml();
+          statusEl.innerHTML = relayHtml;
+          if (needsRelayRetry) {
+            const retryBtn = statusEl.querySelector("#ssp2-debug-relay-retry-inline");
+            if (retryBtn) {
+              retryBtn.addEventListener("click", async (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                retryBtn.disabled = true;
+                retryBtn.textContent = "Retrying...";
+                try {
+                  await checkRelayConnectivity({ force: true, ttlMs: 0, bootstrapForce: true });
+                } catch (_) {}
+                finally {
+                  retryBtn.disabled = false;
+                  retryBtn.textContent = "Relay Auth Retry";
+                  updateRelayDebug();
+                }
+              });
+            }
+          }
+        }
+
+        // wire connect button
+        dbgWrap.querySelector("#ssp2-debug-relay-connect")?.addEventListener("click", async () => {
+          const btn = dbgWrap.querySelector("#ssp2-debug-relay-connect");
+          if (btn) btn.disabled = true;
+          try {
+            await checkRelayConnectivity({ force: true, ttlMs: 0, bootstrapForce: true });
+          } catch (_) {}
+          finally {
+            if (btn) { btn.disabled = false; btn.textContent = "Relay Connect"; }
+            updateRelayDebug();
+          }
+        });
+
+        // initial render
+        updateRelayDebug();
       } catch {}
 
 
@@ -13473,7 +13662,6 @@ try {
           <div style="font-weight:900;margin-bottom:8px;">Alert Types</div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
             <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>Merge Alert</span><input id="s-alert-merge" type="checkbox" ${alerts.types.mergeAlert ? "checked" : ""} /></label>
-            <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>Late Load</span><input id="s-alert-lateload" type="checkbox" ${alerts.types.lateLoad ? "checked" : ""} /></label>
             <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>Late Adhoc</span><input id="s-alert-lateadhoc" type="checkbox" ${alerts.types.lateAdhoc ? "checked" : ""} /></label>
             <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>Capacity Alert</span><input id="s-alert-capacity" type="checkbox" ${alerts.types.capacityAlert ? "checked" : ""} /></label>
             <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>Staging Alert</span><input id="s-alert-staging" type="checkbox" ${alerts.types.stagingAlert ? "checked" : ""} /></label>
@@ -14145,13 +14333,7 @@ function openSettingsModal(defaultTab) {
         types: {
           ...currentAlerts.types,
           mergeAlert: readChk("s-alert-merge"),
-          lateLoad: readChk("s-alert-lateload"),
-          lateAdhoc: readChk("s-alert-lateadhoc"),
-          capacityAlert: readChk("s-alert-capacity"),
-          stagingAlert: readChk("s-alert-staging"),
-          sdtMissAlert: readChk("s-alert-sdtmiss"),
-          tdrLateAlert: readChk("s-alert-tdr"),
-          buDriverArrivedAlert: readChk("s-alert-buarrived"),
+
         },
       });
 
@@ -14737,6 +14919,7 @@ function computeDisruptionsForLaneCpt(laneKey, cptMs) {
         actualMs: aatMs,
         kind,
         minutes: Math.max(0, Number(minutes || 0)),
+        inbLane: String(r?.inbLane || r?.inboundLane || "").trim(),
       });
     }
 
@@ -14801,12 +14984,18 @@ function computeDisruptionsAll() {
       cur.containers = Math.max(Number(cur.containers || 0), Number(r.containers || 0));
       if (cur.packages == null) cur.packages = r.packages;
       if (r.packages != null) cur.packages = Math.max(Number(cur.packages || 0), Number(r.packages || 0));
-      if (!cur.scheduledMs || (r.scheduledMs && r.scheduledMs < cur.scheduledMs)) cur.scheduledMs = r.scheduledMs;
+      // inbound lane handling: prefer a value if missing, or when record wins
+      if (!cur.inbLane && r.inbLane) cur.inbLane = r.inbLane;
+      if (!cur.scheduledMs || (r.scheduledMs && r.scheduledMs < cur.scheduledMs)) {
+        cur.scheduledMs = r.scheduledMs;
+        if (r.inbLane) cur.inbLane = r.inbLane;
+      }
       if (r.actualMs) cur.actualMs = Math.max(Number(cur.actualMs || 0), Number(r.actualMs || 0));
       if (r.etaMs) cur.etaMs = Math.max(Number(cur.etaMs || 0), Number(r.etaMs || 0));
       if (sev(r) > sev(cur) || (sev(r) === sev(cur) && Number(r.minutes || 0) > Number(cur.minutes || 0))) {
         cur.kind = r.kind;
         cur.minutes = Number(r.minutes || 0);
+        if (r.inbLane) cur.inbLane = r.inbLane;
       }
       // Keep a stable laneKey/cptMs for jump: prefer the record whose scheduled time matches earliest.
       if (cur.scheduledMs === r.scheduledMs) { cur.laneKey = r.laneKey; cur.cptMs = r.cptMs; }

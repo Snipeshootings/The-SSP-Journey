@@ -68,6 +68,17 @@ CPT: 14:30 (30 mins away)
 Action: Merge inbound load immediately
 ```
 
+**Shift Summary (automatic)**
+```
+*📊 SHIFT SUMMARY*
+Loads remaining: 12
+Containers remaining: 432
+Packages remaining: 1240
+Detected: 2025-06-25 14:00:00
+```
+
+_A shift summary message is posted every 30 minutes when Slack notifications are enabled._
+
 **Escalation:**
 ```
 *URGENT: Late Inbound Load*
